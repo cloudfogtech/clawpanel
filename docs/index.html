@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClawPanel - OpenClaw 可视化管理面板</title>
+  <meta name="description" content="ClawPanel 是基于 Tauri v2 构建的跨平台桌面应用，为 OpenClaw AI Agent 框架提供可视化管理界面。">
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --bg-card: #12121a;
+      --bg-card-hover: #1a1a25;
+      --border: #1e1e2e;
+      --text: #e4e4ec;
+      --text-secondary: #9898a8;
+      --accent: #6366f1;
+      --accent-soft: rgba(99, 102, 241, 0.15);
+      --success: #22c55e;
+      --radius: 12px;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* 顶部导航 */
+    .nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(10, 10, 15, 0.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      height: 56px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .nav-brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 16px; }
+    .nav-brand img { width: 28px; height: 28px; border-radius: 6px; }
+    .nav-links { display: flex; gap: 24px; font-size: 14px; }
+    .nav-links a { color: var(--text-secondary); transition: color 0.2s; }
+    .nav-links a:hover { color: var(--text); text-decoration: none; }
+
+    /* Hero 区域 */
+    .hero {
+      padding: 140px 24px 80px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -200px; left: 50%; transform: translateX(-50%);
+      width: 800px; height: 600px;
+      background: radial-gradient(ellipse, rgba(99, 102, 241, 0.12) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .hero h1 { font-size: 48px; font-weight: 700; margin-bottom: 16px; position: relative; }
+    .hero .subtitle { font-size: 18px; color: var(--text-secondary); max-width: 600px; margin: 0 auto 32px; position: relative; }
+    .hero-actions { display: flex; gap: 12px; justify-content: center; position: relative; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 12px 24px; border-radius: 8px;
+      font-size: 14px; font-weight: 500;
+      border: none; cursor: pointer; transition: all 0.2s;
+      text-decoration: none;
+    }
+    .btn:hover { text-decoration: none; }
+    .btn-primary {
+      background: var(--accent); color: #fff;
+    }
+    .btn-primary:hover { background: #5558e6; transform: translateY(-1px); }
+    .btn-secondary {
+      background: var(--bg-card); color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { background: var(--bg-card-hover); transform: translateY(-1px); }
+
+    /* 内容区域 */
+    .container { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
+
+    /* 功能特性 */
+    .features { padding: 80px 0; }
+    .section-title {
+      font-size: 28px; font-weight: 600;
+      text-align: center; margin-bottom: 48px;
+    }
+    .features-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      transition: all 0.2s;
+    }
+    .feature-card:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .feature-card h3 { font-size: 16px; margin-bottom: 8px; }
+    .feature-card p { font-size: 14px; color: var(--text-secondary); }
+
+    /* 技术架构 */
+    .tech { padding: 80px 0; }
+    .tech-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    .tech-table th, .tech-table td {
+      padding: 14px 20px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .tech-table th {
+      font-weight: 500;
+      color: var(--text-secondary);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .tech-table td:first-child { font-weight: 500; }
+
+    /* 快速开始 */
+    .quickstart { padding: 80px 0; }
+    .code-block {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: 13px;
+      line-height: 1.8;
+      overflow-x: auto;
+      margin: 16px 0;
+    }
+    .code-block .comment { color: #6b7280; }
+    .code-block .cmd { color: var(--success); }
+
+    /* 相关项目 */
+    .projects { padding: 80px 0; }
+    .project-card {
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin-bottom: 12px;
+      transition: all 0.2s;
+    }
+    .project-card:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--accent);
+    }
+    .project-card h3 { font-size: 15px; margin-bottom: 4px; }
+    .project-card p { font-size: 13px; color: var(--text-secondary); }
+
+    /* 页脚 */
+    .footer {
+      padding: 40px 0;
+      text-align: center;
+      font-size: 13px;
+      color: var(--text-secondary);
+      border-top: 1px solid var(--border);
+    }
+    .footer a { color: var(--text-secondary); }
+    .footer a:hover { color: var(--text); }
+
+    /* 响应式 */
+    @media (max-width: 640px) {
+      .hero h1 { font-size: 32px; }
+      .hero .subtitle { font-size: 15px; }
+      .hero-actions { flex-direction: column; align-items: center; }
+      .nav-links { display: none; }
+      .features-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 导航 -->
+  <nav class="nav">
+    <div class="nav-brand">
+      <img src="https://raw.githubusercontent.com/qingchencloud/clawpanel/main/public/images/logo.svg" alt="Logo">
+      <span>ClawPanel</span>
+    </div>
+    <div class="nav-links">
+      <a href="#features">功能</a>
+      <a href="#tech">架构</a>
+      <a href="#quickstart">快速开始</a>
+      <a href="#projects">相关项目</a>
+      <a href="https://github.com/qingchencloud/clawpanel">GitHub</a>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero">
+    <h1>ClawPanel</h1>
+    <p class="subtitle">OpenClaw AI Agent 框架的可视化管理面板，基于 Tauri v2 构建的跨平台桌面应用。</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="https://github.com/qingchencloud/clawpanel/releases">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 12L3 7h3V2h4v5h3L8 12z" fill="currentColor"/><path d="M2 13h12v1H2v-1z" fill="currentColor"/></svg>
+        下载最新版
+      </a>
+      <a class="btn btn-secondary" href="https://github.com/qingchencloud/clawpanel">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        源代码
+      </a>
+    </div>
+  </section>
+
+  <!-- 功能特性 -->
+  <section id="features" class="features">
+    <div class="container">
+      <h2 class="section-title">功能特性</h2>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>仪表盘</h3>
+          <p>系统运行概览，服务状态实时监控，一目了然掌握 OpenClaw 运行情况。</p>
+        </div>
+        <div class="feature-card">
+          <h3>服务管理</h3>
+          <p>OpenClaw 服务启停控制、版本检测与一键升级、配置备份与恢复。</p>
+        </div>
+        <div class="feature-card">
+          <h3>模型配置</h3>
+          <p>多服务商管理、模型增删改查、主模型选择、批量测试、延迟检测，支持自动保存与撤销。</p>
+        </div>
+        <div class="feature-card">
+          <h3>网关配置</h3>
+          <p>Gateway 端口、运行模式、认证方式可视化配置，即改即生效。</p>
+        </div>
+        <div class="feature-card">
+          <h3>日志查看</h3>
+          <p>多日志源实时查看与关键词搜索，快速定位运行异常。</p>
+        </div>
+        <div class="feature-card">
+          <h3>记忆管理</h3>
+          <p>OpenClaw 记忆文件的查看、编辑、分类管理与 ZIP 导出。</p>
+        </div>
+        <div class="feature-card">
+          <h3>扩展工具</h3>
+          <p>cftunnel 内网穿透管理、ClawApp 连接状态监控等扩展功能。</p>
+        </div>
+        <div class="feature-card">
+          <h3>主题切换</h3>
+          <p>支持暗色与亮色主题切换，适应不同使用环境偏好。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 技术架构 -->
+  <section id="tech" class="tech">
+    <div class="container">
+      <h2 class="section-title">技术架构</h2>
+      <table class="tech-table">
+        <thead>
+          <tr><th>层级</th><th>技术</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>前端</td><td>Vanilla JS + Vite</td><td>零框架依赖，轻量快速</td></tr>
+          <tr><td>后端</td><td>Rust + Tauri v2</td><td>原生性能，跨平台打包</td></tr>
+          <tr><td>通信</td><td>Tauri IPC + Shell Plugin</td><td>前后端桥接，本地命令执行</td></tr>
+          <tr><td>样式</td><td>纯 CSS (CSS Variables)</td><td>暗色主题，玻璃拟态风格</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 快速开始 -->
+  <section id="quickstart" class="quickstart">
+    <div class="container">
+      <h2 class="section-title">快速开始</h2>
+
+      <h3 style="font-size:16px;margin-bottom:8px">前置条件</h3>
+      <p style="font-size:14px;color:var(--text-secondary);margin-bottom:24px">
+        需要安装 <a href="https://nodejs.org/">Node.js</a> >= 18、<a href="https://www.rust-lang.org/tools/install">Rust</a> stable 以及 <a href="https://v2.tauri.app/start/prerequisites/">Tauri v2 系统依赖</a>。
+      </p>
+
+      <div class="code-block">
+        <span class="comment"># 克隆仓库</span><br>
+        <span class="cmd">git clone https://github.com/qingchencloud/clawpanel.git</span><br>
+        <span class="cmd">cd clawpanel</span><br>
+        <span class="cmd">npm install</span><br>
+        <br>
+        <span class="comment"># 启动开发模式（完整 Tauri 桌面应用）</span><br>
+        <span class="cmd">./scripts/dev.sh</span><br>
+        <br>
+        <span class="comment"># 仅启动前端（浏览器调试，使用 mock 数据）</span><br>
+        <span class="cmd">./scripts/dev.sh web</span><br>
+        <br>
+        <span class="comment"># 构建发布版本</span><br>
+        <span class="cmd">./scripts/build.sh release</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 相关项目 -->
+  <section id="projects" class="projects">
+    <div class="container">
+      <h2 class="section-title">相关项目</h2>
+      <a class="project-card" href="https://github.com/openclaw-labs/openclaw" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">
+        <div>
+          <h3>OpenClaw</h3>
+          <p>AI Agent 框架，支持多模型协作、工具调用、记忆管理</p>
+        </div>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="var(--text-secondary)"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
+      </a>
+      <a class="project-card" href="https://github.com/qingchencloud/clawapp" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">
+        <div>
+          <h3>ClawApp</h3>
+          <p>跨平台移动聊天客户端，H5 + 代理服务器架构</p>
+        </div>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="var(--text-secondary)"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
+      </a>
+      <a class="project-card" href="https://github.com/qingchencloud/cftunnel" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">
+        <div>
+          <h3>cftunnel</h3>
+          <p>Cloudflare Tunnel 内网穿透工具，全协议支持</p>
+        </div>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="var(--text-secondary)"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
+      </a>
+    </div>
+  </section>
+
+  <!-- 页脚 -->
+  <footer class="footer">
+    <div class="container">
+      <p>MIT License &copy; 2026 <a href="https://github.com/qingchencloud">qingchencloud</a></p>
+    </div>
+  </footer>
+
+</body>
+</html>

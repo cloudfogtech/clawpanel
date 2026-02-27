@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <!-- 背景圆角方块 -->
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
+  <!-- 爪子：三个爪尖 -->
+  <path d="M40 38c0-6 4-12 8-12s8 6 8 12v16h-16V38z" fill="#fff" opacity="0.95"/>
+  <path d="M56 32c0-6 4-12 8-12s8 6 8 12v22H56V32z" fill="#fff"/>
+  <path d="M72 38c0-6 4-12 8-12s8 6 8 12v16H72V38z" fill="#fff" opacity="0.95"/>
+  <!-- 爪掌 -->
+  <path d="M34 56c0 0 4-4 30-4s30 4 30 4v12c0 16-10 28-30 32-20-4-30-16-30-32V56z" fill="#fff" opacity="0.9"/>
+  <!-- 面板线条 -->
+  <rect x="46" y="62" width="36" height="3" rx="1.5" fill="url(#bg)" opacity="0.4"/>
+  <rect x="46" y="70" width="28" height="3" rx="1.5" fill="url(#bg)" opacity="0.3"/>
+  <rect x="46" y="78" width="20" height="3" rx="1.5" fill="url(#bg)" opacity="0.2"/>
+  <!-- 渐变定义 -->
+  <defs>
+    <linearGradient id="bg" x1="8" y1="8" x2="120" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+</svg>
