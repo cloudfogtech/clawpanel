@@ -1,9 +1,26 @@
 {
   "name": "clawpanel",
-  "version": "1.0.0",
+  "version": "0.2.1",
   "private": true,
-  "description": "ClawPanel - OpenClaw 可视化管理面板",
+  "description": "ClawPanel - OpenClaw 可视化管理面板，基于 Tauri v2 的跨平台桌面应用",
   "type": "module",
+  "author": "qingchencloud",
+  "license": "MIT",
+  "homepage": "https://github.com/qingchencloud/clawpanel",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qingchencloud/clawpanel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qingchencloud/clawpanel/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "ai-agent",
+    "tauri",
+    "desktop-app",
+    "management-panel"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "vite build",

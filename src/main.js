@@ -79,9 +79,12 @@ async function autoConnectWebSocket() {
     const token = config?.gateway?.auth?.token || ''
 
     // 启动前先确保设备已配对 + allowedOrigins 已写入，无需用户手动操作
+    let needReload = false
     try {
-      await api.autoPairDevice()
-      console.log('[main] 设备配对 + origins 已就绪')
+      const pairResult = await api.autoPairDevice()
+      console.log('[main] 设备配对 + origins 已就绪:', pairResult)
+      // autoPairDevice 会写入 allowedOrigins，需要 reload 使 Gateway 生效
+      needReload = true
     } catch (pairErr) {
       console.warn('[main] autoPairDevice 失败（非致命）:', pairErr)
     }
@@ -90,11 +93,21 @@ async function autoConnectWebSocket() {
     try {
       const patched = await api.patchModelVision()
       if (patched) {
-        console.log('[main] 已为模型添加 vision 支持，重载 Gateway...')
-        await api.reloadGateway()
+        console.log('[main] 已为模型添加 vision 支持')
+        needReload = true
       }
     } catch (visionErr) {
       console.warn('[main] patchModelVision 失败（非致命）:', visionErr)
+    }
+
+    // 统一 reload Gateway（配对 origins + vision patch 合并为一次 reload）
+    if (needReload) {
+      try {
+        await api.reloadGateway()
+        console.log('[main] Gateway 已重载')
+      } catch (reloadErr) {
+        console.warn('[main] reloadGateway 失败（非致命）:', reloadErr)
+      }
     }
 
     wsClient.connect(`127.0.0.1:${port}`, token)

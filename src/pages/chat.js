@@ -40,7 +40,7 @@ const COMMANDS = [
 let _sessionKey = null, _page = null, _messagesEl = null, _textarea = null
 let _sendBtn = null, _statusDot = null, _typingEl = null, _scrollBtn = null
 let _sessionListEl = null, _cmdPanelEl = null, _attachPreviewEl = null, _fileInputEl = null
-let _currentAiBubble = null, _currentAiText = '', _currentRunId = null
+let _currentAiBubble = null, _currentAiText = '', _currentAiImages = [], _currentRunId = null
 let _isStreaming = false, _isSending = false, _messageQueue = []
 let _lastRenderTime = 0, _renderPending = false, _lastHistoryHash = ''
 let _streamSafetyTimer = null, _unsubEvent = null, _unsubReady = null, _unsubStatus = null
@@ -103,6 +103,20 @@ export async function render() {
         </button>
       </div>
       <div class="chat-disconnect-bar" id="chat-disconnect-bar" style="display:none">连接已断开，正在重连...</div>
+      <div class="chat-connect-overlay" id="chat-connect-overlay" style="display:none">
+        <div class="chat-connect-card">
+          <div class="chat-connect-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48"><path d="M8.5 14.5A2.5 2.5 0 0011 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 11-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 002.5 2.5z"/></svg>
+          </div>
+          <div class="chat-connect-title">Gateway 连接未就绪</div>
+          <div class="chat-connect-desc" id="chat-connect-desc">正在连接 Gateway...</div>
+          <div class="chat-connect-actions">
+            <button class="btn btn-primary btn-sm" id="btn-fix-connect">修复并重连</button>
+            <button class="btn btn-secondary btn-sm" id="btn-goto-gateway">Gateway 设置</button>
+          </div>
+          <div class="chat-connect-hint">首次使用？请确保 Gateway 已启动，或点击「修复并重连」自动修复配置</div>
+        </div>
+      </div>
     </div>
   `
 
@@ -118,6 +132,7 @@ export async function render() {
   _fileInputEl = page.querySelector('#chat-file-input')
 
   bindEvents(page)
+  bindConnectOverlay(page)
   // 非阻塞：先返回 DOM，后台连接 Gateway
   connectGateway()
   return page
@@ -164,6 +179,39 @@ function bindEvents(page) {
   })
   _scrollBtn.addEventListener('click', () => scrollToBottom())
   _messagesEl.addEventListener('click', () => hideCmdPanel())
+}
+
+// ── 连接引导遮罩 ──
+
+function bindConnectOverlay(page) {
+  const fixBtn = page.querySelector('#btn-fix-connect')
+  const gwBtn = page.querySelector('#btn-goto-gateway')
+
+  if (fixBtn) {
+    fixBtn.addEventListener('click', async () => {
+      fixBtn.disabled = true
+      fixBtn.textContent = '修复中...'
+      const desc = document.getElementById('chat-connect-desc')
+      try {
+        if (desc) desc.textContent = '正在写入配置并重载 Gateway...'
+        await api.autoPairDevice()
+        await api.reloadGateway()
+        if (desc) desc.textContent = '修复完成，正在重连...'
+        // 断开旧连接，重新发起
+        wsClient.disconnect()
+        setTimeout(() => connectGateway(), 1000)
+      } catch (e) {
+        if (desc) desc.textContent = '修复失败: ' + (e.message || e)
+      } finally {
+        fixBtn.disabled = false
+        fixBtn.textContent = '修复并重连'
+      }
+    })
+  }
+
+  if (gwBtn) {
+    gwBtn.addEventListener('click', () => navigate('/gateway'))
+  }
 }
 
 // ── 文件上传 ──
@@ -261,21 +309,37 @@ async function connectGateway() {
       if (!_pageActive) return
       updateStatusDot(status)
       const bar = document.getElementById('chat-disconnect-bar')
-      if (!bar) return
-      if (status === 'reconnecting' || status === 'disconnected') {
-        bar.textContent = '连接已断开，正在重连...'
-        bar.style.display = 'flex'
+      const overlay = document.getElementById('chat-connect-overlay')
+      const desc = document.getElementById('chat-connect-desc')
+      if (status === 'ready' || status === 'connected') {
+        if (bar) bar.style.display = 'none'
+        if (overlay) overlay.style.display = 'none'
       } else if (status === 'error') {
-        bar.textContent = errorMsg || '连接错误'
-        bar.style.display = 'flex'
+        // 连接错误：显示引导遮罩而非底部条
+        if (bar) bar.style.display = 'none'
+        if (overlay) {
+          overlay.style.display = 'flex'
+          if (desc) desc.textContent = errorMsg || '连接 Gateway 失败'
+        }
+      } else if (status === 'reconnecting' || status === 'disconnected') {
+        if (bar) { bar.textContent = '连接已断开，正在重连...'; bar.style.display = 'flex' }
       } else {
-        bar.style.display = 'none'
+        if (bar) bar.style.display = 'none'
       }
     })
 
     _unsubReady = wsClient.onReady((hello, sessionKey, err) => {
       if (!_pageActive) return
-      if (err?.error) { toast(err.message || '连接失败', 'error'); return }
+      const overlay = document.getElementById('chat-connect-overlay')
+      if (err?.error) {
+        if (overlay) {
+          overlay.style.display = 'flex'
+          const desc = document.getElementById('chat-connect-desc')
+          if (desc) desc.textContent = err.message || '连接失败'
+        }
+        return
+      }
+      if (overlay) overlay.style.display = 'none'
       showTyping(false)  // Gateway 就绪后关闭加载动画
       // 重连后恢复：保留当前 sessionKey，不重复加载历史
       if (!_sessionKey) {
@@ -565,6 +629,7 @@ function handleChatEvent(payload) {
 
   if (state === 'delta') {
     const c = extractChatContent(payload.message)
+    if (c?.images?.length) _currentAiImages = c.images
     if (c?.text && c.text.length > _currentAiText.length) {
       showTyping(false)
       if (!_currentAiBubble) {
@@ -582,16 +647,20 @@ function handleChatEvent(payload) {
   if (state === 'final') {
     const c = extractChatContent(payload.message)
     const finalText = c?.text || ''
+    const finalImages = c?.images || []
+    if (finalImages.length) _currentAiImages = finalImages
+    const hasContent = finalText || _currentAiImages.length
     // 忽略空 final（Gateway 会为一条消息触发多个 run，部分是空 final）
-    if (!_currentAiBubble && !finalText) return
+    if (!_currentAiBubble && !hasContent) return
     showTyping(false)
     // 如果流式阶段没有创建 bubble，从 final message 中提取
-    if (!_currentAiBubble && finalText) {
+    if (!_currentAiBubble && hasContent) {
       _currentAiBubble = createStreamBubble()
       _currentAiText = finalText
     }
-    if (_currentAiBubble && _currentAiText) {
-      _currentAiBubble.innerHTML = renderMarkdown(_currentAiText)
+    if (_currentAiBubble) {
+      if (_currentAiText) _currentAiBubble.innerHTML = renderMarkdown(_currentAiText)
+      appendImagesToEl(_currentAiBubble, _currentAiImages)
     }
     if (_currentAiText) {
       saveMessage({ id: payload.runId || uuid(), sessionKey: _sessionKey, role: 'assistant', content: _currentAiText, timestamp: Date.now() })
@@ -614,6 +683,18 @@ function handleChatEvent(payload) {
 
   if (state === 'error') {
     const errMsg = payload.errorMessage || payload.error?.message || '未知错误'
+
+    // 连接级错误（origin/pairing/auth）拦截，不作为聊天消息显示
+    if (/origin not allowed|NOT_PAIRED|PAIRING_REQUIRED|auth.*fail/i.test(errMsg)) {
+      console.warn('[chat] 拦截连接级错误，不显示为聊天消息:', errMsg)
+      const overlay = document.getElementById('chat-connect-overlay')
+      if (overlay) {
+        overlay.style.display = 'flex'
+        const desc = document.getElementById('chat-connect-desc')
+        if (desc) desc.textContent = '连接被 Gateway 拒绝，请点击「修复并重连」'
+      }
+      return
+    }
 
     // 防抖：如果是相同错误且在 2 秒内，忽略（避免重复显示）
     const now = Date.now()
@@ -638,20 +719,23 @@ function handleChatEvent(payload) {
   }
 }
 
-/** 从 Gateway message 对象提取文本（参照 clawapp extractContent） */
+/** 从 Gateway message 对象提取文本和图片（参照 clawapp extractContent） */
 function extractChatContent(message) {
   if (!message || typeof message !== 'object') return null
   const content = message.content
-  if (typeof content === 'string') return { text: content }
+  const images = []
+  if (typeof content === 'string') return { text: content, images }
   if (Array.isArray(content)) {
     const texts = []
     for (const block of content) {
       if (block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
+      if (block.type === 'image') images.push(block)
+      if (block.type === 'image_url') images.push(block)
     }
     const text = texts.length ? texts.join('\n') : ''
-    if (text) return { text }
+    return { text, images }
   }
-  if (typeof message.text === 'string') return { text: message.text }
+  if (typeof message.text === 'string') return { text: message.text, images }
   return null
 }
 
@@ -694,13 +778,15 @@ function doRender() {
 
 function resetStreamState() {
   clearTimeout(_streamSafetyTimer)
-  if (_currentAiBubble && _currentAiText) {
+  if (_currentAiBubble && (_currentAiText || _currentAiImages.length)) {
     _currentAiBubble.innerHTML = renderMarkdown(_currentAiText)
+    appendImagesToEl(_currentAiBubble, _currentAiImages)
   }
   _renderPending = false
   _lastRenderTime = 0
   _currentAiBubble = null
   _currentAiText = ''
+  _currentAiImages = []
   _currentRunId = null
   _isStreaming = false
   _lastErrorMsg = null
@@ -737,12 +823,19 @@ async function loadHistory() {
     _lastHistoryHash = hash
     clearMessages()
     deduped.forEach(msg => {
-      if (msg.role === 'user') appendUserMessage(msg.text)
-      else if (msg.role === 'assistant') appendAiMessage(msg.text)
+      if (msg.role === 'user') {
+        const userImages = msg.images?.length ? msg.images.map(i => ({
+          mimeType: i.mediaType || i.media_type || 'image/png',
+          content: i.data || i.source?.data || '',
+        })).filter(a => a.content) : []
+        appendUserMessage(msg.text, userImages)
+      } else if (msg.role === 'assistant') {
+        appendAiMessage(msg.text, msg.images)
+      }
     })
     saveMessages(result.messages.map(m => {
       const c = extractContent(m)
-      return { id: m.id || uuid(), sessionKey: _sessionKey, role: m.role, content: c || '', timestamp: m.timestamp || Date.now() }
+      return { id: m.id || uuid(), sessionKey: _sessionKey, role: m.role, content: c.text || '', timestamp: m.timestamp || Date.now() }
     }))
     scrollToBottom()
   } catch (e) {
@@ -755,28 +848,35 @@ function dedupeHistory(messages) {
   const deduped = []
   for (const msg of messages) {
     if (msg.role === 'toolResult') continue
-    const text = extractContent(msg)
-    if (!text) continue
+    const c = extractContent(msg)
+    if (!c.text && !c.images.length) continue
     const last = deduped[deduped.length - 1]
     if (last && last.role === msg.role) {
-      if (msg.role === 'user' && last.text === text) continue
+      if (msg.role === 'user' && last.text === c.text) continue
       if (msg.role === 'assistant') {
-        last.text = [last.text, text].filter(Boolean).join('\n')
+        last.text = [last.text, c.text].filter(Boolean).join('\n')
+        last.images = [...(last.images || []), ...c.images]
         continue
       }
     }
-    deduped.push({ role: msg.role, text, timestamp: msg.timestamp })
+    deduped.push({ role: msg.role, text: c.text, images: c.images, timestamp: msg.timestamp })
   }
   return deduped
 }
 
 function extractContent(msg) {
-  if (typeof msg.text === 'string') return msg.text
-  if (typeof msg.content === 'string') return msg.content
+  const images = []
   if (Array.isArray(msg.content)) {
-    return msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+    const texts = []
+    for (const block of msg.content) {
+      if (block.type === 'text' && typeof block.text === 'string') texts.push(block.text)
+      if (block.type === 'image') images.push(block)
+      if (block.type === 'image_url') images.push(block)
+    }
+    return { text: texts.join('\n'), images }
   }
-  return ''
+  const text = typeof msg.text === 'string' ? msg.text : (typeof msg.content === 'string' ? msg.content : '')
+  return { text, images }
 }
 
 // ── DOM 操作 ──
@@ -793,7 +893,8 @@ function appendUserMessage(text, attachments = []) {
     attachments.forEach(att => {
       const img = document.createElement('img')
       img.src = `data:${att.mimeType};base64,${att.content}`
-      img.style.cssText = 'max-width:200px;max-height:200px;border-radius:4px'
+      img.style.cssText = 'max-width:200px;max-height:200px;border-radius:4px;cursor:pointer'
+      img.onclick = () => showLightbox(img.src)
       imgContainer.appendChild(img)
     })
     bubble.appendChild(imgContainer)
@@ -810,15 +911,59 @@ function appendUserMessage(text, attachments = []) {
   scrollToBottom()
 }
 
-function appendAiMessage(text) {
+function appendAiMessage(text, images) {
   const wrap = document.createElement('div')
   wrap.className = 'msg msg-ai'
   const bubble = document.createElement('div')
   bubble.className = 'msg-bubble'
   bubble.innerHTML = renderMarkdown(text)
+  appendImagesToEl(bubble, images)
   wrap.appendChild(bubble)
   _messagesEl.insertBefore(wrap, _typingEl)
   scrollToBottom()
+}
+
+/** 渲染图片到消息气泡（支持 Anthropic/OpenAI/直接格式） */
+function appendImagesToEl(el, images) {
+  if (!images?.length) return
+  const container = document.createElement('div')
+  container.style.cssText = 'display:flex;gap:6px;margin-top:8px;flex-wrap:wrap'
+  images.forEach(img => {
+    const imgEl = document.createElement('img')
+    // Anthropic 格式: { type: 'image', source: { data, media_type } }
+    if (img.source?.data) {
+      imgEl.src = `data:${img.source.media_type || 'image/png'};base64,${img.source.data}`
+    // 直接格式: { data, mediaType }
+    } else if (img.data) {
+      imgEl.src = `data:${img.mediaType || img.media_type || 'image/png'};base64,${img.data}`
+    // OpenAI 格式: { type: 'image_url', image_url: { url } }
+    } else if (img.image_url?.url) {
+      imgEl.src = img.image_url.url
+    // URL 格式
+    } else if (img.url) {
+      imgEl.src = img.url
+    } else {
+      return
+    }
+    imgEl.style.cssText = 'max-width:300px;max-height:300px;border-radius:6px;cursor:pointer'
+    imgEl.onclick = () => showLightbox(imgEl.src)
+    container.appendChild(imgEl)
+  })
+  if (container.children.length) el.appendChild(container)
+}
+
+/** 图片灯箱查看 */
+function showLightbox(src) {
+  const existing = document.querySelector('.chat-lightbox')
+  if (existing) existing.remove()
+  const lb = document.createElement('div')
+  lb.className = 'chat-lightbox'
+  lb.innerHTML = `<img src="${src}" class="chat-lightbox-img" />`
+  lb.onclick = (e) => { if (e.target === lb || e.target.tagName !== 'IMG') lb.remove() }
+  document.body.appendChild(lb)
+  // ESC 关闭
+  const onKey = (e) => { if (e.key === 'Escape') { lb.remove(); document.removeEventListener('keydown', onKey) } }
+  document.addEventListener('keydown', onKey)
 }
 
 function appendSystemMessage(text) {
@@ -885,6 +1030,7 @@ export function cleanup() {
   _cmdPanelEl = null
   _currentAiBubble = null
   _currentAiText = ''
+  _currentAiImages = []
   _currentRunId = null
   _isStreaming = false
   _isSending = false

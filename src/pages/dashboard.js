@@ -39,36 +39,46 @@ export async function render() {
 }
 
 async function loadDashboardData(page) {
-  const [servicesRes, versionRes, logsRes, agentsRes, configRes, tunnelRes, mcpRes, clawappRes, backupsRes] = await Promise.allSettled([
+  // 分波加载：关键数据先渲染，次要数据后填充，减少白屏等待
+  const coreP = Promise.allSettled([
     api.getServicesStatus(),
     api.getVersionInfo(),
-    api.readLogTail('gateway', 20),
-    api.listAgents(),
     api.readOpenclawConfig(),
+  ])
+  const secondaryP = Promise.allSettled([
+    api.listAgents(),
     api.getCftunnelStatus(),
     api.readMcpConfig(),
     api.getClawappStatus(),
     api.listBackups(),
   ])
+  const logsP = api.readLogTail('gateway', 20).catch(() => '')
 
+  // 第一波：服务状态 + 版本 + 配置 → 立即渲染统计卡片
+  const [servicesRes, versionRes, configRes] = await coreP
   const services = servicesRes.status === 'fulfilled' ? servicesRes.value : []
   const version = versionRes.status === 'fulfilled' ? versionRes.value : {}
-  const logs = logsRes.status === 'fulfilled' ? logsRes.value : ''
-  const agents = agentsRes.status === 'fulfilled' ? agentsRes.value : []
   const config = configRes.status === 'fulfilled' ? configRes.value : null
+  if (servicesRes.status === 'rejected') toast('服务状态加载失败', 'error')
+  if (versionRes.status === 'rejected') toast('版本信息加载失败', 'error')
+
+  renderStatCards(page, services, version, [], config, null)
+  bindActions(page)
+
+  // 第二波：Agent、隧道、MCP、ClawApp、备份 → 更新卡片 + 渲染总览
+  const [agentsRes, tunnelRes, mcpRes, clawappRes, backupsRes] = await secondaryP
+  const agents = agentsRes.status === 'fulfilled' ? agentsRes.value : []
   const tunnel = tunnelRes.status === 'fulfilled' ? tunnelRes.value : null
   const mcpConfig = mcpRes.status === 'fulfilled' ? mcpRes.value : null
   const clawapp = clawappRes.status === 'fulfilled' ? clawappRes.value : null
   const backups = backupsRes.status === 'fulfilled' ? backupsRes.value : []
 
-  if (servicesRes.status === 'rejected') toast('服务状态加载失败', 'error')
-  if (versionRes.status === 'rejected') toast('版本信息加载失败', 'error')
-  if (logsRes.status === 'rejected') toast('日志加载失败', 'error')
-
   renderStatCards(page, services, version, agents, config, tunnel)
   renderOverview(page, services, clawapp, tunnel, mcpConfig, backups, config, agents)
+
+  // 第三波：日志（最低优先级）
+  const logs = await logsP
   renderLogs(page, logs)
-  bindActions(page)
 }
 
 function renderStatCards(page, services, version, agents, config, tunnel) {

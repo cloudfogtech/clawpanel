@@ -3,27 +3,12 @@
 
 #[tauri::command]
 pub fn auto_pair_device() -> Result<String, String> {
-    // 读取设备密钥
-    let device_key_path = crate::commands::openclaw_dir().join("clawpanel-device-key.json");
-    if !device_key_path.exists() {
-        return Err("设备密钥文件不存在".into());
-    }
+    // 无论是否已配对，都确保 gateway.controlUi.allowedOrigins 已写入
+    // 必须在最前面，避免因设备密钥不存在而跳过
+    patch_gateway_origins();
 
-    let device_key_content =
-        std::fs::read_to_string(&device_key_path).map_err(|e| format!("读取设备密钥失败: {e}"))?;
-
-    let device_key: serde_json::Value =
-        serde_json::from_str(&device_key_content).map_err(|e| format!("解析设备密钥失败: {e}"))?;
-
-    let device_id = device_key["deviceId"]
-        .as_str()
-        .ok_or("设备 ID 不存在")?
-        .to_string();
-
-    let public_key = device_key["publicKey"]
-        .as_str()
-        .ok_or("公钥不存在")?
-        .to_string();
+    // 获取或生成设备密钥（首次安装时自动创建）
+    let (device_id, public_key, _) = super::device::get_or_create_key()?;
 
     // 读取或创建 paired.json
     let paired_path = crate::commands::openclaw_dir()
@@ -43,9 +28,6 @@ pub fn auto_pair_device() -> Result<String, String> {
     } else {
         serde_json::json!({})
     };
-
-    // 无论是否已配对，都确保 gateway.controlUi.allowedOrigins 已写入
-    patch_gateway_origins();
 
     let os_platform = std::env::consts::OS; // "windows" | "macos" | "linux"
 
@@ -115,9 +97,6 @@ pub fn auto_pair_device() -> Result<String, String> {
         .map_err(|e| format!("序列化 paired.json 失败: {e}"))?;
 
     std::fs::write(&paired_path, new_content).map_err(|e| format!("写入 paired.json 失败: {e}"))?;
-
-    // 同步写入 controlUi.allowedOrigins，允许 Tauri 的 origin 连接 Gateway
-    patch_gateway_origins();
 
     Ok("设备配对成功".into())
 }

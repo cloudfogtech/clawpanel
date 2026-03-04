@@ -1,7 +1,12 @@
 [package]
 name = "clawpanel"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
+description = "ClawPanel - OpenClaw 可视化管理面板"
+authors = ["qingchencloud"]
+repository = "https://github.com/qingchencloud/clawpanel"
+homepage = "https://github.com/qingchencloud/clawpanel"
+license = "MIT"
 
 [lib]
 name = "clawpanel_lib"

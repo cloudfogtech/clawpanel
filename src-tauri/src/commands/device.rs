@@ -14,7 +14,7 @@ const SCOPES: &[&str] = &[
 ];
 
 /// 获取或生成设备密钥
-fn get_or_create_key() -> Result<(String, String, SigningKey), String> {
+pub(crate) fn get_or_create_key() -> Result<(String, String, SigningKey), String> {
     let dir = super::openclaw_dir();
     let path = dir.join(DEVICE_KEY_FILE);
 

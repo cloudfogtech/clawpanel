@@ -216,7 +216,14 @@ export class WsClient {
       const result = await api.autoPairDevice()
       console.log('[ws] 配对结果:', result)
 
-      // 配对成功后直接重连，不需要重启 Gateway
+      // 配对后需要 reload Gateway 使 allowedOrigins 生效
+      try {
+        await api.reloadGateway()
+        console.log('[ws] Gateway 已重载')
+      } catch (e) {
+        console.warn('[ws] reloadGateway 失败（非致命）:', e)
+      }
+
       console.log('[ws] 配对成功，2秒后重新连接...')
       setTimeout(() => {
         if (!this._intentionalClose) {

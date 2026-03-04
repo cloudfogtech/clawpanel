@@ -32,6 +32,10 @@ export async function render() {
       <div id="projects-list"></div>
     </div>
     <div class="config-section">
+      <div class="config-section-title">参与贡献</div>
+      <div id="contribute-section"></div>
+    </div>
+    <div class="config-section">
       <div class="config-section-title">快捷链接</div>
       <div id="links-list"></div>
     </div>
@@ -44,6 +48,7 @@ export async function render() {
   loadData(page)
   renderCommunity(page)
   renderProjects(page)
+  renderContribute(page)
   renderLinks(page)
   return page
 }
@@ -75,9 +80,15 @@ async function loadData(page) {
       } else {
         panelCard.innerHTML = '<span style="color:var(--success)">已是最新</span>'
       }
-    }).catch(() => {
+    }).catch((err) => {
       const panelCard = cards.querySelector('#panel-update-meta')
-      if (panelCard) panelCard.innerHTML = '<span style="color:var(--text-tertiary)">检查更新失败</span>'
+      if (!panelCard) return
+      const msg = String(err?.message || err || '')
+      if (msg.includes('403') || msg.includes('404') || msg.includes('rate limit')) {
+        panelCard.innerHTML = '<span style="color:var(--text-tertiary)">仓库未公开，发布后可自动检测</span>'
+      } else {
+        panelCard.innerHTML = '<span style="color:var(--text-tertiary)">检查更新失败</span>'
+      }
     })
 
     cards.innerHTML = `
@@ -214,6 +225,21 @@ const LINKS = [
   { label: 'OpenClaw 中文翻译', url: 'https://github.com/1186258278/OpenClawChineseTranslation' },
   { label: 'ClawApp 文档', url: 'https://github.com/qingchencloud/clawapp#readme' },
 ]
+
+function renderContribute(page) {
+  const el = page.querySelector('#contribute-section')
+  el.innerHTML = `
+    <div style="font-size:var(--font-size-sm);color:var(--text-secondary);margin-bottom:12px">
+      ClawPanel 是开源项目，欢迎参与贡献！遇到问题请提 Issue，功能建议和代码改进欢迎提 PR。
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      <a class="btn btn-primary btn-sm" href="https://github.com/qingchencloud/clawpanel/issues/new" target="_blank" rel="noopener">提交 Issue</a>
+      <a class="btn btn-secondary btn-sm" href="https://github.com/qingchencloud/clawpanel/pulls" target="_blank" rel="noopener">提交 PR</a>
+      <a class="btn btn-secondary btn-sm" href="https://github.com/qingchencloud/clawpanel/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">贡献指南</a>
+      <a class="btn btn-secondary btn-sm" href="https://github.com/qingchencloud/clawpanel/issues" target="_blank" rel="noopener">查看 Issues</a>
+    </div>
+  `
+}
 
 function renderLinks(page) {
   const el = page.querySelector('#links-list')

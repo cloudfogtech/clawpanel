@@ -5,6 +5,51 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-03-04
+
+### 新增 (Features)
+
+- **聊天图片完整支持** — AI 响应中的图片现在可以正确提取和渲染（支持 Anthropic / OpenAI / 直接格式）
+- **图片灯箱查看** — 点击聊天中的图片可全屏查看，支持 ESC 关闭
+- **会话列表折叠** — 聊天页面侧边栏支持点击 ≡ 按钮收起/展开，带平滑过渡动画
+- **参与贡献入口** — 关于页面新增「参与贡献」区块，包含提交 Issue、提交 PR、贡献指南等快捷链接
+
+### 修复 (Bug Fixes)
+
+- **聊天历史图片丢失** — `extractContent` / `dedupeHistory` / `loadHistory` 现在正确提取和渲染历史消息中的图片
+- **流式响应图片丢失** — delta / final 事件处理新增 `_currentAiImages` 收集，`resetStreamState` 正确清理
+- **私有仓库更新检测** — 检查更新失败时区分 403/404（仓库未公开）和其他错误，显示友好提示
+
+### 优化 (Improvements)
+
+- **开源文档完善** — 新增 `SECURITY.md` 安全政策，同步版本号至 0.2.x，补充项目元数据
+- **仪表盘分波渲染** — 9 个 API 改为三波渐进加载，关键数据先显示，消除白屏等待
+
+## [0.2.0] - 2026-03-04
+
+### 新增 (Features)
+
+- **ClawPanel 自动更新检测** — 关于页面自动检查 ClawPanel 最新版本，显示更新链接
+- **系统诊断页面** — 全面检测系统状态（服务、WebSocket、Node.js、设备密钥），一键修复配对
+- **聊天连接引导遮罩** — WebSocket 连接失败时显示友好引导界面，提供「修复并重连」按钮，替代原始错误消息
+- **图片上传与粘贴** — 聊天页面支持附件上传和 Ctrl+V 粘贴图片，支持多模态对话
+
+### 修复 (Bug Fixes)
+
+- **首次启动 origin 拒绝** — 修复 `autoPairDevice` 在设备密钥不存在时提前退出、未写入 `allowedOrigins` 的问题
+- **Gateway 配置不生效** — 写入 `allowedOrigins` 后自动 `reloadGateway`，确保新配置立即生效
+- **WebSocket 自动修复** — `_autoPairAndReconnect` 补充 `reloadGateway` 调用，修复自动配对后仍被拒绝的问题
+- **wsClient.close 不存在** — 修正为 `wsClient.disconnect()`
+- **远程模型缺少视觉支持** — 添加模型时 `input` 改为 `['text', 'image']`
+- **连接级错误拦截** — 拦截 `origin not allowed`、`NOT_PAIRED` 等连接级错误，不再作为聊天消息显示
+
+### 优化 (Improvements)
+
+- **仪表盘分波渲染** — 9 个 API 请求改为三波渐进加载，关键数据先显示，消除打开时的白屏等待
+- **全页面骨架屏** — 所有页面添加 loading-placeholder 骨架占位，提升加载体验
+- **页面清理函数** — models.js 添加 `cleanup()` 清理定时器和中止控制器，防止内存泄漏
+- **发布工作流增强** — release.yml 生成分类更新日志、可点击下载链接、首次使用指南
+
 ## [0.1.0] - 2026-03-01
 
 首个公开发布版本，包含 OpenClaw 管理面板的全部核心功能。
