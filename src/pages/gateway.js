@@ -136,13 +136,46 @@ function renderConfig(page, state) {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
         安全认证
       </div>
-      <div class="form-group">
-        <label class="form-label">访问密钥</label>
+      <div class="form-group" style="margin-bottom:var(--space-md)">
+        <label class="form-label">认证方式</label>
+        <div class="gw-option-cards">
+          <label class="gw-option-card ${gw.auth?.mode === 'password' ? '' : 'selected'}" data-auth="token">
+            <input type="radio" name="gw-auth-mode" value="token" ${gw.auth?.mode === 'password' ? '' : 'checked'} hidden>
+            <div class="gw-option-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+            </div>
+            <div class="gw-option-text">
+              <div class="gw-option-title">Token 密钥</div>
+              <div class="gw-option-desc">标准认证方式，适合本地和局域网使用</div>
+            </div>
+          </label>
+          <label class="gw-option-card ${gw.auth?.mode === 'password' ? 'selected' : ''}" data-auth="password">
+            <input type="radio" name="gw-auth-mode" value="password" ${gw.auth?.mode === 'password' ? 'checked' : ''} hidden>
+            <div class="gw-option-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+            </div>
+            <div class="gw-option-text">
+              <div class="gw-option-title">密码认证</div>
+              <div class="gw-option-desc">Tailscale Funnel 等外网暴露场景必须使用此模式</div>
+            </div>
+          </label>
+        </div>
+      </div>
+      <div class="form-group" id="gw-auth-token-group" style="${gw.auth?.mode === 'password' ? 'display:none' : ''}">
+        <label class="form-label">访问密钥（Token）</label>
         <div style="display:flex;gap:8px">
           <input class="form-input" id="gw-token" type="password" value="${gw.auth?.token || gw.authToken || ''}" placeholder="不设置则任何人都能调用" style="flex:1">
           <button class="btn btn-sm btn-secondary" id="btn-toggle-token">显示</button>
         </div>
         <div class="form-hint">设置后，应用调用时需要带上这个密钥才能通过。如果选了「局域网共享」，强烈建议设置</div>
+      </div>
+      <div class="form-group" id="gw-auth-password-group" style="${gw.auth?.mode === 'password' ? '' : 'display:none'}">
+        <label class="form-label">密码</label>
+        <div style="display:flex;gap:8px">
+          <input class="form-input" id="gw-password" type="password" value="${gw.auth?.password || ''}" placeholder="设置 Gateway 访问密码" style="flex:1">
+          <button class="btn btn-sm btn-secondary" id="btn-toggle-password">显示</button>
+        </div>
+        <div class="form-hint">通过 Tailscale Funnel 暴露 Gateway 时，必须使用密码认证模式</div>
       </div>
     </div>
 
@@ -170,17 +203,22 @@ function renderConfig(page, state) {
 
 function bindConfigEvents(el) {
   // 密码显示/隐藏
-  el.querySelector('#btn-toggle-token').onclick = () => {
-    const input = el.querySelector('#gw-token')
-    const btn = el.querySelector('#btn-toggle-token')
-    if (input.type === 'password') {
-      input.type = 'text'
-      btn.textContent = '隐藏'
-    } else {
-      input.type = 'password'
-      btn.textContent = '显示'
+  function bindToggle(btnId, inputId) {
+    const btn = el.querySelector('#' + btnId)
+    if (!btn) return
+    btn.onclick = () => {
+      const input = el.querySelector('#' + inputId)
+      if (input.type === 'password') {
+        input.type = 'text'
+        btn.textContent = '隐藏'
+      } else {
+        input.type = 'password'
+        btn.textContent = '显示'
+      }
     }
   }
+  bindToggle('btn-toggle-token', 'gw-token')
+  bindToggle('btn-toggle-password', 'gw-password')
 
   // 选项卡片点击高亮
   el.querySelectorAll('.gw-option-cards').forEach(group => {
@@ -189,6 +227,17 @@ function bindConfigEvents(el) {
         group.querySelectorAll('.gw-option-card').forEach(c => c.classList.remove('selected'))
         card.classList.add('selected')
       })
+    })
+  })
+
+  // 认证模式切换：显示/隐藏对应输入框
+  el.querySelectorAll('input[name="gw-auth-mode"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      const mode = radio.value
+      const tokenGroup = el.querySelector('#gw-auth-token-group')
+      const passwordGroup = el.querySelector('#gw-auth-password-group')
+      if (tokenGroup) tokenGroup.style.display = mode === 'token' ? '' : 'none'
+      if (passwordGroup) passwordGroup.style.display = mode === 'password' ? '' : 'none'
     })
   })
 
@@ -208,13 +257,20 @@ async function saveConfig(page, state) {
   const bind = bindRadio?.value || 'loopback'
   const modeRadio = page.querySelector('input[name="gw-mode"]:checked')
   const mode = modeRadio?.value || 'local'
+  const authModeRadio = page.querySelector('input[name="gw-auth-mode"]:checked')
+  const authMode = authModeRadio?.value || 'token'
   const authToken = page.querySelector('#gw-token')?.value || ''
+  const authPassword = page.querySelector('#gw-password')?.value || ''
   const tailscaleAddr = page.querySelector('#gw-tailscale')?.value || ''
+
+  const auth = authMode === 'password'
+    ? { mode: 'password', password: authPassword }
+    : authToken ? { mode: 'token', token: authToken } : {}
 
   state.config.gateway = {
     ...state.config.gateway,
     port, bind, mode,
-    auth: { token: authToken },
+    auth,
     tailscale: tailscaleAddr.trim() ? { address: tailscaleAddr.trim() } : undefined,
   }
 
