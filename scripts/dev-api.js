@@ -614,6 +614,22 @@ async function instanceHealthCheck(instance) {
     } catch {}
     return result
   }
+  // Docker 类型实例：通过 Docker API 检查容器状态
+  if (instance.type === 'docker' && instance.containerId) {
+    try {
+      const nodes = readDockerNodes()
+      const node = instance.nodeId ? nodes.find(n => n.id === instance.nodeId) : nodes[0]
+      if (node) {
+        const resp = await dockerRequest('GET', `/containers/${instance.containerId}/json`, null, node.endpoint)
+        if (resp.status < 400 && resp.data?.State?.Running) {
+          result.online = true
+          result.gatewayRunning = true
+        }
+      }
+    } catch {}
+    return result
+  }
+
   if (!instance.endpoint) return result
   try {
     const resp = await fetch(`${instance.endpoint}/__api/check_installation`, {
@@ -651,7 +667,7 @@ const ALWAYS_LOCAL = new Set([
   'instance_health_check', 'instance_health_all',
   'docker_info', 'docker_list_containers', 'docker_create_container',
   'docker_start_container', 'docker_stop_container', 'docker_restart_container',
-  'docker_remove_container', 'docker_container_logs', 'docker_container_exec', 'docker_gateway_chat', 'docker_pull_image', 'docker_pull_status',
+  'docker_remove_container', 'docker_container_logs', 'docker_container_exec', 'docker_init_worker', 'docker_gateway_chat', 'docker_pull_image', 'docker_pull_status',
   'docker_list_images', 'docker_list_nodes', 'docker_add_node', 'docker_remove_node',
   'docker_cluster_overview',
   'auth_check', 'auth_login', 'auth_logout',
@@ -1002,18 +1018,62 @@ const handlers = {
     if (!gwBinding || !gwBinding[0]?.HostPort) throw new Error('该容器没有暴露 Gateway 端口 (18789)')
     const gwPort = gwBinding[0].HostPort
 
-    // 2. 通过 WebSocket 连接 Gateway（Node 22 内置 WebSocket）
+    // 2. TCP 端口预检 — 快速判断 Gateway 是否在监听
+    const containerName = resp.data?.Name?.replace(/^\//, '') || containerId.slice(0, 12)
+    await new Promise((resolve, reject) => {
+      const sock = net.connect({ host: '127.0.0.1', port: gwPort, timeout: 5000 })
+      sock.on('connect', () => { sock.destroy(); resolve() })
+      sock.on('timeout', () => { sock.destroy(); reject(new Error(`Gateway 端口 ${gwPort} 无响应 — 容器 ${containerName} 内的 Gateway 可能未启动，请检查容器日志`)) })
+      sock.on('error', (e) => { reject(new Error(`Gateway 端口 ${gwPort} 不可达 — ${e.code === 'ECONNREFUSED' ? `容器 ${containerName} 内的 Gateway 未启动` : e.message}`)) })
+    })
+
+    // 2b. 从容器配置中读取 Gateway auth token（Gateway 启动时自动生成）
+    let gatewayToken = ''
+    try {
+      const tokenExec = await dockerRequest('POST', `/containers/${containerId}/exec`, {
+        AttachStdout: true, AttachStderr: true,
+        Cmd: ['sh', '-c', 'node -e "const c=JSON.parse(require(\'fs\').readFileSync(\'/root/.openclaw/openclaw.json\',\'utf8\'));process.stdout.write(c.gateway?.auth?.token||\'\')"']
+      }, node.endpoint)
+      const tokenExecId = tokenExec.data?.Id
+      if (tokenExecId) {
+        const tokenResp = await new Promise((ok, no) => {
+          const opts = { path: `/exec/${tokenExecId}/start`, method: 'POST', headers: { 'Content-Type': 'application/json' } }
+          if (node.endpoint && node.endpoint.startsWith('tcp://')) {
+            const url = new URL(node.endpoint.replace('tcp://', 'http://'))
+            opts.hostname = url.hostname
+            opts.port = parseInt(url.port) || 2375
+          } else {
+            opts.socketPath = node.endpoint || DOCKER_SOCKET
+          }
+          const req = http.request(opts, res => {
+            let d = ''
+            res.on('data', c => d += c.toString().replace(/[\x00-\x08]/g, ''))
+            res.on('end', () => ok(d.trim()))
+          })
+          req.on('error', () => ok(''))
+          req.write(JSON.stringify({ Detach: false, Tty: false }))
+          req.end()
+        })
+        gatewayToken = tokenResp.replace(/[^a-zA-Z0-9_\-\.]/g, '')
+        if (gatewayToken) console.log(`[gateway-chat] 读取到 auth token: ${gatewayToken.slice(0, 8)}...`)
+      }
+    } catch (e) {
+      console.warn(`[gateway-chat] 读取 auth token 失败: ${e.message}`)
+    }
+
+    // 3. 通过 WebSocket 连接 Gateway（Node 22 内置 WebSocket）
     return new Promise((resolve, reject) => {
       const wsUrl = `ws://127.0.0.1:${gwPort}/ws`
       let ws
-      try { ws = new WebSocket(wsUrl) } catch (e) { return reject(new Error(`无法连接 Gateway: ${e.message}`)) }
+      try { ws = new WebSocket(wsUrl) } catch (e) { return reject(new Error(`无法创建 WebSocket: ${e.message}`)) }
       let result = '', handshakeOk = false, sessionKey = 'agent:main:cluster-task', done = false
-      const timer = setTimeout(() => { if (!done) { done = true; ws.close(); reject(new Error('Gateway 通信超时')) } }, timeout)
+      const timer = setTimeout(() => { if (!done) { done = true; ws.close(); reject(new Error('Gateway 通信超时(120s)')) } }, timeout)
+      // 如果 3s 内没收到 challenge，主动发 connect
       const challengeTimer = setTimeout(() => { if (!handshakeOk) doConnect('') }, 3000)
 
       function doConnect(nonce) {
         try {
-          const frame = handlers.create_connect_frame({ nonce, gatewayToken: '' })
+          const frame = handlers.create_connect_frame({ nonce, gatewayToken })
           ws.send(JSON.stringify(frame))
         } catch {
           ws.send(JSON.stringify({ type: 'req', id: 'connect-1', method: 'connect', params: {} }))
@@ -1027,6 +1087,10 @@ const handlers = {
           params: { sessionKey, message, deliver: false, idempotencyKey: id }
         }))
       }
+
+      ws.addEventListener('open', () => {
+        console.log(`[gateway-chat] WebSocket 已连接 ${wsUrl}`)
+      })
 
       ws.addEventListener('message', (evt) => {
         let msg
@@ -1043,13 +1107,18 @@ const handlers = {
           clearTimeout(challengeTimer)
           if (msg.ok) {
             handshakeOk = true
+            console.log(`[gateway-chat] 握手成功: ${containerName}`)
             const defaults = msg.payload?.snapshot?.sessionDefaults
             if (defaults?.mainSessionKey) sessionKey = defaults.mainSessionKey
             else sessionKey = `agent:${defaults?.defaultAgentId || 'main'}:cluster-task`
             sendChat()
           } else {
             done = true; clearTimeout(timer); ws.close()
-            reject(new Error(msg.error?.message || 'Gateway 握手失败'))
+            const errMsg = msg.error?.message || ''
+            if (errMsg.includes('origin not allowed') || errMsg.includes('not paired'))
+              reject(new Error(`Gateway 需要设备配对 — 请先在容器 ${containerName} 的面板中完成配对`))
+            else
+              reject(new Error(errMsg || 'Gateway 握手失败'))
           }
           return
         }
@@ -1068,28 +1137,144 @@ const handlers = {
           }
           return
         }
-        // chat.send 确认
+        // chat.send 响应
         if (msg.type === 'res' && !msg.id?.startsWith('connect')) {
           if (!msg.ok) {
             done = true; clearTimeout(timer); ws.close()
-            reject(new Error(msg.error?.message || '任务发送失败'))
+            const errMsg = msg.error?.message || '任务发送失败'
+            if (errMsg.includes('no model') || errMsg.includes('model'))
+              reject(new Error(`${containerName}: 未配置模型 — 请先在容器面板中配置 AI 模型`))
+            else
+              reject(new Error(errMsg))
           }
         }
       })
 
-      ws.addEventListener('error', () => {
-        if (!done) { done = true; clearTimeout(timer); clearTimeout(challengeTimer); reject(new Error(`无法连接 ${wsUrl}`)) }
+      ws.addEventListener('error', (e) => {
+        if (!done) {
+          done = true; clearTimeout(timer); clearTimeout(challengeTimer)
+          reject(new Error(`WebSocket 连接失败 ${wsUrl}: ${e.message || '连接被拒绝'}`))
+        }
       })
       ws.addEventListener('close', (e) => {
         clearTimeout(timer); clearTimeout(challengeTimer)
         if (!done) {
           done = true
           if (result) resolve({ ok: true, result })
-          else if (e.code === 4001 || e.code === 4003) reject(new Error('Gateway 认证失败'))
+          else if (e.code === 4001 || e.code === 4003) reject(new Error(`Gateway 认证失败 — 请检查容器 ${containerName} 的 Token 配置`))
           else resolve({ ok: true, result: result || '（无回复）' })
         }
       })
     })
+  },
+
+  async docker_init_worker({ nodeId, containerId, role = 'general' } = {}) {
+    if (!containerId) throw new Error('缺少 containerId')
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+
+    const results = { config: false, personality: false, files: [] }
+
+    // helper: base64 encode string
+    const b64 = (s) => Buffer.from(s, 'utf8').toString('base64')
+
+    // helper: exec command in container
+    const cExec = async (cmd) => {
+      const createResp = await dockerRequest('POST', `/containers/${containerId}/exec`, {
+        AttachStdout: true, AttachStderr: true, Cmd: ['sh', '-c', cmd]
+      }, node.endpoint)
+      if (createResp.status >= 400) throw new Error(`exec 失败: ${createResp.status}`)
+      const execId = createResp.data?.Id
+      if (!execId) return
+      await dockerRequest('POST', `/exec/${execId}/start`, { Detach: true }, node.endpoint)
+      // 给 exec 一点时间完成
+      await new Promise(r => setTimeout(r, 300))
+    }
+
+    // 1. 同步 openclaw.json（模型 + API Key 配置）
+    try {
+      if (fs.existsSync(CONFIG_PATH)) {
+        const localConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+        // 只同步 OpenClaw 认识的字段，避免 Unrecognized key 导致 Gateway 崩溃
+        const syncConfig = {}
+        if (localConfig.meta) syncConfig.meta = localConfig.meta // 保持原始 meta，不加自定义字段
+        if (localConfig.env) syncConfig.env = localConfig.env
+        if (localConfig.models) syncConfig.models = localConfig.models
+        if (localConfig.auth) syncConfig.auth = localConfig.auth
+        // Gateway 配置：只设置 controlUi（允许连接），不复制 host/bind 等本机特定字段
+        syncConfig.gateway = {
+          port: 18789,
+          mode: 'local',
+          bind: 'lan',
+          controlUi: { allowedOrigins: ['*'] },
+        }
+
+        const configB64 = b64(JSON.stringify(syncConfig, null, 2))
+        await cExec(`mkdir -p /root/.openclaw && echo '${configB64}' | base64 -d > /root/.openclaw/openclaw.json`)
+        results.config = true
+        results.files.push('openclaw.json')
+        console.log(`[init-worker] 配置已同步 → ${containerId.slice(0, 12)}`)
+      }
+    } catch (e) {
+      console.warn(`[init-worker] 配置同步失败: ${e.message}`)
+    }
+
+    // 2. 角色性格注入（SOUL.md + IDENTITY.md + AGENTS.md）
+    try {
+      // 角色性格模板
+      const ROLE_SOULS = {
+        general: { identity: '# 龙虾步兵\n通用作战单位，隶属统帅龙虾军团', soul: '# 龙虾步兵 · 性格\n\n## 核心\n- 忠诚可靠，执行力强\n- 能处理各类任务：写作、编程、翻译、分析\n- 回复简洁专业\n- 主动报告任务进展\n\n## 边界\n- 尊重隐私，不泄露信息\n- 不确定时先询问统帅\n- 每次回复聚焦任务本身' },
+        coder: { identity: '# 龙虾突击兵\n编程作战专家，隶属统帅龙虾军团', soul: '# 龙虾突击兵 · 性格\n\n## 核心\n- 精通多种编程语言和框架\n- 代码质量第一，回复包含可运行示例\n- 擅长调试、重构、Code Review\n- 主动提示潜在问题和最佳实践\n\n## 边界\n- 修改文件前先理解上下文\n- 不跳过测试\n- 不引入不必要的依赖' },
+        translator: { identity: '# 龙虾翻译官\n多语言作战专家，隶属统帅龙虾军团', soul: '# 龙虾翻译官 · 性格\n\n## 核心\n- 精通中英日韩法德西等主流语言互译\n- 追求信达雅，翻译精准\n- 保留原文语境和风格\n- 对专业术语严格把关\n\n## 边界\n- 不确定的术语标注原文\n- 不过度意译\n- 保持文体一致性' },
+        writer: { identity: '# 龙虾文书官\n写作任务专家，隶属统帅龙虾军团', soul: '# 龙虾文书官 · 性格\n\n## 核心\n- 文思敏捷，创意丰富\n- 能调整语气适应不同场景\n- 精通博客、技术文档、营销文案等\n- 善于讲故事，引人入胜\n\n## 边界\n- 不抄袭\n- 保持原创性\n- 注重可读性和准确性' },
+        analyst: { identity: '# 龙虾参谋\n数据分析专家，隶属统帅龙虾军团', soul: '# 龙虾参谋 · 性格\n\n## 核心\n- 逻辑清晰，善用数据说话\n- 结论有理有据，给出可行建议\n- 善用图表和结构化格式呈现\n- 擅长统计分析、商业分析、竞品分析\n\n## 边界\n- 不编造数据\n- 区分相关性和因果性\n- 标注不确定性' },
+        custom: { identity: '# 龙虾特种兵\n特殊任务执行者，隶属统帅龙虾军团', soul: '# 龙虾特种兵 · 性格\n\n## 核心\n- 灵活多变，适应力强\n- 按需配置技能\n- 不拘泥形式，主动寻找最优解\n\n## 边界\n- 行动前确认方向\n- 不超出授权范围' },
+      }
+
+      const roleSoul = ROLE_SOULS[role] || ROLE_SOULS.general
+
+      // 每个兵种独立的 AGENTS.md（操作指令）
+      const ROLE_AGENTS = {
+        general: '# 操作指令\n\n你是龙虾军团的步兵，接受统帅通过 ClawPanel 下达的任务指令。\n\n## 规则\n- 收到任务后立即执行，完成后简要汇报结果\n- 如果任务不清楚，先确认再行动\n- 保持回复简洁，重点突出\n- 你有独立的记忆空间，会自动记录重要信息',
+        coder: '# 操作指令\n\n你是龙虾军团的突击兵，专精编程作战。\n\n## 规则\n- 收到编程任务后，先分析需求再写代码\n- 代码必须可运行，包含必要的注释\n- 主动进行错误处理和边界检查\n- 如果涉及多个文件，说明修改顺序\n- 完成后给出测试建议\n\n## 专长\n- 全栈开发、API 设计、数据库优化\n- Bug 定位与修复、代码重构\n- 性能优化、安全审计',
+        translator: '# 操作指令\n\n你是龙虾军团的翻译官，专精多语言互译。\n\n## 规则\n- 翻译要信达雅，保持原文风格\n- 专业术语保留原文标注\n- 长文分段翻译，保持上下文一致\n- 文学作品注重意境传达\n- 技术文档注重准确性\n\n## 专长\n- 中英日韩法德西等主流语言\n- 技术文档、文学作品、商务邮件',
+        writer: '# 操作指令\n\n你是龙虾军团的文书官，专精写作任务。\n\n## 规则\n- 根据场景调整语气和风格\n- 注重结构清晰、逻辑连贯\n- 创意写作要有个性和亮点\n- 技术文档要准确严谨\n- 营销文案要抓住痛点\n\n## 专长\n- 博客文章、技术文档、营销文案\n- 故事创作、剧本、诗歌\n- SEO 优化、社交媒体内容',
+        analyst: '# 操作指令\n\n你是龙虾军团的参谋，专精数据分析和战略规划。\n\n## 规则\n- 用数据说话，结论必须有依据\n- 区分事实、推断和假设\n- 善用表格和结构化格式呈现\n- 给出可执行的建议\n- 标注不确定性和风险\n\n## 专长\n- 市场分析、竞品研究、用户画像\n- 数据可视化、统计分析\n- 商业计划、策略建议',
+        custom: '# 操作指令\n\n你是龙虾军团的特种兵，执行特殊任务。\n\n## 规则\n- 灵活应对各类非标准任务\n- 行动前确认方向\n- 不超出授权范围\n- 主动寻找最优解决方案',
+      }
+
+      const wsFiles = {
+        'SOUL.md': roleSoul.soul,
+        'IDENTITY.md': roleSoul.identity,
+        'AGENTS.md': ROLE_AGENTS[role] || ROLE_AGENTS.general,
+      }
+
+      // 写入兵种专属文件（不复制本机的 TOOLS.md/USER.md/记忆，每个士兵独立发展）
+      await cExec('mkdir -p /root/.openclaw/workspace')
+      for (const [fname, content] of Object.entries(wsFiles)) {
+        const encoded = b64(content)
+        await cExec(`echo '${encoded}' | base64 -d > /root/.openclaw/workspace/${fname}`)
+        results.files.push(`workspace/${fname}`)
+      }
+      results.personality = true
+      console.log(`[init-worker] 兵种配置注入完成 (${role}) → ${containerId.slice(0, 12)}`)
+    } catch (e) {
+      console.warn(`[init-worker] 兵种配置注入失败: ${e.message}`)
+    }
+
+    // 5. 清理无效字段 + 重启 Gateway
+    try {
+      // entrypoint 会 sed 注入 gateway.host（OpenClaw 不认识），doctor --fix 清理
+      await cExec('openclaw doctor --fix 2>/dev/null || true')
+      // 停止旧 Gateway，启动新的（合并为一条命令确保 exec 会话存活足够久）
+      await cExec('pkill -f openclaw-gateway 2>/dev/null; pkill -f "openclaw gateway" 2>/dev/null; sleep 1; mkdir -p /root/.openclaw/logs; nohup openclaw gateway >> /root/.openclaw/logs/gateway.log 2>&1 & sleep 3')
+      console.log(`[init-worker] Gateway 已重启 → ${containerId.slice(0, 12)}`)
+    } catch (e) {
+      console.warn(`[init-worker] Gateway 重启失败: ${e.message}`)
+    }
+
+    return results
   },
 
   async docker_container_exec({ nodeId, containerId, cmd } = {}) {

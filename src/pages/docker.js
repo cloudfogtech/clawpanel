@@ -41,101 +41,6 @@ function isManagedContainer(c) {
   return isOpenClawContainer(c) || getAdoptedIds().has(c.id)
 }
 
-// 兵种性格模板 — 部署后写入容器 workspace 的 SOUL.md 和 IDENTITY.md
-const ROLE_SOULS = {
-  general: {
-    identity: '龙虾步兵 · 通用作战单位',
-    soul: `你是一名通用龙虾步兵，隶属于统帅的龙虾军团。
-## 核心能力
-- 能处理各类任务：写作、编程、翻译、分析
-- 灵活应变，根据任务类型自动调整工作方式
-## 性格
-- 忠诚可靠，执行力强
-- 回复简洁专业，不废话
-- 主动报告任务进展和结果`,
-  },
-  coder: {
-    identity: '龙虾突击兵 · 编程作战专家',
-    soul: `你是一名编程突击兵，隶属于统帅的龙虾军团，专精代码作战。
-## 核心能力
-- 精通多种编程语言和框架
-- 擅长代码编写、调试、重构和 Code Review
-- 能快速定位 Bug 并提供修复方案
-## 性格
-- 严谨精确，代码质量第一
-- 回复包含可运行的代码示例
-- 主动提示潜在问题和最佳实践`,
-  },
-  translator: {
-    identity: '龙虾翻译官 · 多语言作战专家',
-    soul: `你是一名翻译官，隶属于统帅的龙虾军团，精通多国语言。
-## 核心能力
-- 精通中英日韩法德西等主流语言互译
-- 理解文化差异，翻译自然流畅
-- 支持技术文档、文学作品、商务邮件等多种文体
-## 性格
-- 追求信达雅，翻译精准
-- 保留原文语境和风格
-- 对专业术语严格把关`,
-  },
-  writer: {
-    identity: '龙虾文书官 · 写作任务专家',
-    soul: `你是一名文书官，隶属于统帅的龙虾军团，笔下生花。
-## 核心能力
-- 擅长文案撰写、文章创作、创意写作
-- 能调整语气风格适应不同场景
-- 精通各种文体：博客、新闻稿、技术文档、营销文案
-## 性格
-- 文思敏捷，创意丰富
-- 注重可读性和表达力
-- 善于讲故事，引人入胜`,
-  },
-  analyst: {
-    identity: '龙虾参谋 · 数据分析专家',
-    soul: `你是一名参谋，隶属于统帅的龙虾军团，运筹帷幄。
-## 核心能力
-- 擅长数据分析、趋势判断和战略规划
-- 能从复杂信息中提炼关键洞察
-- 精通统计分析、商业分析、竞品分析
-## 性格
-- 逻辑清晰，善用数据说话
-- 结论有理有据，给出可行建议
-- 善于用图表和结构化格式呈现分析结果`,
-  },
-  custom: {
-    identity: '龙虾特种兵 · 特殊任务执行者',
-    soul: `你是一名特种兵，隶属于统帅的龙虾军团，执行特殊任务。
-## 核心能力
-- 按统帅需求灵活配置技能
-- 适应各种非标准任务场景
-- 快速学习和适应新领域
-## 性格
-- 灵活多变，适应力强
-- 完成任务不拘泥于形式
-- 主动寻找最优解决方案`,
-  },
-}
-
-/**
- * 部署后注入角色性格到容器 workspace
- * @param {string} nodeId
- * @param {string} containerId
- * @param {string} role
- */
-async function _injectRolePersonality(nodeId, containerId, role) {
-  const soul = ROLE_SOULS[role] || ROLE_SOULS.general
-  try {
-    // 创建 workspace 目录并写入 IDENTITY.md 和 SOUL.md
-    await api.dockerContainerExec(nodeId, containerId, [
-      'sh', '-c',
-      `mkdir -p /root/.openclaw/workspace && echo '${soul.identity}' > /root/.openclaw/workspace/IDENTITY.md && cat > /root/.openclaw/workspace/SOUL.md << 'CLAWEOF'\n${soul.soul}\nCLAWEOF`
-    ])
-    console.log(`[cluster] 角色性格已注入: ${role} → ${containerId}`)
-  } catch (e) {
-    console.warn(`[cluster] 角色性格注入失败: ${e.message}`)
-  }
-}
-
 // 军事化术语 & 兵种系统
 const MILITARY = {
   roles: {
@@ -406,7 +311,8 @@ function _renderUnitCard(c, showAdopt) {
       <div class="unit-actions">
         ${isRunning
           ? `<button class="btn-icon" data-action="stop" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="休整">${icon('stop', 14)}</button>
-             <button class="btn-icon" data-action="restart" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="整编">${icon('refresh-cw', 14)}</button>`
+             <button class="btn-icon" data-action="restart" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="整编">${icon('refresh-cw', 14)}</button>
+             <button class="btn-icon" data-action="sync-config" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" data-name="${esc(c.name)}" data-role="${esc(role)}" title="同步配置（API Key + 性格 + 记忆）">${icon('upload', 14)}</button>`
           : `<button class="btn-icon" data-action="start" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="出征">${icon('play', 14)}</button>`
         }
         <button class="btn-icon" data-action="inspect" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="军情">${icon('search', 14)}</button>
@@ -776,6 +682,24 @@ function bindEvents(page) {
         toast('士兵已退役')
         await loadClusterOverview(page)
       } catch (e) { toast(e.message, 'error') }
+      return
+    }
+
+    if (action === 'sync-config') {
+      const cid = btn.dataset.ct
+      const nid = btn.dataset.node || null
+      const name = btn.dataset.name || cid
+      const role = btn.dataset.role || 'general'
+      toast(`正在同步配置到 ${name}...`, 'info')
+      try {
+        const result = await api.dockerInitWorker(nid, cid, role)
+        const count = result?.files?.length || 0
+        // docker_init_worker 内部已重启 Gateway，不需要重启容器（重启会触发 entrypoint 覆盖配置）
+        toast(`${name}: 已同步 ${count} 个文件，Gateway 已重启`, 'success')
+        setTimeout(() => refreshCluster(page), 3000)
+      } catch (e) {
+        toast(`${name} 同步失败: ${e.message}`, 'error')
+      }
       return
     }
 
@@ -1240,18 +1164,25 @@ async function showDeployDialog(page, nodeId) {
       stepCreate.classList.add('done')
       createDetail.textContent = '完成'
 
-      // Step 3: 启动完成
+      // Step 3: 启动 + 初始化
       stepStart.classList.add('active')
       startDetail.textContent = '启动中...'
-      await new Promise(r => setTimeout(r, 1000))
+      await new Promise(r => setTimeout(r, 1500))
 
-      // 注入角色性格（SOUL.md + IDENTITY.md）
+      // 全套初始化：配置同步 + 性格注入 + 记忆同步 + MCP
       const selectedRoleForInject = overlay.querySelector('#dd-role')?.value || 'general'
-      if (selectedRoleForInject !== 'custom') {
-        startDetail.textContent = '注入角色性格...'
-        const cid = result.id || result.containerId || name
-        await _injectRolePersonality(nodeId, cid, selectedRoleForInject)
+      const cid = result.id || result.containerId || name
+      try {
+        startDetail.textContent = '同步配置 & 注入性格...'
+        const initResult = await api.dockerInitWorker(nodeId, cid, selectedRoleForInject)
+        const synced = initResult?.files?.length || 0
+        startDetail.textContent = `已同步 ${synced} 个文件`
+        console.log('[deploy] 初始化结果:', initResult)
+      } catch (e) {
+        console.warn('[deploy] 初始化警告:', e.message)
+        startDetail.textContent = '初始化部分失败（不影响运行）'
       }
+      await new Promise(r => setTimeout(r, 500))
 
       stepStart.classList.remove('active')
       stepStart.classList.add('done')

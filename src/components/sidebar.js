@@ -43,7 +43,7 @@ const NAV_ITEMS_FULL = [
   {
     section: '龙虾军团',
     items: [
-      { route: '/docker', label: '🦞 龙虾军团', icon: 'docker' },
+      { route: '/docker', label: '龙虾军团', icon: 'docker' },
     ]
   },
   {
@@ -64,10 +64,9 @@ const NAV_ITEMS_SETUP = [
     ]
   },
   {
-    section: '扩展',
+    section: '',
     items: [
       { route: '/extensions', label: '扩展工具', icon: 'extensions' },
-      { route: '/skills', label: 'Skills', icon: 'skills' },
     ]
   },
   {
@@ -275,7 +274,7 @@ async function _toggleInstanceDropdown(sidebarEl) {
   if (!dd) return
   if (dd.classList.contains('open')) { dd.classList.remove('open'); return }
 
-  dd.innerHTML = '<div style="padding:8px;color:var(--text-tertiary);font-size:12px">loading...</div>'
+  dd.innerHTML = '<div style="padding:8px;color:var(--text-tertiary);font-size:12px">加载中...</div>'
   dd.classList.add('open')
 
   try {
@@ -287,7 +286,7 @@ async function _toggleInstanceDropdown(sidebarEl) {
       const h = healthMap[inst.id] || {}
       const active = inst.id === activeId ? ' active' : ''
       const dot = h.online !== false ? 'online' : 'offline'
-      const badge = inst.type === 'docker' ? '<span class="instance-badge">Docker</span>' : inst.type === 'remote' ? '<span class="instance-badge">Remote</span>' : ''
+      const badge = inst.type === 'docker' ? '<span class="instance-badge docker">🦞 龙虾</span>' : inst.type === 'remote' ? '<span class="instance-badge remote">远程</span>' : ''
       html += `<div class="instance-option${active}" data-id="${inst.id}">
         <span class="instance-dot ${dot}"></span>
         <span class="instance-opt-name">${_escSidebar(inst.name)}</span>
@@ -295,7 +294,7 @@ async function _toggleInstanceDropdown(sidebarEl) {
       </div>`
     }
     html += '<div class="instance-divider"></div>'
-    html += '<div class="instance-option instance-add" id="btn-instance-add">+ Add Instance</div>'
+    html += '<div class="instance-option instance-add" id="btn-instance-add">+ 添加实例</div>'
     dd.innerHTML = html
   } catch (e) {
     dd.innerHTML = `<div style="padding:8px;color:var(--error);font-size:12px">${_escSidebar(e.message)}</div>`
@@ -307,27 +306,27 @@ async function _showAddInstanceDialog(sidebarEl) {
   overlay.className = 'docker-dialog-overlay'
   overlay.innerHTML = `
     <div class="docker-dialog">
-      <div class="docker-dialog-title">Add Instance</div>
+      <div class="docker-dialog-title">添加远程实例</div>
       <div class="form-group" style="margin-bottom:var(--space-md)">
-        <label class="form-label">Name</label>
-        <input class="form-input" id="inst-name" placeholder="My Server" />
+        <label class="form-label">名称</label>
+        <input class="form-input" id="inst-name" placeholder="远程服务器" />
       </div>
       <div class="form-group" style="margin-bottom:var(--space-md)">
-        <label class="form-label">Panel Endpoint</label>
+        <label class="form-label">面板地址</label>
         <input class="form-input" id="inst-endpoint" placeholder="http://192.168.1.100:1420" />
       </div>
       <div class="form-group" style="margin-bottom:var(--space-md)">
-        <label class="form-label">Gateway Port (optional)</label>
+        <label class="form-label">Gateway 端口（可选）</label>
         <input class="form-input" id="inst-gw-port" type="number" value="18789" />
       </div>
       <div class="docker-dialog-hint">
-        The remote server must be running ClawPanel (serve.js).<br/>
-        Example: <code>http://192.168.1.100:1420</code>
+        远程服务器需要运行 ClawPanel (serve.js)。<br/>
+        示例: <code>http://192.168.1.100:1420</code>
       </div>
       <div id="inst-add-error" style="color:var(--error);font-size:12px;margin-top:var(--space-sm)"></div>
       <div class="docker-dialog-actions">
-        <button class="btn btn-secondary btn-sm" id="inst-cancel">Cancel</button>
-        <button class="btn btn-primary btn-sm" id="inst-confirm">Add</button>
+        <button class="btn btn-secondary btn-sm" id="inst-cancel">取消</button>
+        <button class="btn btn-primary btn-sm" id="inst-confirm">添加</button>
       </div>
     </div>
   `
@@ -339,16 +338,16 @@ async function _showAddInstanceDialog(sidebarEl) {
     const endpoint = overlay.querySelector('#inst-endpoint').value.trim()
     const gwPort = parseInt(overlay.querySelector('#inst-gw-port').value) || 18789
     const errEl = overlay.querySelector('#inst-add-error')
-    if (!name || !endpoint) { errEl.textContent = 'Name and endpoint are required'; return }
+    if (!name || !endpoint) { errEl.textContent = '请填写名称和面板地址'; return }
     const btn = overlay.querySelector('#inst-confirm')
-    btn.disabled = true; btn.textContent = 'Adding...'
+    btn.disabled = true; btn.textContent = '添加中...'
     try {
       await api.instanceAdd({ name, type: 'remote', endpoint, gatewayPort: gwPort })
       overlay.remove()
       renderSidebar(sidebarEl)
     } catch (e) {
       errEl.textContent = e.message || String(e)
-      btn.disabled = false; btn.textContent = 'Add'
+      btn.disabled = false; btn.textContent = '添加'
     }
   }
 }
