@@ -11,8 +11,10 @@ export const API_TYPES = [
   { value: 'google-gemini', label: 'Google Gemini' },
 ]
 
-// 服务商快捷预设
+// 服务商快捷预设（晴辰云官方置顶）
 export const PROVIDER_PRESETS = [
+  { key: 'qtcool', label: '晴辰云', badge: '官方', baseUrl: 'https://gpt.qt.cool/v1', api: 'openai-completions', site: 'https://gpt.qt.cool/', desc: 'GPT-5 全系列开箱即用，更多模型持续接入中。每日签到送额度 · 邀请送余额 · 充值最低 3 折消耗 · 未消耗包退' },
+  { key: 'shengsuanyun', label: '胜算云', hidden: true, baseUrl: 'https://router.shengsuanyun.com/api/v1', api: 'openai-completions', site: 'https://www.shengsuanyun.com/?from=CH_4BVI0BM2', desc: '国内知名 AI 模型聚合平台，支持多种主流模型' },
   { key: 'openai', label: 'OpenAI 官方', baseUrl: 'https://api.openai.com/v1', api: 'openai-completions' },
   { key: 'anthropic', label: 'Anthropic 官方', baseUrl: 'https://api.anthropic.com', api: 'anthropic-messages' },
   { key: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', api: 'openai-completions' },
@@ -20,15 +22,26 @@ export const PROVIDER_PRESETS = [
   { key: 'ollama', label: 'Ollama (本地)', baseUrl: 'http://127.0.0.1:11434/v1', api: 'openai-completions' },
 ]
 
-// gpt.qt.cool 推广配置
+// 晴辰云推广配置
 export const QTCOOL = {
   baseUrl: 'https://gpt.qt.cool/v1',
   defaultKey: 'sk-0JDu7hyc51ZKD4iNebpFu07EUEhXmVVc',
   site: 'https://gpt.qt.cool/',
+  checkinUrl: 'https://gpt.qt.cool/checkin',
   usageUrl: 'https://gpt.qt.cool/user?key=',
   providerKey: 'qtcool',
+  brandName: '晴辰云',
   api: 'openai-completions',
   models: []  // 始终从 API 动态获取最新模型列表
+}
+
+// 胜算云推广配置
+export const SHENGSUANYUN = {
+  baseUrl: 'https://router.shengsuanyun.com/api/v1',
+  site: 'https://www.shengsuanyun.com/?from=CH_4BVI0BM2',
+  providerKey: 'shengsuanyun',
+  brandName: '胜算云',
+  api: 'openai-completions',
 }
 
 // 常用模型预设（按服务商分组）

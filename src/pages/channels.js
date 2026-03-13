@@ -234,11 +234,11 @@ function renderAvailable(page, state) {
   el.innerHTML = Object.entries(PLATFORM_REGISTRY).map(([pid, reg]) => {
     const done = configuredIds.has(pid)
     return `
-      <button class="platform-pick ${done ? 'configured' : ''}" data-pid="${pid}">
+      <button class="platform-pick" data-pid="${pid}">
         <span class="platform-emoji">${icon(reg.iconName, 28)}</span>
         <span class="platform-pick-name">${reg.label}</span>
         <span class="platform-pick-desc">${reg.desc}</span>
-        ${done ? `<span class="platform-pick-badge">已接入</span>` : ''}
+        ${done ? `<span class="platform-pick-badge" style="color:var(--success)">已接入 · 点击绑定新 Agent</span>` : ''}
       </button>
     `
   }).join('')
@@ -627,17 +627,26 @@ function getChannelBindingKey(pid) {
   return map[pid] || pid
 }
 
-/** 保存渠道→Agent 绑定到 openclaw.json 的 bindings 数组 */
-async function saveChannelBinding(pid, agentId) {
+/** 保存渠道→Agent 绑定到 openclaw.json 的 bindings 数组
+ * 支持同一渠道多个 Agent 绑定（不同 agentId）
+ * oldAgentId: 编辑时替换老绑定
+ */
+async function saveChannelBinding(pid, agentId, oldAgentId) {
   const config = await api.readOpenclawConfig()
   if (!config) return
   const channelKey = getChannelBindingKey(pid)
   let bindings = Array.isArray(config.bindings) ? [...config.bindings] : []
 
-  // 移除该渠道的旧绑定
-  bindings = bindings.filter(b => b.match?.channel !== channelKey)
+  // 编辑模式：移除旧绑定（按 channel + oldAgentId）
+  if (oldAgentId) {
+    bindings = bindings.filter(b => !(b.match?.channel === channelKey && (b.agentId || 'main') === oldAgentId))
+  }
 
-  // 如果选了非空 Agent 且不是 main，添加新绑定
+  // 避免重复：如果已有相同 channel+agentId 的绑定，先移除
+  const effectiveAgent = agentId || 'main'
+  bindings = bindings.filter(b => !(b.match?.channel === channelKey && (b.agentId || 'main') === effectiveAgent))
+
+  // 添加新绑定（main 也明确写入，方便 UI 展示）
   if (agentId && agentId !== 'main') {
     bindings.push({ match: { channel: channelKey }, agentId })
   }

@@ -564,6 +564,30 @@ pub async fn get_version_info() -> Result<VersionInfo, String> {
     })
 }
 
+/// 获取 OpenClaw 运行时状态摘要（openclaw status --json）
+/// 包含 runtimeVersion、会话列表（含 token 用量、fastMode 等标签）
+#[tauri::command]
+pub async fn get_status_summary() -> Result<Value, String> {
+    let output = crate::utils::openclaw_command_async()
+        .args(["status", "--json"])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // CLI 输出可能含非 JSON 行，复用 skills 模块的 extract_json
+            crate::commands::skills::extract_json_pub(&stdout)
+                .ok_or_else(|| "解析失败: 输出中未找到有效 JSON".to_string())
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            Err(format!("openclaw status 失败: {}", stderr.trim()))
+        }
+        Err(e) => Err(format!("执行 openclaw 失败: {e}")),
+    }
+}
+
 /// npm 包名映射
 fn npm_package_name(source: &str) -> &'static str {
     match source {

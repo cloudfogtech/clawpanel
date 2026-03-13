@@ -2522,8 +2522,9 @@ function showSettings() {
           <div class="form-group" style="margin-bottom:8px">
             <label class="form-label">快捷选择</label>
             <div id="ast-provider-presets" style="display:flex;flex-wrap:wrap;gap:6px">
-              ${PROVIDER_PRESETS.map(p => `<button class="btn btn-sm btn-secondary ast-preset-btn" data-key="${p.key}" data-url="${escHtml(p.baseUrl)}" data-api="${p.api}" style="font-size:12px;padding:3px 10px">${p.label}</button>`).join('')}
+              ${PROVIDER_PRESETS.filter(p => !p.hidden).map(p => `<button class="btn btn-sm btn-secondary ast-preset-btn" data-key="${p.key}" data-url="${escHtml(p.baseUrl)}" data-api="${p.api}" style="font-size:12px;padding:3px 10px">${p.label}${p.badge ? ' <span style="font-size:9px;background:var(--accent);color:#fff;padding:1px 4px;border-radius:6px;margin-left:3px">' + p.badge + '</span>' : ''}</button>`).join('')}
             </div>
+            <div id="ast-preset-detail" style="display:none;margin-top:6px;padding:8px 12px;background:var(--bg-tertiary);border-radius:var(--radius-md);font-size:12px"></div>
           </div>
           <div style="display:flex;gap:10px">
             <div class="form-group" style="flex:1">
@@ -2736,6 +2737,17 @@ function showSettings() {
       // 高亮选中
       overlay.querySelectorAll('.ast-preset-btn').forEach(b => b.style.opacity = '0.5')
       btn.style.opacity = '1'
+      // 显示服务商详情
+      const preset = PROVIDER_PRESETS.find(p => p.key === btn.dataset.key)
+      const detailEl = overlay.querySelector('#ast-preset-detail')
+      if (detailEl && preset && (preset.desc || preset.site)) {
+        let html = preset.desc ? `<div style="color:var(--text-secondary);line-height:1.5">${preset.desc}</div>` : ''
+        if (preset.site) html += `<a href="${preset.site}" target="_blank" style="color:var(--accent);text-decoration:none;font-size:11px;margin-top:3px;display:inline-block">→ 访问 ${preset.label}官网</a>`
+        detailEl.innerHTML = html
+        detailEl.style.display = 'block'
+      } else if (detailEl) {
+        detailEl.style.display = 'none'
+      }
     }
   })
 

@@ -34,6 +34,20 @@ const COMMANDS = [
     { cmd: '/think medium', desc: '中度思考', action: 'exec' },
     { cmd: '/think high', desc: '深度思考', action: 'exec' },
   ]},
+  { title: '快速模式', commands: [
+    { cmd: '/fast', desc: '切换快速模式（开/关）', action: 'exec' },
+    { cmd: '/fast on', desc: '开启快速模式（低延迟）', action: 'exec' },
+    { cmd: '/fast off', desc: '关闭快速模式', action: 'exec' },
+  ]},
+  { title: '详细/推理', commands: [
+    { cmd: '/verbose off', desc: '关闭详细模式', action: 'exec' },
+    { cmd: '/verbose low', desc: '低详细度', action: 'exec' },
+    { cmd: '/verbose high', desc: '高详细度', action: 'exec' },
+    { cmd: '/reasoning off', desc: '关闭推理模式', action: 'exec' },
+    { cmd: '/reasoning low', desc: '轻度推理', action: 'exec' },
+    { cmd: '/reasoning medium', desc: '中度推理', action: 'exec' },
+    { cmd: '/reasoning high', desc: '深度推理', action: 'exec' },
+  ]},
   { title: '信息', commands: [
     { cmd: '/help', desc: '帮助信息', action: 'exec' },
     { cmd: '/status', desc: '系统状态', action: 'exec' },
@@ -880,6 +894,16 @@ function handleEvent(msg) {
   if (!payload) return
 
   if (event === 'chat') handleChatEvent(payload)
+
+  // Compaction 状态指示：上游 2026.3.12 新增 status_reaction 事件
+  if (event === 'chat.status_reaction' || event === 'status_reaction') {
+    const reaction = payload.reaction || payload.emoji || ''
+    if (reaction.includes('compact') || reaction === '🗜️' || reaction === '📦') {
+      showCompactionHint(true)
+    } else if (!reaction || reaction === 'thinking' || reaction === '💭') {
+      showCompactionHint(false)
+    }
+  }
 }
 
 function handleChatEvent(payload) {
@@ -1526,6 +1550,20 @@ function clearMessages() {
 function showTyping(show) {
   if (_typingEl) _typingEl.style.display = show ? 'flex' : 'none'
   if (show) scrollToBottom()
+}
+
+function showCompactionHint(show) {
+  let hint = _page?.querySelector('#compaction-hint')
+  if (show && !hint && _messagesEl) {
+    hint = document.createElement('div')
+    hint.id = 'compaction-hint'
+    hint.className = 'msg msg-system compaction-hint'
+    hint.innerHTML = '🗜️ 正在整理上下文（Compaction）…'
+    _messagesEl.insertBefore(hint, _typingEl)
+    scrollToBottom()
+  } else if (!show && hint) {
+    hint.remove()
+  }
 }
 
 function scrollToBottom() {

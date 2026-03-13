@@ -45,7 +45,26 @@ detect_os() {
     else
         OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     fi
-    echo "🖥️  系统: $OS $(uname -m)"
+    ARCH=$(uname -m)
+    echo "🖥️  系统: $OS $ARCH"
+
+    # ARM 架构检测和提示
+    case "$ARCH" in
+        aarch64|arm64)
+            echo "✅ ARM64 架构，Web 模式和 Docker 模式均支持"
+            ;;
+        armv7*|armhf)
+            echo "⚠️  ARM 32位 ($ARCH)：Web 模式可用，Docker 镜像仅支持 arm64"
+            ;;
+        armv6*)
+            echo "⚠️  ARM v6 ($ARCH)：内存和性能可能不足，建议升级到 ARM64 设备"
+            ;;
+        x86_64|amd64)
+            ;;
+        *)
+            echo "ℹ️  架构: $ARCH"
+            ;;
+    esac
 }
 
 # 安装 Node.js

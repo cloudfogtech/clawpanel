@@ -304,6 +304,8 @@ async function boot() {
   registerRoute('/setup', () => import('./pages/setup.js'))
   registerRoute('/channels', () => import('./pages/channels.js'))
   registerRoute('/cron', () => import('./pages/cron.js'))
+  registerRoute('/usage', () => import('./pages/usage.js'))
+  registerRoute('/communication', () => import('./pages/communication.js'))
 
   renderSidebar(sidebar)
   initRouter(content)

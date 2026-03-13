@@ -123,35 +123,6 @@ function renderConfig(page, state) {
 
     <div class="config-section">
       <div class="config-section-title">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-        运行模式
-      </div>
-      <div class="gw-option-cards">
-        <label class="gw-option-card ${gw.mode === 'remote' ? '' : 'selected'}" data-mode="local">
-          <input type="radio" name="gw-mode" value="local" ${gw.mode === 'remote' ? '' : 'checked'} hidden>
-          <div class="gw-option-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-          </div>
-          <div class="gw-option-text">
-            <div class="gw-option-title">本地模式</div>
-            <div class="gw-option-desc">模型跑在这台电脑上（如 Ollama），不需要联网</div>
-          </div>
-        </label>
-        <label class="gw-option-card ${gw.mode === 'remote' ? 'selected' : ''}" data-mode="remote">
-          <input type="radio" name="gw-mode" value="remote" ${gw.mode === 'remote' ? 'checked' : ''} hidden>
-          <div class="gw-option-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-          </div>
-          <div class="gw-option-text">
-            <div class="gw-option-title">云端模式</div>
-            <div class="gw-option-desc">调用线上 AI 服务（OpenAI、Claude 等），大多数人选这个</div>
-          </div>
-        </label>
-      </div>
-    </div>
-
-    <div class="config-section">
-      <div class="config-section-title">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
         安全认证
       </div>
@@ -325,8 +296,7 @@ async function saveConfig(page, state) {
   const port = parseInt(page.querySelector('#gw-port')?.value) || 18789
   const bindRadio = page.querySelector('input[name="gw-bind"]:checked')
   const bind = bindRadio?.value || 'loopback'
-  const modeRadio = page.querySelector('input[name="gw-mode"]:checked')
-  const mode = modeRadio?.value || 'local'
+  const mode = 'local'
   const authModeRadio = page.querySelector('input[name="gw-auth-mode"]:checked')
   const authMode = authModeRadio?.value || 'token'
   const authToken = page.querySelector('#gw-token')?.value || ''

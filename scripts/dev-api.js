@@ -2386,6 +2386,27 @@ const handlers = {
     }
   },
 
+  // 运行时状态摘要（openclaw status --json）
+  get_status_summary() {
+    try {
+      const raw = execSync('openclaw status --json 2>&1', { windowsHide: true, timeout: 10000 }).toString()
+      // 提取第一个 JSON 对象
+      const idx = raw.indexOf('{')
+      if (idx >= 0) {
+        try { return JSON.parse(raw.slice(idx)) } catch {}
+        // 流式解析：找到匹配的 } 结束
+        let depth = 0
+        for (let i = idx; i < raw.length; i++) {
+          if (raw[i] === '{') depth++
+          else if (raw[i] === '}') { depth--; if (depth === 0) { try { return JSON.parse(raw.slice(idx, i + 1)) } catch { break } } }
+        }
+      }
+      return { error: '解析失败' }
+    } catch (e) {
+      return { error: e.message || String(e) }
+    }
+  },
+
   // 版本信息
   get_version_info() {
     let current = null

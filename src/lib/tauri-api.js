@@ -155,6 +155,7 @@ export const api = {
 
   // 配置（读缓存，写清缓存）
   getVersionInfo: () => cachedInvoke('get_version_info', {}, 30000),
+  getStatusSummary: () => cachedInvoke('get_status_summary', {}, 5000),
   readOpenclawConfig: () => cachedInvoke('read_openclaw_config'),
   writeOpenclawConfig: (config) => { invalidate('read_openclaw_config'); return invoke('write_openclaw_config', { config }) },
   readMcpConfig: () => cachedInvoke('read_mcp_config'),

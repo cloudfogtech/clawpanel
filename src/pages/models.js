@@ -32,11 +32,12 @@ export async function render() {
         <div style="flex:1;min-width:240px">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
             <span style="font-size:20px">${icon('gift', 22)}</span>
-            <span style="font-weight:700;font-size:16px;letter-spacing:0.3px">ClawPanel 公益 AI 接口计划</span>
+            <span style="font-weight:700;font-size:16px;letter-spacing:0.3px">晴辰云 AI 接口</span>
+            <span style="font-size:10px;background:rgba(255,255,255,0.2);padding:2px 8px;border-radius:10px;font-weight:600">官方</span>
           </div>
           <div style="font-size:13px;color:rgba(255,255,255,0.65);line-height:1.7">
-            Token 费用？我们帮你出了。调用成本由项目组内部承担，GPT-5 全系列模型开箱即用。<br>
-            无需注册、无需付费、支持 OpenAI 兼容接口 — 点击即享。
+            每日签到送免费额度 · 邀请好友送余额 · 充值最低 3 折消耗 · 未消耗余额随时包退<br>
+            GPT-5 全系列模型开箱即用，更多主流模型持续接入中。OpenAI 兼容接口，一键配置
           </div>
         </div>
         <div style="display:flex;flex-direction:column;gap:10px;align-items:flex-end">
@@ -779,19 +780,20 @@ function bindTopActions(page, state) {
 // 添加服务商（带预设快捷选择）
 function addProvider(page, state) {
   // 构建预设按钮 HTML
-  const presetsHtml = PROVIDER_PRESETS.map(p =>
-    `<button class="btn btn-sm btn-secondary preset-btn" data-preset="${p.key}" style="margin:0 6px 6px 0">${p.label}</button>`
+  const presetsHtml = PROVIDER_PRESETS.filter(p => !p.hidden).map(p =>
+    `<button class="btn btn-sm btn-secondary preset-btn" data-preset="${p.key}" style="margin:0 6px 6px 0">${p.label}${p.badge ? ' <span style="font-size:9px;background:var(--accent);color:#fff;padding:1px 5px;border-radius:8px;margin-left:4px">' + p.badge + '</span>' : ''}</button>`
   ).join('')
 
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `
-    <div class="modal">
+    <div class="modal" style="max-height:85vh;overflow-y:auto">
       <div class="modal-title">添加服务商</div>
       <div class="form-group">
         <label class="form-label">快捷选择</label>
         <div style="display:flex;flex-wrap:wrap">${presetsHtml}</div>
         <div class="form-hint">选择常用服务商自动填充，或手动填写下方信息</div>
+        <div id="preset-detail" style="display:none;margin-top:8px;padding:10px 14px;background:var(--bg-tertiary);border-radius:var(--radius-md);font-size:var(--font-size-sm)"></div>
       </div>
       <div class="form-group">
         <label class="form-label">服务商名称</label>
@@ -835,6 +837,18 @@ function addProvider(page, state) {
       // 高亮选中的预设
       overlay.querySelectorAll('.preset-btn').forEach(b => b.style.opacity = '0.5')
       btn.style.opacity = '1'
+      // 显示服务商详情（官网、描述）
+      const detailEl = overlay.querySelector('#preset-detail')
+      if (detailEl) {
+        if (preset.desc || preset.site) {
+          let html = preset.desc ? `<div style="color:var(--text-secondary);line-height:1.6">${preset.desc}</div>` : ''
+          if (preset.site) html += `<a href="${preset.site}" target="_blank" style="color:var(--accent);text-decoration:none;font-size:12px;margin-top:4px;display:inline-block">→ 访问 ${preset.label}官网</a>`
+          detailEl.innerHTML = html
+          detailEl.style.display = 'block'
+        } else {
+          detailEl.style.display = 'none'
+        }
+      }
     }
   })
 

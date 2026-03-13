@@ -97,6 +97,7 @@ pub fn run() {
             config::auto_install_git,
             config::configure_git_https,
             config::invalidate_path_cache,
+            config::get_status_summary,
             // 设备密钥 + Gateway 握手
             device::create_connect_frame,
             // 设备配对

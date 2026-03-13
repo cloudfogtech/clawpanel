@@ -45,9 +45,10 @@ pub fn read_log_tail(log_name: String, lines: Option<u32>) -> Result<String, Str
     file.seek(SeekFrom::Start(start_pos))
         .map_err(|e| format!("Seek 失败: {e}"))?;
 
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)
         .map_err(|e| format!("读取日志失败: {e}"))?;
+    let buf = String::from_utf8_lossy(&raw).into_owned();
 
     let mut all_lines: Vec<&str> = buf.lines().collect();
 

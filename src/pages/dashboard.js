@@ -67,6 +67,7 @@ async function loadDashboardData(page) {
     api.listAgents(),
     api.readMcpConfig(),
     api.listBackups(),
+    api.getStatusSummary(),
   ])
   const logsP = api.readLogTail('gateway', 20).catch(() => '')
 
@@ -98,13 +99,14 @@ async function loadDashboardData(page) {
   renderStatCards(page, services, version, [], config)
 
   // 第二波：Agent、MCP、备份 → 更新卡片 + 渲染总览
-  const [agentsRes, mcpRes, backupsRes] = await secondaryP
+  const [agentsRes, mcpRes, backupsRes, statusRes] = await secondaryP
   const agents = agentsRes.status === 'fulfilled' ? agentsRes.value : []
   const mcpConfig = mcpRes.status === 'fulfilled' ? mcpRes.value : null
   const backups = backupsRes.status === 'fulfilled' ? backupsRes.value : []
+  const statusSummary = statusRes.status === 'fulfilled' ? statusRes.value : null
 
   renderStatCards(page, services, version, agents, config)
-  renderOverview(page, services, mcpConfig, backups, config, agents)
+  renderOverview(page, services, mcpConfig, backups, config, agents, statusSummary)
 
   // 第三波：日志（最低优先级）
   const logs = await logsP
@@ -168,7 +170,7 @@ function renderStatCards(page, services, version, agents, config) {
   `
 }
 
-function renderOverview(page, services, mcpConfig, backups, config, agents) {
+function renderOverview(page, services, mcpConfig, backups, config, agents, statusSummary) {
   const containerEl = page.querySelector('#dashboard-overview-container')
   const gw = services.find(s => s.label === 'ai.openclaw.gateway')
   const mcpCount = mcpConfig?.mcpServers ? Object.keys(mcpConfig.mcpServers).length : 0
@@ -185,6 +187,8 @@ function renderOverview(page, services, mcpConfig, backups, config, agents) {
 
   const latestBackup = backups.length > 0 ? backups.sort((a,b) => b.created_at - a.created_at)[0] : null
   const lastUpdate = config?.meta?.lastTouchedVersion || '未知'
+  const runtimeVer = statusSummary?.runtimeVersion || null
+  const sessions = statusSummary?.sessions || null
 
   const gwPort = config?.gateway?.port || 18789
   const primaryModel = config?.agents?.defaults?.model?.primary || '未设置'
@@ -258,12 +262,13 @@ function renderOverview(page, services, mcpConfig, backups, config, agents) {
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
           </div>
           <div class="overview-card-body">
-            <div class="overview-card-title">配置版本</div>
-            <div class="overview-card-value" style="font-size:var(--font-size-sm)">${lastUpdate}</div>
-            <div class="overview-card-meta">openclaw.json</div>
+            <div class="overview-card-title">运行时版本</div>
+            <div class="overview-card-value" style="font-size:var(--font-size-sm)">${runtimeVer || lastUpdate}</div>
+            <div class="overview-card-meta">${runtimeVer ? 'OpenClaw Runtime' : 'openclaw.json'}</div>
           </div>
         </div>
       </div>
+      ${renderSessionStatus(sessions)}
     </div>
   `
 
@@ -275,6 +280,37 @@ function renderOverview(page, services, mcpConfig, backups, config, agents) {
       navigate(card.dataset.nav)
     })
   })
+}
+
+function renderSessionStatus(sessions) {
+  if (!sessions || !sessions.recent || sessions.recent.length === 0) return ''
+  const rows = sessions.recent.slice(0, 5).map(s => {
+    const pct = s.percentUsed ?? 0
+    const barColor = pct > 80 ? 'var(--error)' : pct > 50 ? 'var(--warning)' : 'var(--success)'
+    const flags = (s.flags || []).map(f => `<span class="session-flag">${escapeHtml(f)}</span>`).join('')
+    const model = s.model ? `<span class="session-model">${escapeHtml(s.model)}</span>` : ''
+    const tokens = s.totalTokens != null && s.totalTokens > 0 ? `${Math.round(s.totalTokens / 1000)}k` : '0'
+    const ctx = s.contextTokens != null ? `${Math.round(s.contextTokens / 1000)}k` : '—'
+    const remaining = s.remainingTokens != null ? `${Math.round(s.remainingTokens / 1000)}k` : ctx
+    const key = escapeHtml(s.key || '').replace(/^agent:main:/, '')
+    return `<div class="session-row">
+      <div class="session-row-header">
+        <span class="session-key" title="${escapeHtml(s.key || '')}">${key || '—'}</span>
+        ${model}${flags}
+      </div>
+      <div class="session-bar-wrap">
+        <div class="session-bar" style="width:${Math.min(pct, 100)}%;background:${barColor}"></div>
+      </div>
+      <div class="session-row-meta">${tokens} / ${ctx} · 剩余 ${remaining} · ${pct}%</div>
+    </div>`
+  })
+  const defaultModel = sessions.defaults?.model || '—'
+  const defaultCtx = sessions.defaults?.contextTokens ? `${Math.round(sessions.defaults.contextTokens / 1000)}k` : '—'
+  return `
+    <div class="config-section" style="margin-top:16px">
+      <div class="config-section-title">活跃会话 <span style="font-weight:normal;color:var(--text-tertiary);font-size:var(--font-size-xs)">${sessions.count || 0} 个 · 默认模型 ${escapeHtml(defaultModel)} · 上下文 ${defaultCtx}</span></div>
+      <div class="session-list">${rows.join('')}</div>
+    </div>`
 }
 
 function renderLogs(page, logs) {

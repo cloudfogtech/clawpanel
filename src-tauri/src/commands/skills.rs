@@ -220,6 +220,11 @@ pub async fn skills_clawhub_search(query: String) -> Result<Value, String> {
     Ok(Value::Array(items))
 }
 
+/// Public wrapper for extract_json, used by config.rs get_status_summary
+pub fn extract_json_pub(text: &str) -> Option<Value> {
+    extract_json(text)
+}
+
 /// Extract the first valid JSON object or array from a string that may contain
 /// non-JSON lines (Node.js warnings, npm update prompts, etc.)
 fn extract_json(text: &str) -> Option<Value> {

@@ -316,6 +316,11 @@ async function openTaskDialog(job, page, state) {
         <div class="form-hint">不选则使用默认 Agent 执行</div>
       </div>
       <div class="form-group">
+        <label class="form-label">投递渠道</label>
+        <select class="form-input" name="deliveryChannel"><option value="">无（主会话）</option></select>
+        <div class="form-hint">配置了多个消息渠道时必须指定，否则任务会报错</div>
+      </div>
+      <div class="form-group">
         <label class="form-label">执行周期</label>
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${shortcutsHtml}</div>
         <input class="form-input" name="schedule" value="${escapeAttr(initSchedule)}" placeholder="Cron 表达式，如 0 9 * * *">
@@ -339,6 +344,19 @@ async function openTaskDialog(job, page, state) {
     ],
     width: 500,
   })
+
+  // 异步加载渠道列表
+  api.readOpenclawConfig().then(cfg => {
+    const channels = cfg?.channels || {}
+    const channelIds = Object.keys(channels).filter(k => k !== 'defaults')
+    if (channelIds.length <= 1) return // 单渠道或无渠道不需要选
+    const select = modal.querySelector('select[name="deliveryChannel"]')
+    if (!select) return
+    const current = job?.delivery?.channel || ''
+    select.innerHTML = `<option value="">无（主会话）</option>` + channelIds.map(ch =>
+      `<option value="${escapeAttr(ch)}" ${ch === current ? 'selected' : ''}>${escapeHtml(ch)}</option>`
+    ).join('')
+  }).catch(() => {})
 
   // 异步加载 Agent 列表并更新下拉框（不阻塞弹窗显示）
   api.listAgents().then(res => {
@@ -404,6 +422,8 @@ async function openTaskDialog(job, page, state) {
         patch.schedule = { kind: 'cron', expr: schedule }
         patch.payload = { kind: 'agentTurn', message }
         if (agentId) patch.agentId = agentId
+        const deliveryChannel = modal.querySelector('select[name="deliveryChannel"]')?.value
+        if (deliveryChannel) patch.delivery = { channel: deliveryChannel }
         await wsClient.request('cron.update', { id: job.id, patch })
         toast('任务已更新', 'success')
       } else {
@@ -414,6 +434,8 @@ async function openTaskDialog(job, page, state) {
           payload: { kind: 'agentTurn', message },
         }
         if (agentId) params.agentId = agentId
+        const deliveryChannel = modal.querySelector('select[name="deliveryChannel"]')?.value
+        if (deliveryChannel) params.delivery = { channel: deliveryChannel }
         await wsClient.request('cron.add', params)
         toast('任务已创建', 'success')
       }
