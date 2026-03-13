@@ -202,7 +202,11 @@ ClawPanel 会自动检测本机的 OpenClaw 安装，你可以：
 创建服务文件：
 
 ```bash
-sudo tee /etc/systemd/system/clawpanel.service << 'EOF'
+# 先确认 node 的实际路径（不同安装方式路径不同）
+which node
+# 常见路径：/usr/bin/node、/usr/local/bin/node、~/.nvm/versions/node/vXX/bin/node
+
+sudo tee /etc/systemd/system/clawpanel.service << EOF
 [Unit]
 Description=ClawPanel Web - OpenClaw Management Panel
 After=network.target
@@ -211,15 +215,18 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/clawpanel
-ExecStart=/usr/bin/node scripts/serve.js
+ExecStart=$(which node) scripts/serve.js
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:$(dirname $(which node)):$(dirname $(which openclaw 2>/dev/null || echo /usr/local/bin/openclaw))
 
 [Install]
 WantedBy=multi-user.target
 EOF
 ```
+
+> ⚠️ **注意**：`ExecStart` 必须使用 Node.js 的**绝对路径**。systemd 不继承用户的 PATH 环境变量，所以 `node` 这种相对路径会找不到。上面的 `$(which node)` 会在创建服务时自动替换为实际路径。`Environment=PATH=...` 确保 OpenClaw CLI 也能被找到。
 
 启用并启动：
 
