@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/github/downloads/qingchencloud/clawpanel/total?style=flat-square&color=8b5cf6" alt="Downloads">
   </a>
   <a href="https://github.com/qingchencloud/clawpanel/blob/main/LICENSE">
-    <img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License">
+    <img src="https://img.shields.io/badge/license-Non--Commercial-orange.svg?style=flat-square" alt="License">
   </a>
   <a href="https://github.com/qingchencloud/clawpanel/actions/workflows/ci.yml">
     <img src="https://img.shields.io/github/actions/workflow/status/qingchencloud/clawpanel/ci.yml?style=flat-square&label=CI" alt="CI">
@@ -723,4 +723,6 @@ sudo systemctl restart clawpanel  # 或 pm2 restart clawpanel
 
 ## 许可证
 
-[MIT License](LICENSE)
+本项目采用自定义非商业许可证，免费供个人和非商业用途使用。商业使用需获得授权。详见 [LICENSE](LICENSE)。
+
+© 2026 武汉晴辰天下网络科技有限公司 | [claw.qt.cool](https://claw.qt.cool)
