@@ -1158,10 +1158,19 @@ pub fn write_mcp_config(config: Value) -> Result<(), String> {
 /// macOS: 优先从 npm 包的 package.json 读取（含完整后缀），fallback 到 CLI
 /// Windows/Linux: 优先读文件系统，fallback 到 CLI
 async fn get_local_version() -> Option<String> {
-    // macOS: 通过 symlink 找到包目录，读 package.json 的 version
     #[cfg(target_os = "macos")]
     {
-        // 兼容 ARM (/opt/homebrew) 和 Intel (/usr/local) 两种 Homebrew 安装路径
+        if let Some(cli_path) = crate::utils::resolve_openclaw_cli_path() {
+            let resolved = std::fs::canonicalize(&cli_path)
+                .ok()
+                .unwrap_or_else(|| PathBuf::from(&cli_path));
+            if let Some(ver) = read_version_from_installation(&resolved)
+                .or_else(|| read_version_from_installation(std::path::Path::new(&cli_path)))
+            {
+                return Some(ver);
+            }
+        }
+
         for brew_prefix in &["/opt/homebrew/bin", "/usr/local/bin"] {
             let openclaw_path = format!("{}/openclaw", brew_prefix);
             if let Ok(target) = fs::read_link(&openclaw_path) {
@@ -1182,10 +1191,9 @@ async fn get_local_version() -> Option<String> {
             }
         }
     }
-    // Windows: 先查 standalone 安装，再查 npm 全局目录
+
     #[cfg(target_os = "windows")]
     {
-        // 检查所有 standalone 安装目录
         for sa_dir in all_standalone_dirs() {
             let version_file = sa_dir.join("VERSION");
             if let Ok(content) = fs::read_to_string(&version_file) {
@@ -1212,7 +1220,7 @@ async fn get_local_version() -> Option<String> {
                 }
             }
         }
-        // npm 全局目录 — 根据 CLI 来源决定检查顺序，避免读到非活跃包的版本
+
         if let Ok(appdata) = std::env::var("APPDATA") {
             let cli_is_zh = crate::utils::resolve_openclaw_cli_path()
                 .map(|p| crate::utils::classify_cli_source(&p) == "npm-zh")
@@ -1239,7 +1247,8 @@ async fn get_local_version() -> Option<String> {
             }
         }
     }
-    // 所有平台通用 fallback: CLI 输出（异步）
+
+    // 所有平台通用 fallback: CLI 输出
     // Windows: 先确认 openclaw 不是第三方程序（如 CherryStudio）
     #[cfg(target_os = "windows")]
     {
@@ -1259,6 +1268,7 @@ async fn get_local_version() -> Option<String> {
             }
         }
     }
+
     use crate::utils::openclaw_command_async;
     let output = openclaw_command_async()
         .arg("--version")
@@ -1296,6 +1306,18 @@ fn detect_installed_source() -> String {
     // macOS: 检查 openclaw bin 的 symlink 指向
     #[cfg(target_os = "macos")]
     {
+        if let Some(cli_path) = crate::utils::resolve_openclaw_cli_path() {
+            let resolved = std::fs::canonicalize(&cli_path)
+                .ok()
+                .unwrap_or_else(|| PathBuf::from(&cli_path));
+            let source = crate::utils::classify_cli_source(&resolved.to_string_lossy());
+            if source == "npm-zh" || source == "standalone" {
+                return "chinese".into();
+            }
+            if source == "npm-official" || source == "npm-global" {
+                return "official".into();
+            }
+        }
         // 兼容 ARM (/opt/homebrew) 和 Intel (/usr/local) 两种 Homebrew 路径
         for brew_prefix in &["/opt/homebrew/bin/openclaw", "/usr/local/bin/openclaw"] {
             if let Ok(target) = std::fs::read_link(brew_prefix) {
@@ -1303,6 +1325,11 @@ fn detect_installed_source() -> String {
                     return "chinese".into();
                 }
                 return "official".into();
+            }
+        }
+        for sa_dir in all_standalone_dirs() {
+            if sa_dir.join("openclaw").exists() || sa_dir.join("VERSION").exists() {
+                return "chinese".into();
             }
         }
         "official".into()

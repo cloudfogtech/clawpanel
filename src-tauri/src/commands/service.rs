@@ -322,13 +322,26 @@ pub fn guardian_status() -> Result<GuardianStatus, String> {
 #[cfg(target_os = "macos")]
 mod platform {
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
 
     const OPENCLAW_PREFIXES: &[&str] = &["ai.openclaw."];
 
-    /// macOS 上 CLI 是否安装（检查 plist 是否存在即可）
+    fn common_cli_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(".openclaw-bin").join("openclaw"));
+        }
+        candidates.push(PathBuf::from("/opt/openclaw/openclaw"));
+        candidates.push(PathBuf::from("/opt/homebrew/bin/openclaw"));
+        candidates.push(PathBuf::from("/usr/local/bin/openclaw"));
+        candidates
+    }
+
+    /// macOS 上 CLI 是否安装（兼容手动安装 / standalone / Homebrew）
     pub fn is_cli_installed() -> bool {
-        true // macOS 通过 plist 扫描，不依赖 CLI 检测
+        crate::utils::resolve_openclaw_cli_path().is_some()
+            || common_cli_candidates().into_iter().any(|p| p.exists())
     }
 
     pub fn current_uid() -> Result<u32, String> {
@@ -361,6 +374,9 @@ mod platform {
             }
         }
         labels.sort();
+        if labels.is_empty() {
+            labels.push("ai.openclaw.gateway".to_string());
+        }
         labels
     }
 

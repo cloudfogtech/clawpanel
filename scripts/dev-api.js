@@ -425,11 +425,30 @@ function buildGitInstallEnv() {
 
 function detectInstalledSource() {
   if (isMac) {
+    // ARM Homebrew
     try {
       const target = fs.readlinkSync('/opt/homebrew/bin/openclaw')
       if (String(target).includes('openclaw-zh')) return 'chinese'
       return 'official'
     } catch {}
+    // Intel Homebrew
+    try {
+      const target = fs.readlinkSync('/usr/local/bin/openclaw')
+      if (String(target).includes('openclaw-zh')) return 'chinese'
+      return 'official'
+    } catch {}
+    // standalone (~/.openclaw-bin)
+    const saDir = path.join(homedir(), '.openclaw-bin')
+    if (fs.existsSync(path.join(saDir, 'openclaw')) || fs.existsSync(path.join(saDir, 'VERSION'))) return 'chinese'
+    if (fs.existsSync('/opt/openclaw/openclaw')) return 'chinese'
+    // findOpenclawBin fallback
+    const bin = findOpenclawBin()
+    if (bin) {
+      const lower = bin.replace(/\\/g, '/').toLowerCase()
+      if (lower.includes('openclaw-zh') || lower.includes('@qingchencloud') || lower.includes('/openclaw-bin/') || lower.includes('/opt/openclaw/')) return 'chinese'
+      return 'official'
+    }
+    return 'official'
   }
   if (isWindows) {
     try {
@@ -452,11 +471,34 @@ function detectInstalledSource() {
 function getLocalOpenclawVersion() {
   let current = null
   if (isMac) {
+    // ARM Homebrew
     try {
       const target = fs.readlinkSync('/opt/homebrew/bin/openclaw')
       const pkgPath = path.resolve('/opt/homebrew/bin', target, '..', 'package.json')
       current = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version
     } catch {}
+    // Intel Homebrew
+    if (!current) {
+      try {
+        const target = fs.readlinkSync('/usr/local/bin/openclaw')
+        const pkgPath = path.resolve('/usr/local/bin', target, '..', 'package.json')
+        current = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version
+      } catch {}
+    }
+    // standalone (~/.openclaw-bin)
+    if (!current) {
+      try {
+        const vf = path.join(homedir(), '.openclaw-bin', 'VERSION')
+        if (fs.existsSync(vf)) {
+          const lines = fs.readFileSync(vf, 'utf8').split('\n')
+          for (const l of lines) { if (l.startsWith('openclaw_version=')) { current = l.split('=')[1]?.trim(); break } }
+        }
+        if (!current) {
+          const pkg = path.join(homedir(), '.openclaw-bin', 'node_modules', '@qingchencloud', 'openclaw-zh', 'package.json')
+          if (fs.existsSync(pkg)) current = JSON.parse(fs.readFileSync(pkg, 'utf8')).version
+        }
+      } catch {}
+    }
   }
   if (!current && isWindows) {
     try {
@@ -1530,7 +1572,11 @@ const handlers = {
 
       let cliInstalled = false
       if (isMac) {
-        cliInstalled = fs.existsSync('/opt/homebrew/bin/openclaw') || fs.existsSync('/usr/local/bin/openclaw')
+        cliInstalled = fs.existsSync('/opt/homebrew/bin/openclaw')
+          || fs.existsSync('/usr/local/bin/openclaw')
+          || fs.existsSync(path.join(homedir(), '.openclaw-bin', 'openclaw'))
+          || fs.existsSync('/opt/openclaw/openclaw')
+          || !!findOpenclawBin()
       } else if (isWindows) {
         try {
           const paths = [

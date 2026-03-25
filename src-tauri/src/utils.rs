@@ -35,6 +35,20 @@ fn find_openclaw_cmd() -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(not(target_os = "windows"))]
+fn common_non_windows_cli_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".openclaw-bin").join("openclaw"));
+        candidates.push(home.join(".local").join("bin").join("openclaw"));
+    }
+    candidates.push(std::path::PathBuf::from("/opt/openclaw/openclaw"));
+    candidates.push(std::path::PathBuf::from("/opt/homebrew/bin/openclaw"));
+    candidates.push(std::path::PathBuf::from("/usr/local/bin/openclaw"));
+    candidates.push(std::path::PathBuf::from("/usr/bin/openclaw"));
+    candidates
+}
+
 /// 解析当前实际使用的 openclaw CLI 完整路径（跨平台）
 pub fn resolve_openclaw_cli_path() -> Option<String> {
     // 优先使用用户绑定的路径
@@ -54,6 +68,11 @@ pub fn resolve_openclaw_cli_path() -> Option<String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        for candidate in common_non_windows_cli_candidates() {
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
         let path = crate::commands::enhanced_path();
         let sep = ':';
         for dir in path.split(sep) {

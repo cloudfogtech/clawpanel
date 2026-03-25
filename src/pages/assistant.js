@@ -3168,6 +3168,22 @@ function showSettings() {
     btn.disabled = true
     btn.textContent = t('assistant.testing')
     resultEl.innerHTML = '<span style="color:var(--text-tertiary)">' + t('assistant.testSending') + '</span>'
+
+    // Web 模式下浏览器 fetch 受 CORS 限制，优先走后端代理
+    if (!window.__TAURI_INTERNALS__) {
+      const t0 = Date.now()
+      try {
+        const reply = await api.testModel(baseUrl, apiKey, model, selApiType)
+        const elapsed = Date.now() - t0
+        resultEl.innerHTML = buildTestResult({ success: true, elapsed, usedApi: selApiType, reqUrl: baseUrl, reqBody: {}, respStatus: 200, respBody: '', reply: reply || '(ok)' })
+      } catch (err) {
+        const elapsed = Date.now() - t0
+        resultEl.innerHTML = buildTestResult({ success: false, elapsed, usedApi: selApiType, reqUrl: baseUrl, reqBody: {}, respStatus: 0, respBody: '', error: err.message || String(err) })
+      }
+      btn.disabled = false; btn.textContent = t('assistant.testBtn')
+      return
+    }
+
     const base = cleanBaseUrl(baseUrl, selApiType)
     const hdrs = authHeaders(selApiType, apiKey)
     const t0 = Date.now()

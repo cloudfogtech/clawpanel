@@ -639,7 +639,7 @@ async function checkGlobalUpdate() {
     if (!ver) return
 
     // 用户已忽略过该版本，不再打扰
-    const dismissed = sessionStorage.getItem('clawpanel_update_dismissed')
+    const dismissed = localStorage.getItem('clawpanel_update_dismissed')
     if (dismissed === ver) return
 
     const changelog = info.manifest?.changelog || ''
@@ -665,7 +665,7 @@ async function checkGlobalUpdate() {
 
     // 关闭按钮：记住忽略的版本
     banner.querySelector('#btn-update-dismiss')?.addEventListener('click', () => {
-      sessionStorage.setItem('clawpanel_update_dismissed', ver)
+      localStorage.setItem('clawpanel_update_dismissed', ver)
       banner.classList.add('update-banner-hidden')
     })
 

@@ -3,7 +3,7 @@
  */
 import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
-import { onGatewayChange } from '../lib/app-state.js'
+import { getActiveInstance, onGatewayChange } from '../lib/app-state.js'
 import { navigate } from '../router.js'
 import { t } from '../lib/i18n.js'
 
@@ -65,8 +65,22 @@ export function cleanup() {
 }
 
 let _dashboardInitialized = false
+let _dashboardVersionCache = null
+let _dashboardStatusSummaryCache = null
+let _dashboardInstanceId = ''
+
+function syncDashboardInstanceScope() {
+  const instanceId = getActiveInstance()?.id || 'local'
+  if (_dashboardInstanceId && _dashboardInstanceId !== instanceId) {
+    _dashboardInitialized = false
+    _dashboardVersionCache = null
+    _dashboardStatusSummaryCache = null
+  }
+  _dashboardInstanceId = instanceId
+}
 
 async function loadDashboardData(page, fullRefresh = false) {
+  syncDashboardInstanceScope()
   // 分波加载：关键数据先渲染，次要数据后填充，减少白屏等待
   // 轻量调用（读文件）每次都做；重量调用（spawn CLI/网络请求）只在首次或手动刷新时做
   const withTimeout = (promise, ms) => Promise.race([
@@ -77,21 +91,23 @@ async function loadDashboardData(page, fullRefresh = false) {
     api.getServicesStatus(),
     api.readOpenclawConfig(),
     // 版本信息：首次加载或手动刷新时才查询（避免 ARM 设备上频繁查 npm registry）
-    (!_dashboardInitialized || fullRefresh) ? api.getVersionInfo() : Promise.resolve(null),
+    (!_dashboardInitialized || fullRefresh || !_dashboardVersionCache) ? api.getVersionInfo() : Promise.resolve(_dashboardVersionCache),
   ]), 15000)
   const secondaryP = withTimeout(Promise.allSettled([
     api.listAgents(),
     api.readMcpConfig(),
     api.listBackups(),
     // getStatusSummary 是最重的调用（spawn openclaw status --json），只在首次加载时调用
-    (!_dashboardInitialized || fullRefresh) ? api.getStatusSummary() : Promise.resolve(null),
+    (!_dashboardInitialized || fullRefresh || !_dashboardStatusSummaryCache) ? api.getStatusSummary() : Promise.resolve(_dashboardStatusSummaryCache),
   ]), 15000).catch(() => [{ status: 'rejected' }, { status: 'rejected' }, { status: 'rejected' }, { status: 'rejected' }])
   const logsP = api.readLogTail('gateway', 20).catch(() => '')
 
   // 第一波：服务状态 + 配置 + 版本 → 立即渲染统计卡片
   const [servicesRes, configRes, versionRes] = await coreP
   const services = servicesRes.status === 'fulfilled' ? servicesRes.value : []
-  const version = (versionRes.status === 'fulfilled' && versionRes.value) ? versionRes.value : {}
+  const version = (versionRes.status === 'fulfilled' && versionRes.value)
+    ? (_dashboardVersionCache = versionRes.value)
+    : (_dashboardVersionCache || {})
   const config = configRes.status === 'fulfilled' ? configRes.value : null
   if (servicesRes.status === 'rejected') toast(t('dashboard.servicesLoadFail'), 'error')
   if (versionRes.status === 'rejected') toast(t('dashboard.versionLoadFail'), 'error')
@@ -128,7 +144,9 @@ async function loadDashboardData(page, fullRefresh = false) {
   const agents = agentsRes.status === 'fulfilled' ? agentsRes.value : []
   const mcpConfig = mcpRes.status === 'fulfilled' ? mcpRes.value : null
   const backups = backupsRes.status === 'fulfilled' ? backupsRes.value : []
-  const statusSummary = statusRes.status === 'fulfilled' ? statusRes.value : null
+  const statusSummary = (statusRes.status === 'fulfilled' && statusRes.value)
+    ? (_dashboardStatusSummaryCache = statusRes.value)
+    : _dashboardStatusSummaryCache
 
   renderStatCards(page, services, version, agents, config)
   renderOverview(page, services, mcpConfig, backups, config, agents, statusSummary)
@@ -475,6 +493,7 @@ function bindActions(page) {
     btnUpdate.textContent = t('dashboard.checking')
     try {
       const info = await api.getVersionInfo()
+      _dashboardVersionCache = info
       if (info.ahead_of_recommended && info.recommended) {
         toast(t('dashboard.versionAheadWarn', { current: info.current || '', recommended: info.recommended }), 'warning')
       } else if (info.update_available && info.recommended) {
