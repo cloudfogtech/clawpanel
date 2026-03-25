@@ -171,6 +171,23 @@ npm run build && npm run serve  # 正式版
 
 歡迎提交 Issue 和 Pull Request。詳見 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+
+## Sponsor
+
+If you find this project useful, consider supporting us via USDT (BNB Smart Chain):
+
+<img src="public/images/bnbqr.jpg" alt="Sponsor QR" width="180">
+
+```
+0xbdd7ebdf2b30d873e556799711021c6671ffe88f
+```
+
+## Contact
+
+- **Email**: [support@qctx.net](mailto:support@qctx.net)
+- **Website**: [qingchencloud.com](https://qingchencloud.com)
+- **Product**: [claw.qt.cool](https://claw.qt.cool)
+
 ## 授權條款
 
 [AGPL-3.0](LICENSE) 開源授權。商用需求請聯繫取得商業授權。

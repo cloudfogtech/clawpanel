@@ -308,6 +308,22 @@ Thanks to community members who opened issues, reported bugs, and suggested feat
 
 > If we missed your contribution, please [open an issue](https://github.com/qingchencloud/clawpanel/issues/new) and we will add it promptly.
 
+## Sponsor
+
+If you find this project useful, consider supporting us via USDT (BNB Smart Chain):
+
+<img src="public/images/bnbqr.jpg" alt="Sponsor QR" width="180">
+
+```
+0xbdd7ebdf2b30d873e556799711021c6671ffe88f
+```
+
+## Contact
+
+- **Email**: [support@qctx.net](mailto:support@qctx.net)
+- **Website**: [qingchencloud.com](https://qingchencloud.com)
+- **Product**: [claw.qt.cool](https://claw.qt.cool)
+
 ## License
 
 This project is licensed under [AGPL-3.0](LICENSE). For commercial/proprietary use without open-source requirements, contact us for a commercial license.
