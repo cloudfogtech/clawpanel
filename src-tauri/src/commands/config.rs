@@ -678,19 +678,8 @@ pub fn write_openclaw_config(config: Value) -> Result<(), String> {
 }
 
 const CALIBRATION_RESET_INHERIT_KEYS: &[&str] = &[
-    "agents",
-    "auth",
-    "bindings",
-    "browser",
-    "channels",
-    "commands",
-    "env",
-    "hooks",
-    "models",
-    "plugins",
-    "session",
-    "skills",
-    "wizard",
+    "agents", "auth", "bindings", "browser", "channels", "commands", "env", "hooks", "models",
+    "plugins", "session", "skills", "wizard",
 ];
 
 fn calibration_required_origins() -> Vec<String> {
@@ -772,10 +761,7 @@ fn calibration_richness_score(config: &Value) -> usize {
     {
         score += 4;
     }
-    if config
-        .pointer("/agents/defaults")
-        .is_some()
-    {
+    if config.pointer("/agents/defaults").is_some() {
         score += 2;
     }
     if config
@@ -1025,9 +1011,7 @@ fn normalize_calibrated_config(mut config: Value) -> Value {
         {
             tools_obj.insert("profile".into(), Value::String("full".into()));
         }
-        let sessions = tools_obj
-            .entry("sessions")
-            .or_insert_with(|| json!({}));
+        let sessions = tools_obj.entry("sessions").or_insert_with(|| json!({}));
         if !sessions.is_object() {
             *sessions = json!({});
         }
@@ -1092,9 +1076,7 @@ fn normalize_calibrated_config(mut config: Value) -> Value {
             );
         }
 
-        let control_ui = gateway_obj
-            .entry("controlUi")
-            .or_insert_with(|| json!({}));
+        let control_ui = gateway_obj.entry("controlUi").or_insert_with(|| json!({}));
         if !control_ui.is_object() {
             *control_ui = json!({});
         }
@@ -1173,8 +1155,8 @@ pub fn calibrate_openclaw_config(mode: String) -> Result<Value, String> {
     inherited_keys.dedup();
 
     let calibrated = strip_ui_fields(normalize_calibrated_config(calibrated));
-    let json =
-        serde_json::to_string_pretty(&calibrated).map_err(|e| format!("序列化校准配置失败: {e}"))?;
+    let json = serde_json::to_string_pretty(&calibrated)
+        .map_err(|e| format!("序列化校准配置失败: {e}"))?;
 
     fs::write(&config_path, &json).map_err(|e| format!("写入校准配置失败: {e}"))?;
     fs::write(&backup_path, &json).map_err(|e| format!("写入配置备份失败: {e}"))?;
@@ -3477,9 +3459,15 @@ async fn upgrade_openclaw_inner(
                     .map(|o| o.status.success())
                     .unwrap_or(false);
                 if has_pkexec {
-                    let _ = app.emit("upgrade-log", "需要管理员权限，将通过 pkexec 弹出认证窗口...");
+                    let _ = app.emit(
+                        "upgrade-log",
+                        "需要管理员权限，将通过 pkexec 弹出认证窗口...",
+                    );
                 } else {
-                    let _ = app.emit("upgrade-log", "⚠️ 需要管理员权限但 pkexec 不可用，可能需要手动安装");
+                    let _ = app.emit(
+                        "upgrade-log",
+                        "⚠️ 需要管理员权限但 pkexec 不可用，可能需要手动安装",
+                    );
                 }
             }
         }
@@ -3650,7 +3638,9 @@ async fn upgrade_openclaw_inner(
     // 安装成功后再卸载旧包（确保 CLI 始终可用）
     if need_uninstall_old {
         let _ = app.emit("upgrade-log", format!("清理旧版本 ({old_pkg})..."));
-        let _ = npm_command_elevated().args(["uninstall", "-g", old_pkg]).output();
+        let _ = npm_command_elevated()
+            .args(["uninstall", "-g", old_pkg])
+            .output();
 
         // 清理 standalone 安装目录（不论从 standalone 切走还是切到 standalone，
         // npm 路径已经安装了新 CLI，standalone 残留会干扰源检测）
@@ -3833,7 +3823,9 @@ async fn uninstall_openclaw_inner(
         "openclaw"
     };
     let _ = app.emit("upgrade-log", format!("清理 {other_pkg}..."));
-    let _ = npm_command_elevated().args(["uninstall", "-g", other_pkg]).output();
+    let _ = npm_command_elevated()
+        .args(["uninstall", "-g", other_pkg])
+        .output();
     let _ = app.emit("upgrade-progress", 80);
 
     // 5. 可选：清理配置目录
