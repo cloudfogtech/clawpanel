@@ -182,15 +182,12 @@ fn extract_zip(zip_bytes: &[u8], target_dir: &Path) -> Result<(), String> {
 
     // 清理旧目录
     if target_dir.exists() {
-        std::fs::remove_dir_all(target_dir)
-            .map_err(|e| format!("清理旧目录失败: {e}"))?;
+        std::fs::remove_dir_all(target_dir).map_err(|e| format!("清理旧目录失败: {e}"))?;
     }
-    std::fs::create_dir_all(target_dir)
-        .map_err(|e| format!("创建目录失败: {e}"))?;
+    std::fs::create_dir_all(target_dir).map_err(|e| format!("创建目录失败: {e}"))?;
 
     let reader = Cursor::new(zip_bytes);
-    let mut archive =
-        ZipArchive::new(reader).map_err(|e| format!("打开 zip 失败: {e}"))?;
+    let mut archive = ZipArchive::new(reader).map_err(|e| format!("打开 zip 失败: {e}"))?;
 
     // 收集所有文件名，检测是否都在同一个顶层目录下（常见的 zip 打包方式）
     let names: Vec<String> = (0..archive.len())

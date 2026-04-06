@@ -5368,7 +5368,8 @@ pub fn scan_git_paths() -> Result<Value, String> {
     #[cfg(target_os = "windows")]
     {
         let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
-        let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+        let pf86 =
+            std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
         let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
 
         // 标准安装路径
@@ -5378,16 +5379,25 @@ pub fn scan_git_paths() -> Result<Value, String> {
         // 常见盘符
         for drive in &["C", "D", "E", "F", "G"] {
             candidates.push((format!(r"{}:\Git\cmd\git.exe", drive), "MANUAL".into()));
-            candidates.push((format!(r"{}:\Program Files\Git\cmd\git.exe", drive), "SYSTEM".into()));
+            candidates.push((
+                format!(r"{}:\Program Files\Git\cmd\git.exe", drive),
+                "SYSTEM".into(),
+            ));
             // 工具目录
             for sub in &["Tools", "Dev", "AI", "Apps", "Software"] {
-                candidates.push((format!(r"{}:\{}\Git\cmd\git.exe", drive, sub), "MANUAL".into()));
+                candidates.push((
+                    format!(r"{}:\{}\Git\cmd\git.exe", drive, sub),
+                    "MANUAL".into(),
+                ));
             }
         }
 
         // 自定义应用目录（如 D:\Data\exeApp\Git）
         for drive in &["C", "D", "E", "F"] {
-            candidates.push((format!(r"{}:\Data\exeApp\Git\cmd\git.exe", drive), "MANUAL".into()));
+            candidates.push((
+                format!(r"{}:\Data\exeApp\Git\cmd\git.exe", drive),
+                "MANUAL".into(),
+            ));
         }
 
         // GitHub Desktop 内置 Git
@@ -5398,9 +5408,17 @@ pub fn scan_git_paths() -> Result<Value, String> {
                     for entry in entries.flatten() {
                         let p = entry.path();
                         if p.is_dir() {
-                            let git_exe = p.join("resources").join("app").join("git").join("cmd").join("git.exe");
+                            let git_exe = p
+                                .join("resources")
+                                .join("app")
+                                .join("git")
+                                .join("cmd")
+                                .join("git.exe");
                             if git_exe.exists() {
-                                candidates.push((git_exe.to_string_lossy().to_string(), "GITHUB_DESKTOP".into()));
+                                candidates.push((
+                                    git_exe.to_string_lossy().to_string(),
+                                    "GITHUB_DESKTOP".into(),
+                                ));
                             }
                         }
                     }
@@ -5419,17 +5437,27 @@ pub fn scan_git_paths() -> Result<Value, String> {
         // MinGW / MSYS2 / Git Bash
         candidates.push((format!(r"{}\Git\mingw64\bin\git.exe", pf), "MINGW".into()));
         for drive in &["C", "D"] {
-            candidates.push((format!(r"{}:\msys64\usr\bin\git.exe", drive), "MSYS2".into()));
+            candidates.push((
+                format!(r"{}:\msys64\usr\bin\git.exe", drive),
+                "MSYS2".into(),
+            ));
             candidates.push((format!(r"{}:\msys2\usr\bin\git.exe", drive), "MSYS2".into()));
         }
 
         // Scoop
         let home = dirs::home_dir().unwrap_or_default();
-        candidates.push((format!(r"{}\scoop\apps\git\current\cmd\git.exe", home.display()), "SCOOP".into()));
-        candidates.push((format!(r"{}\scoop\shims\git.exe", home.display()), "SCOOP".into()));
+        candidates.push((
+            format!(r"{}\scoop\apps\git\current\cmd\git.exe", home.display()),
+            "SCOOP".into(),
+        ));
+        candidates.push((
+            format!(r"{}\scoop\shims\git.exe", home.display()),
+            "SCOOP".into(),
+        ));
 
         // Chocolatey
-        let choco_dir = std::env::var("ChocolateyInstall").unwrap_or_else(|_| r"C:\ProgramData\chocolatey".into());
+        let choco_dir = std::env::var("ChocolateyInstall")
+            .unwrap_or_else(|_| r"C:\ProgramData\chocolatey".into());
         candidates.push((format!(r"{}\bin\git.exe", choco_dir), "CHOCOLATEY".into()));
     }
 
@@ -5439,15 +5467,27 @@ pub fn scan_git_paths() -> Result<Value, String> {
         candidates.push(("/usr/local/bin/git".into(), "SYSTEM".into()));
         candidates.push(("/opt/homebrew/bin/git".into(), "BREW".into()));
         // Xcode
-        candidates.push(("/Library/Developer/CommandLineTools/usr/bin/git".into(), "XCODE_CLT".into()));
-        candidates.push(("/Applications/Xcode.app/Contents/Developer/usr/bin/git".into(), "XCODE".into()));
+        candidates.push((
+            "/Library/Developer/CommandLineTools/usr/bin/git".into(),
+            "XCODE_CLT".into(),
+        ));
+        candidates.push((
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/git".into(),
+            "XCODE".into(),
+        ));
         // Snap / Flatpak
         candidates.push(("/snap/bin/git".into(), "SNAP".into()));
         // Nix
         let home = dirs::home_dir().unwrap_or_default();
-        candidates.push((format!("{}/.nix-profile/bin/git", home.display()), "NIX".into()));
+        candidates.push((
+            format!("{}/.nix-profile/bin/git", home.display()),
+            "NIX".into(),
+        ));
         // Linuxbrew
-        candidates.push((format!("{}/.linuxbrew/bin/git", home.display()), "BREW".into()));
+        candidates.push((
+            format!("{}/.linuxbrew/bin/git", home.display()),
+            "BREW".into(),
+        ));
         candidates.push(("/home/linuxbrew/.linuxbrew/bin/git".into(), "BREW".into()));
     }
 
@@ -5455,9 +5495,13 @@ pub fn scan_git_paths() -> Result<Value, String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (path, source) in &candidates {
         let p = std::path::Path::new(path);
-        if !p.exists() { continue; }
+        if !p.exists() {
+            continue;
+        }
         let canonical = p.to_string_lossy().to_string();
-        if seen.contains(&canonical) { continue; }
+        if seen.contains(&canonical) {
+            continue;
+        }
         seen.insert(canonical.clone());
 
         let mut cmd = Command::new(path);

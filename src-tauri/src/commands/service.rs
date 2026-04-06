@@ -154,8 +154,7 @@ fn should_auto_claim_gateway(owner: &Option<GatewayOwnerRecord>) -> bool {
         None => true, // 无 owner 文件 → 自动认领
         Some(record) => {
             // owner 文件存在但签名不完全匹配 → 仅按 port + openclaw_dir 判断
-            record.port == port
-                && normalize_owned_path(&record.openclaw_dir) == openclaw_dir
+            record.port == port && normalize_owned_path(&record.openclaw_dir) == openclaw_dir
         }
     }
 }

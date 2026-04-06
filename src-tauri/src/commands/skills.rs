@@ -13,8 +13,7 @@ pub async fn skills_list() -> Result<Value, String> {
 /// 查看单个 Skill 详情（纯本地文件解析，不依赖 CLI）
 #[tauri::command]
 pub async fn skills_info(name: String) -> Result<Value, String> {
-    scan_custom_skill_detail(&name)
-        .ok_or_else(|| format!("Skill「{name}」不存在"))
+    scan_custom_skill_detail(&name).ok_or_else(|| format!("Skill「{name}」不存在"))
 }
 
 /// 检查 Skills 依赖状态（纯本地扫描）
@@ -22,7 +21,10 @@ pub async fn skills_info(name: String) -> Result<Value, String> {
 pub async fn skills_check() -> Result<Value, String> {
     let skills = scan_local_skill_entries()?;
     let total = skills.len();
-    let ready = skills.iter().filter(|s| s.get("eligible").and_then(|v| v.as_bool()).unwrap_or(false)).count();
+    let ready = skills
+        .iter()
+        .filter(|s| s.get("eligible").and_then(|v| v.as_bool()).unwrap_or(false))
+        .count();
     let missing = total - ready;
     Ok(serde_json::json!({
         "total": total,
