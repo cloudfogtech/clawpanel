@@ -75,6 +75,7 @@ const _toolRunIndex = new Map()
 const _toolEventSeen = new Set()
 let _errorTimer = null, _lastErrorMsg = null
 let _responseWatchdog = null, _postFinalCheck = null
+let _ultimateTimer = null, _sendTimestamp = 0
 let _attachments = []
 let _hasEverConnected = false
 let _availableModels = []
@@ -1566,6 +1567,7 @@ async function doSend(text, attachments = []) {
   } catch (err) {
     showTyping(false)
     _cancelResponseWatchdog()
+    _sendTimestamp = 0
     appendSystemMessage(`${t('chat.sendFailed')}${err.message}`)
   } finally {
     _isSending = false
@@ -1590,28 +1592,89 @@ function handleEvent(msg) {
   const { event, payload } = msg
   if (!payload) return
 
-  if (event === 'agent' && payload?.stream === 'tool' && payload?.data?.toolCallId) {
-    const ts = payload.ts
-    const toolCallId = payload.data.toolCallId
-    const runKey = `${payload.runId}:${toolCallId}`
-    if (_toolEventSeen.has(runKey)) return
-    _toolEventSeen.add(runKey)
-    if (ts) _toolEventTimes.set(toolCallId, ts)
-    const current = _toolEventData.get(toolCallId) || {}
-    if (payload.data?.args && current.input == null) current.input = payload.data.args
-    if (payload.data?.meta && current.output == null) current.output = payload.data.meta
-    if (typeof payload.data?.isError === 'boolean' && current.status == null) current.status = payload.data.isError ? 'error' : 'ok'
-    if (current.time == null) current.time = ts || null
-    _toolEventData.set(toolCallId, current)
-    if (payload.runId) {
-      const list = _toolRunIndex.get(payload.runId) || []
-      if (!list.includes(toolCallId)) list.push(toolCallId)
-      _toolRunIndex.set(payload.runId, list)
+  // ── 处理所有 agent 事件（OpenClaw 4.5+ 结构化进度） ──
+  if (event === 'agent') {
+    // 任何 agent 事件都说明 OpenClaw 在活跃处理，重置看门狗
+    _resetWatchdogOnActivity()
+
+    const stream = payload?.stream
+    const data = payload?.data || {}
+
+    // tool 事件（已有逻辑）
+    if (stream === 'tool' && data.toolCallId) {
+      const ts = payload.ts
+      const toolCallId = data.toolCallId
+      const runKey = `${payload.runId}:${toolCallId}`
+      if (_toolEventSeen.has(runKey)) return
+      _toolEventSeen.add(runKey)
+      if (ts) _toolEventTimes.set(toolCallId, ts)
+      const current = _toolEventData.get(toolCallId) || {}
+      if (data.args && current.input == null) current.input = data.args
+      if (data.meta && current.output == null) current.output = data.meta
+      if (typeof data.isError === 'boolean' && current.status == null) current.status = data.isError ? 'error' : 'ok'
+      if (current.time == null) current.time = ts || null
+      _toolEventData.set(toolCallId, current)
+      if (payload.runId) {
+        const list = _toolRunIndex.get(payload.runId) || []
+        if (!list.includes(toolCallId)) list.push(toolCallId)
+        _toolRunIndex.set(payload.runId, list)
+      }
+      const toolName = data.name || data.toolName || ''
+      if (toolName && !_isStreaming) {
+        showTyping(true, t('chat.usingTool', { name: toolName }))
+      }
     }
-    // 工具执行反馈：更新 typing 提示文字
-    const toolName = payload.data?.name || payload.data?.toolName || ''
-    if (toolName && !_isStreaming) {
-      showTyping(true, t('chat.usingTool', { name: toolName }))
+
+    // lifecycle 事件：处理开始/结束
+    if (stream === 'lifecycle') {
+      const phase = data.phase
+      if (phase === 'start' && !_isStreaming) {
+        showTyping(true, t('chat.aiProcessing'))
+      }
+    }
+
+    // item 事件（4.5+ 结构化执行步骤：tool/command/patch/search/analysis）
+    if (stream === 'item') {
+      const title = data.title || data.name || ''
+      const kind = data.kind || ''
+      if ((data.phase === 'start' || data.phase === 'update') && !_isStreaming) {
+        const hint = kind === 'command' ? t('chat.commandRunning')
+          : kind === 'search' ? t('chat.aiSearching')
+          : kind === 'analysis' ? t('chat.aiAnalyzing')
+          : title ? t('chat.aiExecuting', { title })
+          : t('chat.aiProcessing')
+        showTyping(true, hint)
+      }
+    }
+
+    // plan 事件（4.5+ 计划更新）
+    if (stream === 'plan' && !_isStreaming) {
+      showTyping(true, t('chat.aiPlanning'))
+    }
+
+    // approval 事件（操作审批）
+    if (stream === 'approval' && !_isStreaming) {
+      showTyping(true, t('chat.waitingApproval'))
+    }
+
+    // thinking 事件（推理/思考）
+    if (stream === 'thinking' && !_isStreaming) {
+      showTyping(true, t('chat.aiThinking'))
+    }
+
+    // command_output 事件（命令输出增量）
+    if (stream === 'command_output' && !_isStreaming) {
+      showTyping(true, t('chat.commandRunning'))
+    }
+
+    // compaction 事件
+    if (stream === 'compaction') {
+      showCompactionHint(true)
+    }
+
+    // error 事件
+    if (stream === 'error' && data.message && !_isStreaming) {
+      showTyping(true, `⚠ ${data.message}`)
     }
   }
 
@@ -2036,31 +2099,87 @@ function doRender() {
 }
 
 // ── 响应看门狗：防止页面卡在等待状态 ──
+const WATCHDOG_INTERVAL = 15000  // 15s 轮询间隔
+const ULTIMATE_TIMEOUT = 180000  // 3 分钟终极超时
 
 function _startResponseWatchdog() {
-  _cancelResponseWatchdog()
+  // 只清除轮询定时器，不清除终极超时（终极超时应持续到收到响应）
+  clearTimeout(_responseWatchdog)
+  _responseWatchdog = null
+  _sendTimestamp = _sendTimestamp || Date.now()
+
+  // 启动终极超时（3分钟内如果没有收到任何 chat 事件则放弃）
+  if (!_ultimateTimer) {
+    _ultimateTimer = setTimeout(() => {
+      _ultimateTimer = null
+      if (!_isStreaming && _sessionKey && _pageActive) {
+        console.warn('[chat] 终极超时: 3分钟无 chat 回复')
+        showTyping(false)
+        appendSystemMessage(t('chat.responseTimeout', { seconds: Math.round(ULTIMATE_TIMEOUT / 1000) }))
+        _cancelResponseWatchdog()
+        resetStreamState()
+        processMessageQueue()
+      }
+    }, ULTIMATE_TIMEOUT)
+  }
+
   _responseWatchdog = setTimeout(async () => {
     _responseWatchdog = null
     // 如果还在等待（未开始流式），强制刷新历史
     if (!_isStreaming && _sessionKey && _messagesEl && _pageActive) {
-      console.log('[chat] 响应看门狗触发：15s 无 delta，刷新历史')
+      const elapsed = Math.round((Date.now() - _sendTimestamp) / 1000)
+      console.log(`[chat] 响应看门狗触发：${elapsed}s 无 delta，刷新历史`)
       const oldHash = _lastHistoryHash
       _lastHistoryHash = ''
       await loadHistory()
       // 如果历史有更新，关闭 typing 指示器
       if (_lastHistoryHash && _lastHistoryHash !== oldHash) {
         showTyping(false)
+        _cancelUltimateTimer()
       } else {
-        // 历史没更新，继续等待，再设一轮看门狗
+        // 历史没更新，更新 typing 提示显示已等待时间
+        if (elapsed >= 30) {
+          showTyping(true, `${t('chat.stillWaiting')} (${t('chat.elapsedTime', { seconds: elapsed })})`)
+        }
+        // 继续等待，再设一轮看门狗
         _startResponseWatchdog()
       }
     }
-  }, 15000)
+  }, WATCHDOG_INTERVAL)
+}
+
+function _resetWatchdogOnActivity() {
+  // agent 事件说明 OpenClaw 在活跃处理，重置轮询看门狗（但不重置终极超时）
+  if (_responseWatchdog) {
+    clearTimeout(_responseWatchdog)
+    _responseWatchdog = setTimeout(async () => {
+      _responseWatchdog = null
+      if (!_isStreaming && _sessionKey && _messagesEl && _pageActive) {
+        const elapsed = _sendTimestamp ? Math.round((Date.now() - _sendTimestamp) / 1000) : 0
+        console.log(`[chat] agent 活跃后看门狗触发：${elapsed}s`)
+        const oldHash = _lastHistoryHash
+        _lastHistoryHash = ''
+        await loadHistory()
+        if (_lastHistoryHash && _lastHistoryHash !== oldHash) {
+          showTyping(false)
+          _cancelUltimateTimer()
+        } else {
+          _startResponseWatchdog()
+        }
+      }
+    }, WATCHDOG_INTERVAL)
+  }
 }
 
 function _cancelResponseWatchdog() {
   clearTimeout(_responseWatchdog)
   _responseWatchdog = null
+  _cancelUltimateTimer()
+}
+
+function _cancelUltimateTimer() {
+  clearTimeout(_ultimateTimer)
+  _ultimateTimer = null
 }
 
 function _schedulePostFinalCheck() {
@@ -2078,6 +2197,8 @@ function _schedulePostFinalCheck() {
 
 function resetStreamState() {
   clearTimeout(_streamSafetyTimer)
+  clearInterval(_typingElapsedInterval)
+  _typingElapsedInterval = null
   if (_currentAiBubble && (_currentAiText || _currentAiImages.length || _currentAiVideos.length || _currentAiAudios.length || _currentAiFiles.length || _currentAiTools.length)) {
     _currentAiBubble.innerHTML = renderMarkdown(_currentAiText)
     appendImagesToEl(_currentAiBubble, _currentAiImages)
@@ -2100,6 +2221,7 @@ function resetStreamState() {
   _streamStartTime = 0
   _lastErrorMsg = null
   _errorTimer = null
+  _sendTimestamp = 0
   showTyping(false)
   updateSendState()
 }
@@ -2596,12 +2718,35 @@ function clearMessages() {
   _lastScrollTop = 0
 }
 
+let _typingElapsedInterval = null
 function showTyping(show, hint) {
   if (_typingEl) {
     _typingEl.style.display = show ? 'flex' : 'none'
     // 更新提示文字（如工具调用状态）
     const hintEl = _typingEl.querySelector('.typing-hint')
     if (hintEl) hintEl.textContent = hint || ''
+
+    // 管理已用时间显示
+    let elapsedEl = _typingEl.querySelector('.typing-elapsed')
+    if (show && _sendTimestamp) {
+      if (!elapsedEl) {
+        elapsedEl = document.createElement('span')
+        elapsedEl.className = 'typing-elapsed'
+        _typingEl.appendChild(elapsedEl)
+      }
+      const updateElapsed = () => {
+        if (!_sendTimestamp || !_typingEl) return
+        const sec = Math.round((Date.now() - _sendTimestamp) / 1000)
+        if (sec >= 5 && elapsedEl) elapsedEl.textContent = t('chat.elapsedTime', { seconds: sec })
+      }
+      updateElapsed()
+      clearInterval(_typingElapsedInterval)
+      _typingElapsedInterval = setInterval(updateElapsed, 5000)
+    } else {
+      clearInterval(_typingElapsedInterval)
+      _typingElapsedInterval = null
+      if (elapsedEl) elapsedEl.textContent = ''
+    }
   }
   if (show) scrollToBottom()
 }
@@ -3091,7 +3236,10 @@ export function cleanup() {
   if (_unsubReady) { _unsubReady(); _unsubReady = null }
   if (_unsubStatus) { _unsubStatus(); _unsubStatus = null }
   clearTimeout(_streamSafetyTimer)
+  clearInterval(_typingElapsedInterval)
+  _typingElapsedInterval = null
   _cancelResponseWatchdog()
+  _sendTimestamp = 0
   clearTimeout(_postFinalCheck)
   _postFinalCheck = null
   if (_hostedAbort) { _hostedAbort.abort(); _hostedAbort = null }
