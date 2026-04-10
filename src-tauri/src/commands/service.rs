@@ -27,6 +27,7 @@ const GUARDIAN_INTERVAL: Duration = Duration::from_secs(15);
 const GUARDIAN_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 const GUARDIAN_STABLE_WINDOW: Duration = Duration::from_secs(120);
 const GUARDIAN_MAX_AUTO_RESTART: u32 = 3;
+const GATEWAY_CONFIG_AUTO_FIX_COOLDOWN: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Default)]
 struct GuardianRuntimeState {
@@ -37,6 +38,12 @@ struct GuardianRuntimeState {
     manual_hold: bool,
     pause_reason: Option<String>,
     give_up: bool,
+}
+
+#[derive(Debug, Default)]
+struct GatewayConfigAutoFixState {
+    last_attempt: Option<Instant>,
+    in_progress: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -235,8 +242,147 @@ async fn wait_for_gateway_stopped(label: &str, timeout: Duration) -> Result<(), 
     Err("Gateway 停止超时，请手动检查进程".into())
 }
 
+fn gateway_err_log_path() -> std::path::PathBuf {
+    crate::commands::openclaw_dir()
+        .join("logs")
+        .join("gateway.err.log")
+}
+
+fn read_gateway_error_log_excerpt(max_bytes: usize) -> String {
+    let bytes = match std::fs::read(gateway_err_log_path()) {
+        Ok(content) => content,
+        Err(_) => return String::new(),
+    };
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let tail = if bytes.len() > max_bytes {
+        &bytes[bytes.len() - max_bytes..]
+    } else {
+        &bytes[..]
+    };
+    String::from_utf8_lossy(tail).to_string()
+}
+
+fn looks_like_gateway_config_mismatch(reason: &str) -> bool {
+    let combined = format!("{}\n{}", reason, read_gateway_error_log_excerpt(8192)).to_lowercase();
+    let has_invalid = combined.contains("config invalid") || combined.contains("invalid config");
+    let has_newer_version = combined.contains("config was last written by a newer openclaw");
+    let has_schema_mismatch = combined.contains("must not have additional properties")
+        || combined.contains("must not have additional property")
+        || combined.contains("plugins.entries.memory-core.config")
+        || combined.contains("additional properties");
+    let mentions_doctor_fix = combined.contains("doctor --fix");
+    (has_invalid && (has_schema_mismatch || mentions_doctor_fix))
+        || (has_newer_version && mentions_doctor_fix)
+}
+
 static GUARDIAN_STATE: OnceLock<Arc<Mutex<GuardianRuntimeState>>> = OnceLock::new();
 static GUARDIAN_STARTED: AtomicBool = AtomicBool::new(false);
+static GATEWAY_CONFIG_AUTO_FIX_STATE: OnceLock<Arc<Mutex<GatewayConfigAutoFixState>>> =
+    OnceLock::new();
+
+fn gateway_config_auto_fix_state() -> &'static Arc<Mutex<GatewayConfigAutoFixState>> {
+    GATEWAY_CONFIG_AUTO_FIX_STATE
+        .get_or_init(|| Arc::new(Mutex::new(GatewayConfigAutoFixState::default())))
+}
+
+fn finish_gateway_config_auto_fix_attempt() {
+    let mut state = gateway_config_auto_fix_state().lock().unwrap();
+    state.in_progress = false;
+}
+
+async fn try_auto_fix_gateway_config(
+    reason: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<bool, String> {
+    if !looks_like_gateway_config_mismatch(reason) {
+        return Ok(false);
+    }
+
+    {
+        let mut state = gateway_config_auto_fix_state().lock().unwrap();
+        if state.in_progress {
+            return Ok(false);
+        }
+        if let Some(last_attempt) = state.last_attempt {
+            if last_attempt.elapsed() < GATEWAY_CONFIG_AUTO_FIX_COOLDOWN {
+                return Ok(false);
+            }
+        }
+        state.in_progress = true;
+        state.last_attempt = Some(Instant::now());
+    }
+
+    guardian_log("检测到 Gateway 启动疑似配置失配，尝试自动执行 openclaw doctor --fix");
+    emit_guardian_event(
+        app,
+        "auto_fix_start",
+        "检测到 Gateway 配置异常，正在自动执行 openclaw doctor --fix…",
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::utils::openclaw_command_async()
+            .args(["doctor", "--fix"])
+            .output(),
+    )
+    .await;
+
+    finish_gateway_config_auto_fix_attempt();
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if output.status.success() {
+                let summary = if !stderr.is_empty() { stderr } else { stdout };
+                if summary.is_empty() {
+                    guardian_log("自动执行 openclaw doctor --fix 成功");
+                } else {
+                    guardian_log(&format!("自动执行 openclaw doctor --fix 成功: {summary}"));
+                }
+                Ok(true)
+            } else {
+                let summary = if !stderr.is_empty() { stderr } else { stdout };
+                let detail = if summary.is_empty() {
+                    "doctor --fix 返回失败".to_string()
+                } else {
+                    summary
+                };
+                guardian_log(&format!("自动执行 openclaw doctor --fix 失败: {detail}"));
+                emit_guardian_event(
+                    app,
+                    "auto_fix_failure",
+                    format!("已尝试自动执行 openclaw doctor --fix，但修复失败：{detail}"),
+                );
+                Err(format!(
+                    "检测到 Gateway 配置异常，已尝试自动执行 openclaw doctor --fix，但修复失败：{detail}"
+                ))
+            }
+        }
+        Ok(Err(err)) => {
+            guardian_log(&format!("自动执行 openclaw doctor --fix 失败: {err}"));
+            emit_guardian_event(
+                app,
+                "auto_fix_failure",
+                format!("已尝试自动执行 openclaw doctor --fix，但命令执行失败：{err}"),
+            );
+            Err(format!(
+                "检测到 Gateway 配置异常，已尝试自动执行 openclaw doctor --fix，但命令执行失败：{err}"
+            ))
+        }
+        Err(_) => {
+            guardian_log("自动执行 openclaw doctor --fix 超时 (30s)");
+            emit_guardian_event(
+                app,
+                "auto_fix_failure",
+                "已尝试自动执行 openclaw doctor --fix，但修复超时 (30s)",
+            );
+            Err("检测到 Gateway 配置异常，已尝试自动执行 openclaw doctor --fix，但修复超时 (30s)".into())
+        }
+    }
+}
 
 fn guardian_state() -> &'static Arc<Mutex<GuardianRuntimeState>> {
     GUARDIAN_STATE.get_or_init(|| Arc::new(Mutex::new(GuardianRuntimeState::default())))
@@ -256,6 +402,17 @@ fn guardian_log(message: &str) {
         .append(true)
         .open(path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+fn emit_guardian_event(app: Option<&tauri::AppHandle>, kind: &str, message: impl Into<String>) {
+    if let Some(app) = app {
+        let payload = GuardianEventPayload {
+            kind: kind.to_string(),
+            auto_restart_count: 0,
+            message: message.into(),
+        };
+        let _ = app.emit("guardian-event", payload);
+    }
 }
 
 fn guardian_snapshot() -> GuardianStatus {
@@ -422,7 +579,7 @@ async fn guardian_tick(app: &tauri::AppHandle) {
         guardian_log(&format!(
             "检测到 Gateway 异常退出，后端守护开始自动重启 ({attempt}/{GUARDIAN_MAX_AUTO_RESTART})"
         ));
-        if let Err(err) = start_service_impl_internal("ai.openclaw.gateway").await {
+        if let Err(err) = start_service_impl_internal("ai.openclaw.gateway", Some(app)).await {
             guardian_log(&format!("后端守护自动重启失败: {err}"));
         }
     }
@@ -437,7 +594,55 @@ async fn guardian_tick(app: &tauri::AppHandle) {
     }
 }
 
-async fn start_service_impl_internal(label: &str) -> Result<(), String> {
+async fn start_service_impl_internal(
+    label: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<(), String> {
+    match start_service_impl_internal_once(label).await {
+        Ok(()) => Ok(()),
+        Err(err) => match try_auto_fix_gateway_config(&err, app).await {
+            Ok(true) => {
+                guardian_log("自动修复完成，准备重试启动 Gateway");
+                emit_guardian_event(
+                    app,
+                    "auto_fix_retry",
+                    "已自动修复配置，正在重试启动 Gateway…",
+                );
+                #[cfg(target_os = "windows")]
+                {
+                    platform::cleanup_zombie_gateway_processes();
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                match start_service_impl_internal_once(label).await {
+                    Ok(()) => {
+                        emit_guardian_event(
+                            app,
+                            "auto_fix_success",
+                            "已自动修复配置并成功重试启动 Gateway。",
+                        );
+                        Ok(())
+                    }
+                    Err(retry_err) => {
+                        emit_guardian_event(
+                            app,
+                            "auto_fix_failure",
+                            format!(
+                                "已自动执行 openclaw doctor --fix 并重试启动 Gateway，但仍失败：{retry_err}"
+                            ),
+                        );
+                        Err(format!(
+                            "{retry_err}\n（已自动执行 openclaw doctor --fix 并重试启动 Gateway）"
+                        ))
+                    }
+                }
+            }
+            Ok(false) => Err(err),
+            Err(fix_err) => Err(format!("{err}\n{fix_err}")),
+        },
+    }
+}
+
+async fn start_service_impl_internal_once(label: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         platform::start_service_impl(label)?;
@@ -461,9 +666,12 @@ async fn stop_service_impl_internal(label: &str) -> Result<(), String> {
     wait_for_gateway_stopped(label, Duration::from_secs(10)).await
 }
 
-async fn restart_service_impl_internal(label: &str) -> Result<(), String> {
+async fn restart_service_impl_internal(
+    label: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<(), String> {
     stop_service_impl_internal(label).await?;
-    start_service_impl_internal(label).await
+    start_service_impl_internal(label, app).await
 }
 
 pub fn start_backend_guardian(app: tauri::AppHandle) {
@@ -1688,7 +1896,7 @@ pub async fn get_services_status() -> Result<Vec<ServiceStatus>, String> {
 }
 
 #[tauri::command]
-pub async fn start_service(label: String) -> Result<(), String> {
+pub async fn start_service(app: tauri::AppHandle, label: String) -> Result<(), String> {
     let (running, pid) = current_gateway_runtime(&label).await;
     if running {
         ensure_owned_gateway_or_err(pid)?;
@@ -1697,7 +1905,7 @@ pub async fn start_service(label: String) -> Result<(), String> {
         return Ok(());
     }
     guardian_mark_manual_start();
-    start_service_impl_internal(&label).await
+    start_service_impl_internal(&label, Some(&app)).await
 }
 
 #[tauri::command]
@@ -1711,14 +1919,14 @@ pub async fn stop_service(label: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn restart_service(label: String) -> Result<(), String> {
+pub async fn restart_service(app: tauri::AppHandle, label: String) -> Result<(), String> {
     let (running, pid) = current_gateway_runtime(&label).await;
     if running {
         ensure_owned_gateway_or_err(pid)?;
     }
     guardian_pause("manual restart");
     guardian_mark_manual_start();
-    let result = restart_service_impl_internal(&label).await;
+    let result = restart_service_impl_internal(&label, Some(&app)).await;
     guardian_resume("manual restart");
     result
 }

@@ -60,19 +60,29 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             }
         }
         "gateway_start" => {
-            std::mem::drop(crate::commands::service::start_service(
-                "ai.openclaw.gateway".into(),
-            ));
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::commands::service::start_service(
+                    app2,
+                    "ai.openclaw.gateway".into(),
+                )
+                .await;
+            });
         }
         "gateway_stop" => {
-            std::mem::drop(crate::commands::service::stop_service(
-                "ai.openclaw.gateway".into(),
-            ));
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::commands::service::stop_service("ai.openclaw.gateway".into()).await;
+            });
         }
         "gateway_restart" => {
-            std::mem::drop(crate::commands::service::restart_service(
-                "ai.openclaw.gateway".into(),
-            ));
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::commands::service::restart_service(
+                    app2,
+                    "ai.openclaw.gateway".into(),
+                )
+                .await;
+            });
         }
         "quit" => {
             app.exit(0);

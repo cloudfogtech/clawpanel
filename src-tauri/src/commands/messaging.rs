@@ -3127,9 +3127,13 @@ pub async fn install_qqbot_plugin(
                 "plugin-log",
                 "QQ 插件安装完成；正在重启 Gateway 以加载插件（与官方文档一致）",
             );
+            let app2 = app.clone();
             tauri::async_runtime::spawn(async move {
-                let _ =
-                    crate::commands::service::restart_service("ai.openclaw.gateway".into()).await;
+                let _ = crate::commands::service::restart_service(
+                    app2,
+                    "ai.openclaw.gateway".into(),
+                )
+                .await;
             });
             Ok("安装成功".into())
         }

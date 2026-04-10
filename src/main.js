@@ -15,6 +15,7 @@ import { version as APP_VERSION } from '../package.json'
 import { statusIcon } from './lib/icons.js'
 import { isForeignGatewayError, showGatewayConflictGuidance } from './lib/gateway-ownership.js'
 import { tryShowEngagement } from './components/engagement.js'
+import { toast } from './components/toast.js'
 import { initI18n, t } from './lib/i18n.js'
 
 // 样式
@@ -319,6 +320,7 @@ async function boot() {
   registerRoute('/agent-detail', () => import('./pages/agent-detail.js'))
   registerRoute('/gateway', () => import('./pages/gateway.js'))
   registerRoute('/memory', () => import('./pages/memory.js'))
+  registerRoute('/dreaming', () => import('./pages/dreaming.js'))
   registerRoute('/skills', () => import('./pages/skills.js'))
   registerRoute('/security', () => import('./pages/security.js'))
   registerRoute('/about', () => import('./pages/about.js'))
@@ -412,6 +414,10 @@ async function boot() {
         import('@tauri-apps/api/event').then(async ({ listen }) => {
           await listen('guardian-event', (e) => {
             if (e.payload?.kind === 'give_up') showGuardianRecovery()
+            else if (e.payload?.kind === 'auto_fix_start') toast(t('dashboard.fixing'), 'info')
+            else if (e.payload?.kind === 'auto_fix_retry') toast(t('dashboard.fixDoneRestarting'), 'info')
+            else if (e.payload?.kind === 'auto_fix_success') toast(t('dashboard.fixDoneRestarted'), 'success')
+            else if (e.payload?.kind === 'auto_fix_failure') toast(String(e.payload?.message || t('dashboard.fixDoneRestartFail')).slice(0, 240), 'error')
           })
         }).catch(() => {})
         api.guardianStatus().then(status => {

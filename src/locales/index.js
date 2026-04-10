@@ -17,6 +17,7 @@ import security from './modules/security.js'
 import communication from './modules/communication.js'
 import channels from './modules/channels.js'
 import memory from './modules/memory.js'
+import dreaming from './modules/dreaming.js'
 import cron from './modules/cron.js'
 import usage from './modules/usage.js'
 import skills from './modules/skills.js'
@@ -34,7 +35,7 @@ import engagement from './modules/engagement.js'
 const MODULES = {
   common, sidebar, instance, dashboard, services, settings,
   models, agents, agentDetail, gateway, security, communication, channels,
-  memory, cron, usage, skills, chat, chatDebug, setup, about,
+  memory, dreaming, cron, usage, skills, chat, chatDebug, setup, about,
   ext, logs, assistant, toast, modal, engagement,
 }
 

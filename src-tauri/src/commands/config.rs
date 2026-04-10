@@ -698,8 +698,7 @@ pub fn save_openclaw_json(config: &Value) -> Result<(), String> {
 
 /// 供其他模块复用：触发 Gateway 重载
 pub async fn do_reload_gateway(app: &tauri::AppHandle) -> Result<String, String> {
-    let _ = app; // 预留扩展用
-    reload_gateway().await
+    reload_gateway_internal(Some(app)).await
 }
 
 #[tauri::command]
@@ -4638,8 +4637,7 @@ async fn reload_gateway_via_http() -> Result<String, String> {
 /// 重载 Gateway 服务
 /// Windows/Linux: 优先尝试 HTTP 热重载（不重启进程）
 /// 如果 HTTP 重载失败，回退到 restart_service（会触发 Guardian 重启循环）
-#[tauri::command]
-pub async fn reload_gateway() -> Result<String, String> {
+async fn reload_gateway_internal(app: Option<&tauri::AppHandle>) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         let uid = get_uid()?;
@@ -4658,23 +4656,29 @@ pub async fn reload_gateway() -> Result<String, String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // 优先尝试 HTTP 热重载（不影响现有连接）
         match reload_gateway_via_http().await {
             Ok(msg) => Ok(msg),
             Err(_) => {
-                // HTTP 重载失败，回退到进程重启
-                crate::commands::service::restart_service("ai.openclaw.gateway".into())
-                    .await
-                    .map(|_| "Gateway 已重启".to_string())
+                crate::commands::service::restart_service(
+                    app.cloned().ok_or_else(|| "缺少 AppHandle，无法回退到 Gateway 进程重启".to_string())?,
+                    "ai.openclaw.gateway".into(),
+                )
+                .await
+                .map(|_| "Gateway 已重启".to_string())
             }
         }
     }
 }
 
+#[tauri::command]
+pub async fn reload_gateway(app: tauri::AppHandle) -> Result<String, String> {
+    reload_gateway_internal(Some(&app)).await
+}
+
 /// 重启 Gateway 服务（与 reload_gateway 相同实现）
 #[tauri::command]
-pub async fn restart_gateway() -> Result<String, String> {
-    reload_gateway().await
+pub async fn restart_gateway(app: tauri::AppHandle) -> Result<String, String> {
+    reload_gateway_internal(Some(&app)).await
 }
 
 /// 运行 openclaw doctor --fix 自动修复配置问题

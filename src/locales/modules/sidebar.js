@@ -21,6 +21,7 @@ export default {
   communication: _('通信与自动化', 'Communication', '通信與自動化', '通信と自動化', '통신 및 자동화', 'Truyền thông', 'Comunicación', 'Comunicação', 'Коммуникации', '', 'Kommunikation'),
   security: _('安全设置', 'Security', '安全設定', 'セキュリティ', '보안 설정', 'Bảo mật', 'Seguridad', 'Segurança', 'Безопасность', 'Sécurité', 'Sicherheit'),
   memory: _('记忆文件', 'Memory', '記憶檔案', 'メモリ', '메모리', 'Bộ nhớ', 'Memoria', 'Memória', 'Память', 'Mémoire', 'Speicher'),
+  dreaming: _('梦境模式', 'Dreaming', '夢境模式', 'ドリーミング', '드리밍', 'Dreaming', 'Dreaming', 'Dreaming', 'Dreaming', 'Dreaming', 'Dreaming'),
   cron: _('定时任务', 'Cron Jobs', '定時任務', 'スケジュールタスク', '예약 작업', 'Tác vụ định kỳ', 'Tareas', 'Tarefas', 'Планировщик', 'Tâches planifiées', 'Geplante Aufgaben'),
   usage: _('使用情况', 'Usage', '使用情況', '使用状況', '사용 현황', 'Sử dụng', 'Uso', 'Uso', 'Использование', 'Utilisation', 'Nutzung'),
   skills: _('Skills', 'Skills'),
