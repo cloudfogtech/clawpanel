@@ -28,7 +28,7 @@
   <img src="docs/feature-showcase.gif" width="800" alt="ClawPanel Showcase">
 </p>
 
-ClawPanel est un panneau de gestion visuel supportant plusieurs frameworks d'agents IA, actuellement avec un double support pour [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) et [Hermes Agent](https://github.com/org-2048/hermes-agent). Il intègre un **assistant IA intelligent** qui vous aide à installer, diagnostiquer automatiquement les configurations, résoudre les problèmes et corriger les erreurs. 8 outils + 4 modes + Q&A interactif — facile à gérer pour débutants et experts.
+ClawPanel est un panneau de gestion visuel supportant plusieurs frameworks d'agents IA, actuellement avec un double support pour [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) et [Hermes Agent](https://github.com/nousresearch/hermes-agent). Il intègre un **assistant IA intelligent** qui vous aide à installer, diagnostiquer automatiquement les configurations, résoudre les problèmes et corriger les erreurs. 8 outils + 4 modes + Q&A interactif — facile à gérer pour débutants et experts.
 
 > 🌐 **Site web** : [claw.qt.cool](https://claw.qt.cool/) | 📦 **Télécharger** : [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 

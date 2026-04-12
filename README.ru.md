@@ -28,7 +28,7 @@
   <img src="docs/feature-showcase.gif" width="800" alt="ClawPanel Showcase">
 </p>
 
-ClawPanel — это визуальная панель управления, поддерживающая несколько фреймворков AI-агентов, сейчас с двойной поддержкой [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) и [Hermes Agent](https://github.com/org-2048/hermes-agent). Со **встроенным интеллектуальным ИИ-ассистентом**, который помогает установить, автоматически диагностировать конфигурации, устранять неполадки и исправлять ошибки. 8 инструментов + 4 режима + интерактивный Q&A — удобное управление для новичков и экспертов.
+ClawPanel — это визуальная панель управления, поддерживающая несколько фреймворков AI-агентов, сейчас с двойной поддержкой [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) и [Hermes Agent](https://github.com/nousresearch/hermes-agent). Со **встроенным интеллектуальным ИИ-ассистентом**, который помогает установить, автоматически диагностировать конфигурации, устранять неполадки и исправлять ошибки. 8 инструментов + 4 режима + интерактивный Q&A — удобное управление для новичков и экспертов.
 
 > 🌐 **Сайт**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Скачать**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 

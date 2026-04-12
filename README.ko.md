@@ -28,7 +28,7 @@
   <img src="docs/feature-showcase.gif" width="800" alt="ClawPanel 기능 쇼케이스">
 </p>
 
-ClawPanel은 여러 AI Agent 프레임워크를 지원하는 시각적 관리 패널으로, 현재 [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) 및 [Hermes Agent](https://github.com/org-2048/hermes-agent) 듀얼 엔진을 지원합니다. **지능형 AI 어시스턴트를 내장**하여 원클릭 설치, 자동 설정 진단, 문제 해결 및 오류 수정을 지원합니다. 8개 도구 + 4가지 모드 + 대화형 Q&A로 초보자부터 전문가까지 쉽게 관리할 수 있습니다.
+ClawPanel은 여러 AI Agent 프레임워크를 지원하는 시각적 관리 패널으로, 현재 [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) 및 [Hermes Agent](https://github.com/nousresearch/hermes-agent) 듀얼 엔진을 지원합니다. **지능형 AI 어시스턴트를 내장**하여 원클릭 설치, 자동 설정 진단, 문제 해결 및 오류 수정을 지원합니다. 8개 도구 + 4가지 모드 + 대화형 Q&A로 초보자부터 전문가까지 쉽게 관리할 수 있습니다.
 
 > 🌐 **웹사이트**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **다운로드**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 

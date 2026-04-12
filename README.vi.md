@@ -28,7 +28,7 @@
   <img src="docs/feature-showcase.gif" width="800" alt="ClawPanel Showcase">
 </p>
 
-ClawPanel là bảng quản lý trực quan hỗ trợ nhiều AI Agent framework, hiện tại hỗ trợ [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) và [Hermes Agent](https://github.com/org-2048/hermes-agent) động cơ kép. Tích hợp **trợ lý AI thông minh**, giúp bạn cài đặt, tự động chẩn đoán cấu hình, xử lý sự cố và sửa lỗi. 8 công cụ + 4 chế độ + hỏi đáp tương tác — dễ dàng quản lý cho cả người mới và chuyên gia.
+ClawPanel là bảng quản lý trực quan hỗ trợ nhiều AI Agent framework, hiện tại hỗ trợ [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) và [Hermes Agent](https://github.com/nousresearch/hermes-agent) động cơ kép. Tích hợp **trợ lý AI thông minh**, giúp bạn cài đặt, tự động chẩn đoán cấu hình, xử lý sự cố và sửa lỗi. 8 công cụ + 4 chế độ + hỏi đáp tương tác — dễ dàng quản lý cho cả người mới và chuyên gia.
 
 > 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Tải xuống**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
