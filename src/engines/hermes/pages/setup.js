@@ -18,18 +18,7 @@ const ICONS = {
   done: `<svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" width="24" height="24"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`,
 }
 
-// 可选 extras
-const EXTRAS_LIST = [
-  { key: 'cron', i18n: 'extraCron', recommended: true },
-  { key: 'cli', i18n: 'extraCli', recommended: true },
-  { key: 'pty', i18n: 'extraPty', recommended: true },
-  { key: 'mcp', i18n: 'extraMcp', recommended: true },
-  { key: 'messaging', i18n: 'extraMessaging' },
-  { key: 'feishu', i18n: 'extraFeishu' },
-  { key: 'dingtalk', i18n: 'extraDingtalk' },
-  { key: 'slack', i18n: 'extraSlack' },
-  { key: 'voice', i18n: 'extraVoice' },
-]
+// 核心安装不带 extras，后续可在管理页面按需安装
 
 // Hermes 使用 OpenAI 兼容接口，过滤出兼容的服务商
 const HERMES_PROVIDERS = PROVIDER_PRESETS.filter(p => !p.hidden)
@@ -45,8 +34,6 @@ export function render() {
   let logs = []
   let installing = false
   let progress = 0
-  let showLogs = false
-  let selectedExtras = ['cron', 'cli', 'pty', 'mcp']
   let unlisten = null
 
   function draw() {
@@ -62,7 +49,6 @@ export function render() {
         ${phase === 'configure' ? renderConfigure() : ''}
         ${phase === 'gateway' ? renderGateway() : ''}
         ${phase === 'complete' ? renderComplete() : ''}
-        ${renderLogPanel()}
         <div style="margin-top:16px;text-align:right">
           <a href="https://hermes-agent.nousresearch.com/docs/getting-started/installation/" target="_blank" rel="noopener"
              style="font-size:13px;color:var(--accent);text-decoration:none">
@@ -143,34 +129,38 @@ export function render() {
 
   // --- 安装阶段 ---
   function renderInstall() {
-    const extrasHtml = EXTRAS_LIST.map(ex => {
-      const checked = selectedExtras.includes(ex.key) ? 'checked' : ''
-      return `<label class="hermes-extra-item">
-        <input type="checkbox" value="${ex.key}" ${checked} class="hermes-extra-cb">
-        <span>${t('engine.' + ex.i18n)}${ex.recommended ? ' ⭐' : ''}</span>
-      </label>`
-    }).join('')
-
     const btnText = installing ? `${ICONS.spinner} ${t('engine.installingBtn')}` : `${ICONS.rocket} ${t('engine.installBtn')}`
     const btnDisabled = installing ? 'disabled' : ''
 
     return `<div class="card" style="margin-bottom:16px">
       <div class="card-body" style="padding:24px">
         <h3 style="margin:0 0 4px;font-size:16px">${t('engine.installTitle')}</h3>
-        <p style="color:var(--text-secondary);margin:0 0 20px;font-size:13px">${t('engine.installDesc')}</p>
+        <p style="color:var(--text-secondary);margin:0 0 16px;font-size:13px">${t('engine.installDescSimple')}</p>
 
-        <div style="margin-bottom:20px">
-          <div style="font-size:13px;font-weight:600;margin-bottom:8px">${t('engine.extrasTitle')}</div>
-          <p style="font-size:12px;color:var(--text-tertiary);margin:0 0 10px">${t('engine.extrasDesc')}</p>
-          <div class="hermes-extras-grid">${extrasHtml}</div>
-          <button class="btn-text hermes-select-all" style="margin-top:6px;font-size:12px">${t('engine.extraAll')}</button>
-        </div>
+        ${installing || progress > 0 ? `
+          <div class="hermes-install-status">
+            <div class="hermes-progress"><div class="hermes-progress-bar" style="width:${progress}%"></div></div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+              <span class="hermes-progress-text" style="font-size:12px;color:var(--text-tertiary)">${progress >= 100 ? t('engine.installSuccess') : t('engine.installingBtn')}</span>
+              <span style="font-size:12px;color:var(--text-tertiary);font-family:monospace">${Math.min(progress, 100)}%</span>
+            </div>
+          </div>
+          <div class="hermes-log-panel" style="margin-top:12px">
+            <div class="hermes-log-content">${logs.map(l => `<div>${esc(l)}</div>`).join('')}</div>
+          </div>
+        ` : `
+          <div class="hermes-install-info">
+            <div class="hermes-detect-row" style="margin-bottom:6px">${ICONS.check} <span>${t('engine.installInfoUv')}</span></div>
+            <div class="hermes-detect-row" style="margin-bottom:6px">${ICONS.check} <span>${t('engine.installInfoCore')}</span></div>
+            <div class="hermes-detect-row" style="color:var(--text-tertiary)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              <span>${t('engine.installInfoExtrasLater')}</span>
+            </div>
+          </div>
+        `}
 
-        ${progress > 0 ? `<div class="hermes-progress"><div class="hermes-progress-bar" style="width:${progress}%"></div></div>` : ''}
-
-        <div style="display:flex;gap:10px;align-items:center">
+        <div style="display:flex;gap:10px;align-items:center;margin-top:16px">
           <button class="btn btn-primary hermes-install-btn" ${btnDisabled}>${btnText}</button>
-          ${!installing ? `<button class="btn-text hermes-toggle-logs" style="font-size:12px">${showLogs ? t('engine.hideLogs') : t('engine.viewLogs')}</button>` : ''}
         </div>
       </div>
     </div>`
@@ -254,14 +244,6 @@ export function render() {
     </div>`
   }
 
-  // --- 日志面板 ---
-  function renderLogPanel() {
-    if (!showLogs || logs.length === 0) return ''
-    return `<div class="hermes-log-panel">
-      <div class="hermes-log-content">${logs.map(l => `<div>${esc(l)}</div>`).join('')}</div>
-    </div>`
-  }
-
   function esc(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   }
@@ -277,22 +259,6 @@ export function render() {
     })
     // 安装按钮
     el.querySelector('.hermes-install-btn')?.addEventListener('click', doInstall)
-    // 全选 extras
-    el.querySelector('.hermes-select-all')?.addEventListener('click', () => {
-      selectedExtras = EXTRAS_LIST.map(e => e.key)
-      draw()
-    })
-    // extras checkbox
-    el.querySelectorAll('.hermes-extra-cb').forEach(cb => {
-      cb.addEventListener('change', () => {
-        if (cb.checked && !selectedExtras.includes(cb.value)) selectedExtras.push(cb.value)
-        else selectedExtras = selectedExtras.filter(k => k !== cb.value)
-      })
-    })
-    // 日志切换
-    el.querySelector('.hermes-toggle-logs')?.addEventListener('click', () => {
-      showLogs = !showLogs; draw()
-    })
     // 服务商预设按钮
     el.querySelectorAll('.hermes-preset-btn').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -387,18 +353,20 @@ export function render() {
   async function doInstall() {
     installing = true
     progress = 0
-    showLogs = true
     logs = []
     draw()
 
-    // 监听事件
+    // 监听事件（Tauri 模式下有 hermes-install-log/progress 事件）
     try {
       const { listen } = await import('@tauri-apps/api/event')
       const u1 = await listen('hermes-install-log', (e) => {
-        logs.push(String(e.payload))
+        const line = String(e.payload)
+        logs.push(line)
         const logEl = el.querySelector('.hermes-log-content')
         if (logEl) {
-          logEl.innerHTML += `<div>${esc(String(e.payload))}</div>`
+          const div = document.createElement('div')
+          div.textContent = line
+          logEl.appendChild(div)
           logEl.scrollTop = logEl.scrollHeight
         }
       })
@@ -406,20 +374,25 @@ export function render() {
         progress = Number(e.payload) || 0
         const bar = el.querySelector('.hermes-progress-bar')
         if (bar) bar.style.width = progress + '%'
+        const pctEl = el.querySelector('.hermes-progress-text')
+        if (pctEl) pctEl.textContent = progress >= 100 ? t('engine.installSuccess') : t('engine.installingBtn')
+        // 更新百分比数字
+        const pctNum = bar?.parentElement?.nextElementSibling?.querySelector('span:last-child')
+        if (pctNum) pctNum.textContent = Math.min(progress, 100) + '%'
       })
       unlisten = () => { u1(); u2() }
     } catch (_) {}
 
     try {
-      await api.installHermes('uv-tool', selectedExtras)
+      await api.installHermes('uv-tool', [])
       installing = false
       progress = 100
-      logs.push(t('engine.installSuccess'))
+      logs.push('✅ ' + t('engine.installSuccess'))
       phase = 'configure'
       draw()
     } catch (e) {
       installing = false
-      logs.push(`${t('engine.installFailed')}: ${e}`)
+      logs.push(`❌ ${t('engine.installFailed')}: ${e}`)
       draw()
     } finally {
       if (unlisten) { unlisten(); unlisten = null }

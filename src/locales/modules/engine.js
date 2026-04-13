@@ -26,6 +26,10 @@ export default {
   // 安装阶段
   installTitle: _('安装 Hermes Agent', 'Install Hermes Agent', '安裝 Hermes Agent'),
   installDesc: _('通过 uv 自动安装（含 Python 环境），无需手动操作', 'Auto-install via uv (includes Python), no manual steps', '透過 uv 自動安裝（含 Python 環境），無需手動操作'),
+  installDescSimple: _('一键安装 Hermes Agent 核心包，安装完成后可在管理页面按需添加扩展组件。', 'One-click install of Hermes Agent core package. Extensions can be added later from the management page.', '一鍵安裝 Hermes Agent 核心包，安裝完成後可在管理頁面按需添加擴展組件。'),
+  installInfoUv: _('自动下载 uv 包管理器（如未安装）', 'Auto-download uv package manager (if not installed)', '自動下載 uv 包管理器（如未安裝）'),
+  installInfoCore: _('安装 hermes-agent 核心包', 'Install hermes-agent core package', '安裝 hermes-agent 核心包'),
+  installInfoExtrasLater: _('扩展组件（定时任务、MCP、消息渠道等）可在安装后按需添加', 'Extensions (cron, MCP, messaging, etc.) can be added later as needed', '擴展組件（定時任務、MCP、訊息頻道等）可在安裝後按需添加'),
   installBtn: _('一键安装', 'Install Now', '一鍵安裝'),
   installingBtn: _('正在安装...', 'Installing...', '正在安裝...'),
   installSuccess: _('安装成功！', 'Installation successful!', '安裝成功！'),
