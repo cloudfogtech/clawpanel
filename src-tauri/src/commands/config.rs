@@ -5268,6 +5268,10 @@ pub async fn test_model_verbose(
         crate::commands::build_http_client_no_proxy(std::time::Duration::from_secs(30), None)
             .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
 
+    // 关键：显式 Accept-Encoding: identity 禁止响应压缩，避免：
+    // - reqwest 未启用 brotli feature 时，provider 返回 Content-Encoding: br 导致 text() 失败
+    // - 某些 CDN 会根据默认 UA 自动压缩响应
+    // 测试请求的响应体很小（几百字节），不压缩的性能损失可忽略
     let (used_api, req_url, req_body_json, req_builder) = match api_type_norm {
         "anthropic-messages" => {
             let url = format!("{}/messages", base);
@@ -5279,6 +5283,7 @@ pub async fn test_model_verbose(
             let mut req = client
                 .post(&url)
                 .header("anthropic-version", "2023-06-01")
+                .header("Accept-Encoding", "identity")
                 .json(&body);
             if !api_key.is_empty() {
                 req = req.header("x-api-key", api_key.clone());
@@ -5294,7 +5299,10 @@ pub async fn test_model_verbose(
             let body = json!({
                 "contents": [{"role": "user", "parts": [{"text": "你好，请用一句话回复"}]}]
             });
-            let req = client.post(&url_real).json(&body);
+            let req = client
+                .post(&url_real)
+                .header("Accept-Encoding", "identity")
+                .json(&body);
             ("Gemini", url_display, body, req)
         }
         _ => {
@@ -5305,7 +5313,10 @@ pub async fn test_model_verbose(
                 "max_tokens": 200,
                 "stream": false
             });
-            let mut req = client.post(&url).json(&body);
+            let mut req = client
+                .post(&url)
+                .header("Accept-Encoding", "identity")
+                .json(&body);
             if !api_key.is_empty() {
                 req = req.header("Authorization", format!("Bearer {api_key}"));
             }
@@ -5342,7 +5353,23 @@ pub async fn test_model_verbose(
 
     let status = resp.status();
     let status_code = status.as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    // 读取响应体：若失败（如 gzip/brotli 解码异常、非法 UTF-8）直接返回错误，不静默吞成空串
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok(json!({
+                "success": false,
+                "status": status_code,
+                "reqUrl": req_url,
+                "reqBody": req_body_json,
+                "respBody": "",
+                "reply": "",
+                "error": format!("读取响应体失败: {e} (可能是压缩编码未支持或非 UTF-8 响应)"),
+                "elapsedMs": elapsed_ms,
+                "usedApi": used_api,
+            }));
+        }
+    };
 
     // 提取 reply 文本（兼容 OpenAI / Anthropic / Gemini / DashScope）
     let reply = serde_json::from_str::<serde_json::Value>(&text)

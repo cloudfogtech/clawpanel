@@ -4959,26 +4959,28 @@ const handlers = {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 30000)
 
+    // Accept-Encoding: identity 禁止响应压缩，规避 Node fetch 对某些压缩格式的解码异常
+    // （和 Rust test_model_verbose 保持行为一致）
     let usedApi, reqUrl, reqBody, headers, realUrl
     if (type === 'anthropic-messages') {
       usedApi = 'Anthropic Messages'
       reqUrl = `${base}/messages`
       realUrl = reqUrl
       reqBody = { model: modelId, messages: [{ role: 'user', content: '你好，请用一句话回复' }], max_tokens: 200 }
-      headers = { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' }
+      headers = { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01', 'Accept-Encoding': 'identity' }
       if (apiKey) headers['x-api-key'] = apiKey
     } else if (type === 'google-gemini') {
       usedApi = 'Gemini'
       reqUrl = `${base}/models/${encodeURIComponent(modelId)}:generateContent?key=***`
       realUrl = `${base}/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(apiKey || '')}`
       reqBody = { contents: [{ role: 'user', parts: [{ text: '你好，请用一句话回复' }] }] }
-      headers = { 'Content-Type': 'application/json' }
+      headers = { 'Content-Type': 'application/json', 'Accept-Encoding': 'identity' }
     } else {
       usedApi = 'Chat Completions'
       reqUrl = `${base}/chat/completions`
       realUrl = reqUrl
       reqBody = { model: modelId, messages: [{ role: 'user', content: '你好，请用一句话回复' }], max_tokens: 200, stream: false }
-      headers = { 'Content-Type': 'application/json' }
+      headers = { 'Content-Type': 'application/json', 'Accept-Encoding': 'identity' }
       if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
     }
 

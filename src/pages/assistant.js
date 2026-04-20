@@ -2946,35 +2946,47 @@ function buildTestResult({ success, elapsed, usedApi, reqUrl, reqBody, respStatu
       apiErrMsg = errJson.error?.message || errJson.message || ''
     } catch {}
   }
-  // 状态行
+  // 状态行（加粗显示，区分成功/警告/失败）
   if (error) {
-    html += `<span style="color:var(--error)">✗ ${t('assistant.testFailed')}: ${escHtml(error)}</span>`
+    html += `<div style="color:var(--error);font-weight:500">✗ ${t('assistant.testFailed')}: ${escHtml(error)}</div>`
   } else if (success) {
-    html += `<span style="color:var(--success)">✓ ${t('assistant.testSuccess', { elapsed, api: usedApi })}</span>`
+    html += `<div style="color:var(--success);font-weight:500">✓ ${t('assistant.testSuccess', { elapsed, api: usedApi })}</div>`
   } else {
-    html += `<span style="color:var(--warning)">${statusIcon('warn', 14)} HTTP ${respStatus} — ${t('assistant.testNoReply')}</span>`
+    html += `<div style="color:var(--warning);font-weight:500">${statusIcon('warn', 14)} HTTP ${respStatus} — ${t('assistant.testNoReply')}</div>`
   }
   // API 错误信息（完整展示，URL 可点击）
   if (apiErrMsg) {
     html += `<div style="margin-top:6px;padding:8px 10px;background:var(--bg-tertiary);border-left:3px solid var(--warning);border-radius:4px;font-size:12px;color:var(--text-secondary);line-height:1.6;word-break:break-all">${_linkify(escHtml(apiErrMsg))}</div>`
   }
-  // 回复预览
+  // 模型回复（完整展示，不截断；长回复给最大高度 + scroll）
   if (reply) {
-    const short = reply.length > 80 ? reply.slice(0, 80) + '...' : reply
-    html += `<div style="margin-top:4px;padding:6px 8px;background:var(--bg-tertiary);border-radius:4px;font-size:12px;color:var(--text-secondary)">「${escHtml(short)}」</div>`
+    html += `<div style="margin-top:6px;padding:8px 10px;background:var(--bg-tertiary);border-left:3px solid var(--success);border-radius:4px;font-size:13px;color:var(--text-primary);line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:180px;overflow:auto">` +
+      `<div style="font-size:10px;color:var(--text-tertiary);margin-bottom:4px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase">${t('assistant.testModelReply')}</div>` +
+      escHtml(reply) +
+      `</div>`
   }
+  // respBody 空但 reply 非空：明确诊断
+  if (!respBody && reply) {
+    html += `<div style="margin-top:6px;font-size:11px;color:var(--text-tertiary);font-style:italic;line-height:1.5">${escHtml(t('assistant.testRespBodyEmpty'))}</div>`
+  }
+  // 固定 prompt 脚注（用户知情权：测试的是预设请求，不是真实对话）
+  html += `<div style="margin-top:8px;font-size:10px;color:var(--text-tertiary);opacity:0.7;line-height:1.4">📌 ${escHtml(t('assistant.testFixedPrompt'))}</div>`
   // 折叠的详细信息
-  html += `<details style="margin-top:6px;font-size:11px"><summary style="cursor:pointer;color:var(--text-tertiary);user-select:none">查看完整请求/响应参数</summary>`
-  html += `<div style="margin-top:4px;max-height:200px;overflow:auto;background:var(--bg-tertiary);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all">`
+  html += `<details style="margin-top:6px;font-size:11px"><summary style="cursor:pointer;color:var(--text-tertiary);user-select:none">${t('assistant.testShowDetails')}</summary>`
+  html += `<div style="margin-top:4px;max-height:240px;overflow:auto;background:var(--bg-tertiary);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all">`
   html += `<strong>POST</strong> ${escHtml(reqUrl)}\n\n`
   html += `<strong>Request Body:</strong>\n${escHtml(JSON.stringify(reqBody, null, 2))}\n\n`
   html += `<strong>Response Status:</strong> ${respStatus}\n\n`
   html += `<strong>Response Body:</strong>\n`
-  // 美化 JSON
-  try {
-    html += escHtml(JSON.stringify(JSON.parse(respBody), null, 2))
-  } catch {
-    html += escHtml(respBody?.slice(0, 2000) || '(empty)')
+  // 美化 JSON（空串单独提示，避免误导为"empty"字面量）
+  if (!respBody) {
+    html += `<span style="color:var(--text-tertiary);font-style:italic">${escHtml(t('assistant.testRespBodyEmptyDetail'))}</span>`
+  } else {
+    try {
+      html += escHtml(JSON.stringify(JSON.parse(respBody), null, 2))
+    } catch {
+      html += escHtml(respBody.slice(0, 4000))
+    }
   }
   html += `</div></details>`
   return html
