@@ -108,6 +108,28 @@ export async function render() {
   `
 
   page.querySelector('#btn-recheck').addEventListener('click', () => runDetect(page))
+
+  // #Compat-4: 用户在浏览器里手动装完 Node.js 后切回 panel，或用户装完 Git/OpenClaw
+  // 后 app 失焦又重新获得焦点时，自动重新检测，避免「装完不识别」。
+  // handler 自带 guard：page 从 DOM 移除后自动卸载监听器，防止跨页面泄漏。
+  // 同时监听 visibilitychange（tab 切换）和 window focus（桌面端窗口激活），兜底不同平台行为。
+  let _lastRedetectAt = 0
+  const onVisibilityChange = () => {
+    if (!page.isConnected) {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('focus', onVisibilityChange)
+      return
+    }
+    if (document.visibilityState !== 'visible') return
+    // 3 秒内不重复触发（避免 focus + visibilitychange 同时连发）
+    const now = Date.now()
+    if (now - _lastRedetectAt < 3000) return
+    _lastRedetectAt = now
+    runDetect(page)
+  }
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  window.addEventListener('focus', onVisibilityChange)
+
   runDetect(page)
   return page
 }
@@ -165,8 +187,12 @@ async function runDetect(page) {
     <div class="stat-card loading-placeholder" style="height:48px;margin-top:8px"></div>
     <div class="stat-card loading-placeholder" style="height:48px;margin-top:8px"></div>
   `
-  // 清除缓存，确保拿到最新检测结果
+  // 清除前端 invoke 缓存
   invalidate('get_version_info', 'check_node', 'check_git', 'get_services_status', 'check_installation')
+  // #Compat-4: 同步刷新 Rust 端 PATH 缓存 + CLI 检测缓存
+  // 用户手动装完 Node.js/Git 后，Tauri 进程的 PATH 仍是启动时快照，且 enhanced_path 有缓存。
+  // 必须先调此命令扫描文件系统新装路径，才能让 where/which 找到新二进制。
+  try { await api.invalidatePathCache() } catch {}
   // 并行检测 Node.js、Git、OpenClaw CLI、配置文件
   const [nodeRes, gitRes, clawRes, configRes, versionRes] = await Promise.allSettled([
     api.checkNode(),

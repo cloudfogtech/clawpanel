@@ -2607,11 +2607,15 @@ pub fn check_openclaw_at_path(cli_path: String) -> Result<Value, String> {
 }
 
 fn find_git_path() -> Option<String> {
+    // #Compat-4: 必须把子进程 PATH 替换成 enhanced_path，否则继承的是 Tauri 启动时快照，
+    // 用户新装的 git 不在快照里，`where git` / `which git` 就找不到。对齐 find_node_path 的做法。
+    let enhanced = super::enhanced_path();
     #[cfg(target_os = "windows")]
     {
         let mut cmd = Command::new("where");
         cmd.arg("git");
         cmd.creation_flags(0x08000000);
+        cmd.env("PATH", &enhanced);
         if let Ok(output) = cmd.output() {
             if output.status.success() {
                 if let Some(first_line) = String::from_utf8_lossy(&output.stdout).lines().next() {
@@ -2626,7 +2630,10 @@ fn find_git_path() -> Option<String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        if let Ok(output) = Command::new("which").arg("git").output() {
+        let mut cmd = Command::new("which");
+        cmd.arg("git");
+        cmd.env("PATH", &enhanced);
+        if let Ok(output) = cmd.output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !path.is_empty() && std::path::Path::new(&path).exists() {
@@ -3974,6 +3981,14 @@ async fn upgrade_openclaw_inner(
             }
         }
     }
+
+    // #Compat-4: npm 首次安装场景下，前面 `if need_uninstall_old` 块被跳过，
+    // PATH 缓存和 CLI 检测缓存都是装 openclaw 之前的旧快照。必须在这里统一刷新一次，
+    // 否则前端 `check_installation`/`get_services_status` 拿到的仍是「CLI 未安装」
+    // —— 用户反馈「一键装完日志显示成功，但面板不识别，重启客户端才能用」。
+    // 切换源场景前面已刷过，这里重刷无害（几十 ms 扫描开销可接受）。
+    super::refresh_enhanced_path();
+    crate::commands::service::invalidate_cli_detection_cache();
 
     let new_ver = get_local_version().await.unwrap_or_else(|| "未知".into());
     let msg = format!("✅ 安装完成，当前版本: {new_ver}");
@@ -5788,8 +5803,12 @@ pub fn check_git() -> Result<Value, String> {
     } else {
         find_git_path()
     };
-    let mut cmd = Command::new(&git);
+    // #Compat-4: 优先用 find_git_path 拿到的绝对路径执行 --version（避免依赖子进程 PATH），
+    // 回退到 "git" 时也把 enhanced_path 注入子进程 PATH，让刚装完 git 的场景立即可识别。
+    let exec = git_path.as_deref().unwrap_or(&git);
+    let mut cmd = Command::new(exec);
     cmd.arg("--version");
+    cmd.env("PATH", super::enhanced_path());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
     match cmd.output() {
@@ -6028,6 +6047,10 @@ pub async fn auto_install_git(app: tauri::AppHandle) -> Result<String, String> {
             .map_err(|e| format!("等待 winget 完成失败: {e}"))?;
         if status.success() {
             let _ = app.emit("upgrade-log", "Git 安装成功！");
+            // #Compat-4: 刷新 PATH 缓存，使 check_git 能立即检测到新装的 git，
+            // 避免用户反馈「装完不识别，重启客户端才能用」
+            super::refresh_enhanced_path();
+            crate::commands::service::invalidate_cli_detection_cache();
             return Ok("Git 已通过 winget 安装".to_string());
         }
         Err("winget 安装 Git 失败，请手动下载安装: https://git-scm.com/downloads".to_string())
@@ -6045,6 +6068,9 @@ pub async fn auto_install_git(app: tauri::AppHandle) -> Result<String, String> {
         let status = child.wait().map_err(|e| format!("等待安装完成失败: {e}"))?;
         if status.success() {
             let _ = app.emit("upgrade-log", "Git 安装已触发，请在弹出的窗口中确认安装。");
+            // #Compat-4: 刷新缓存（即便是"触发"而非同步完成，下次检测时缓存也已清）
+            super::refresh_enhanced_path();
+            crate::commands::service::invalidate_cli_detection_cache();
             return Ok("已触发 xcode-select 安装，请在弹窗中确认".to_string());
         }
         Err(
@@ -6130,6 +6156,9 @@ pub async fn auto_install_git(app: tauri::AppHandle) -> Result<String, String> {
         let status = child.wait().map_err(|e| format!("等待安装完成失败: {e}"))?;
         if status.success() {
             let _ = app.emit("upgrade-log", "Git 安装成功！");
+            // #Compat-4: 刷新 PATH 缓存，使 check_git 立即识别新装的 git
+            super::refresh_enhanced_path();
+            crate::commands::service::invalidate_cli_detection_cache();
             return Ok("Git 已安装".to_string());
         }
         Err("Git 安装失败，请手动执行: sudo apt install git".to_string())
