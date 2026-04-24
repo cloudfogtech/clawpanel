@@ -20,6 +20,7 @@ pub mod device;
 pub mod diagnose;
 pub mod extensions;
 pub mod hermes;
+pub mod hermes_providers;
 pub mod logs;
 pub mod memory;
 pub mod messaging;

@@ -4,8 +4,8 @@ mod tray;
 mod utils;
 
 use commands::{
-    agent, assistant, config, device, diagnose, extensions, hermes, logs, memory, messaging,
-    pairing, service, skills, update,
+    agent, assistant, config, device, diagnose, extensions, hermes, hermes_providers, logs, memory,
+    messaging, pairing, service, skills, update,
 };
 
 pub fn run() {
@@ -230,6 +230,7 @@ pub fn run() {
             hermes::hermes_fetch_models,
             hermes::hermes_update_model,
             hermes::hermes_detect_environments,
+            hermes_providers::hermes_list_providers,
             hermes::hermes_set_gateway_url,
             hermes::update_hermes,
             hermes::uninstall_hermes,

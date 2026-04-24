@@ -1198,35 +1198,38 @@ pub async fn configure_hermes(
         let _ = std::fs::create_dir_all(home.join(dir));
     }
 
-    // Hermes 不使用 provider 字段——它通过 .env 中的 API key/base_url 自动检测。
-    // 只需要区分 env key 名称（OPENAI_API_KEY vs ANTHROPIC_API_KEY 等）。
-    let env_provider = match provider.as_str() {
-        "anthropic" | "minimax" => "anthropic",
-        "openrouter" => "openrouter",
-        _ => "openai", // 所有 OpenAI 兼容的
-    };
+    // ---- Provider-aware key routing ----
+    // ClawPanel 使用 HERMES_PROVIDER_REGISTRY (22 providers) 决定 .env key 名和
+    // config.yaml 的 model.provider 字段。详见 hermes_providers.rs 的文档。
+    use super::hermes_providers;
 
-    // 模型标识：Hermes 直接用模型名，不加 provider/ 前缀
-    let model_str = model.unwrap_or_else(|| match env_provider {
-        "anthropic" => "claude-sonnet-4-20250514".into(),
-        "openrouter" => "anthropic/claude-sonnet-4-20250514".into(),
-        _ => "gpt-4o".into(),
+    let pcfg = hermes_providers::get_provider(&provider);
+
+    // 模型标识：优先使用调用方传入，否则用 provider 的首个已知模型；
+    // aggregator 没有默认模型，要求调用方显式提供。
+    let model_str = model.unwrap_or_else(|| {
+        pcfg.and_then(|p| p.models.first().map(|s| s.to_string()))
+            .unwrap_or_default()
     });
+    if model_str.is_empty() {
+        return Err(format!(
+            "Provider '{provider}' has no default model; please pass an explicit model name"
+        ));
+    }
 
     // ---- 写入 config.yaml（合并模式：保留用户自定义的 hooks/skills/cron 等） ----
     let config_path = home.join("config.yaml");
-    let base_url_line = if let Some(ref url) = base_url {
-        let u = url.trim();
-        if !u.is_empty() {
-            format!("  base_url: {u}\n")
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
+    let base_url_line = match base_url.as_ref() {
+        Some(url) if !url.trim().is_empty() => format!("  base_url: {}\n", url.trim()),
+        _ => String::new(),
     };
-    // Hermes 不使用 provider 字段，留空即可
-    let provider_line = String::new();
+    // Provider 字段：Hermes v0.14+ 的 model_switch 依赖该字段决定 env_var。
+    // `custom` 不写 provider 行，让 Hermes 从 base_url 自动推断。
+    let provider_line = if provider == "custom" || provider.is_empty() {
+        String::new()
+    } else {
+        format!("  provider: {provider}\n")
+    };
 
     let config_content = if config_path.exists() {
         // 读取现有配置，只更新 model 区块，保留其余内容
@@ -1238,7 +1241,7 @@ pub async fn configure_hermes(
             r#"# Hermes Agent configuration (managed by ClawPanel)
 model:
   default: {model_str}
-{base_url_line}platform_toolsets:
+{provider_line}{base_url_line}platform_toolsets:
   api_server:
     - hermes-api-server
 terminal:
@@ -1253,35 +1256,34 @@ platforms:
         .map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
 
     // ---- 写入 .env（合并模式：保留用户自定义的环境变量如 TAVILY_API_KEY 等） ----
-    let env_key = match env_provider {
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        _ => "OPENAI_API_KEY",
-    };
-    // ClawPanel 管理的 key 列表（更新时覆盖，其他 key 保留）
-    let managed_keys: Vec<&str> = vec![
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENROUTER_API_KEY",
-        "OPENAI_BASE_URL",
-        "ANTHROPIC_BASE_URL",
-        "GATEWAY_ALLOW_ALL_USERS",
-        "API_SERVER_KEY",
-    ];
+    // 根据 provider 选择正确的 env var；OAuth/external_process 类没有 api_key_env_vars，
+    // 此时跳过写 key（CLI 登录后 Hermes 会自行管理 auth.json）。
+    let key_env = hermes_providers::primary_api_key_env(&provider);
+    let url_env = hermes_providers::primary_base_url_env(&provider);
+
+    // ClawPanel 管理的 key 列表：包含所有 provider 的 api_key_env_vars + base_url_env_vars
+    // + ClawPanel 特定的两个 key。换 provider 时这些会被重写或清除。
+    let managed_keys_owned = hermes_providers::all_managed_env_keys();
+    let managed_keys: Vec<&str> = managed_keys_owned.to_vec();
+
     let mut new_pairs: Vec<(String, String)> = vec![
-        (env_key.into(), api_key.clone()),
         ("GATEWAY_ALLOW_ALL_USERS".into(), "true".into()),
         ("API_SERVER_KEY".into(), "clawpanel-local".into()),
     ];
-    // 清除旧 provider 的 key（换 provider 时不残留旧凭证）
-    // 新的 base_url
-    if let Some(ref url) = base_url {
-        if !url.trim().is_empty() {
-            let url_key = match env_provider {
-                "anthropic" => "ANTHROPIC_BASE_URL",
-                _ => "OPENAI_BASE_URL",
-            };
-            new_pairs.push((url_key.into(), url.trim().into()));
+
+    if let Some(env) = key_env {
+        if !api_key.trim().is_empty() {
+            new_pairs.push((env.into(), api_key.trim().into()));
+        }
+    } else if !api_key.trim().is_empty() {
+        // OAuth provider 传了 api_key —— 记日志，不落盘
+        eprintln!("[configure_hermes] Provider '{provider}' uses OAuth; ignoring provided api_key");
+    }
+
+    if let (Some(env), Some(url)) = (url_env, base_url.as_ref()) {
+        let u = url.trim();
+        if !u.is_empty() {
+            new_pairs.push((env.into(), u.into()));
         }
     }
 
@@ -1450,6 +1452,8 @@ fn merge_env_file(existing: &str, managed_keys: &[&str], new_pairs: &[(String, S
 
 #[tauri::command]
 pub async fn hermes_read_config() -> Result<Value, String> {
+    use super::hermes_providers;
+
     let home = hermes_home();
     let config_path = home.join("config.yaml");
     let env_path = home.join(".env");
@@ -1457,15 +1461,14 @@ pub async fn hermes_read_config() -> Result<Value, String> {
     // 读取 config.yaml
     let config_raw = std::fs::read_to_string(&config_path).unwrap_or_default();
     let mut model_name = String::new();
-    let mut base_url = String::new();
-    let mut provider = String::new();
-    // 简易 YAML 解析（避免引入 yaml 依赖）
+    let mut base_url_from_yaml = String::new();
+    let mut provider_from_yaml = String::new();
     let mut in_model = false;
     for line in config_raw.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("model:") {
             in_model = true;
-            // model: "xxx" 单行格式
+            // `model: "xxx"` 单行格式
             if let Some(v) = trimmed
                 .strip_prefix("model:")
                 .map(|s| s.trim().trim_matches('"'))
@@ -1485,14 +1488,14 @@ pub async fn hermes_read_config() -> Result<Value, String> {
                     .trim_matches('"')
                     .to_string();
             } else if trimmed.starts_with("base_url:") {
-                base_url = trimmed
+                base_url_from_yaml = trimmed
                     .strip_prefix("base_url:")
                     .unwrap()
                     .trim()
                     .trim_matches('"')
                     .to_string();
             } else if trimmed.starts_with("provider:") {
-                provider = trimmed
+                provider_from_yaml = trimmed
                     .strip_prefix("provider:")
                     .unwrap()
                     .trim()
@@ -1505,37 +1508,53 @@ pub async fn hermes_read_config() -> Result<Value, String> {
         }
     }
 
-    // 读取 .env 中的 API key
+    // 读取 .env 到 key→value map
     let env_raw = std::fs::read_to_string(&env_path).unwrap_or_default();
-    let mut api_key = String::new();
-    for line in env_raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("OPENAI_API_KEY=") {
-            api_key = trimmed.strip_prefix("OPENAI_API_KEY=").unwrap().to_string();
-        } else if trimmed.starts_with("ANTHROPIC_API_KEY=") && api_key.is_empty() {
-            api_key = trimmed
-                .strip_prefix("ANTHROPIC_API_KEY=")
-                .unwrap()
-                .to_string();
-        } else if trimmed.starts_with("OPENROUTER_API_KEY=") && api_key.is_empty() {
-            api_key = trimmed
-                .strip_prefix("OPENROUTER_API_KEY=")
-                .unwrap()
-                .to_string();
-        }
-        // base_url from .env if not in config
-        if trimmed.starts_with("OPENAI_BASE_URL=") && base_url.is_empty() {
-            base_url = trimmed
-                .strip_prefix("OPENAI_BASE_URL=")
-                .unwrap()
-                .to_string();
-        } else if trimmed.starts_with("ANTHROPIC_BASE_URL=") && base_url.is_empty() {
-            base_url = trimmed
-                .strip_prefix("ANTHROPIC_BASE_URL=")
-                .unwrap()
-                .to_string();
-        }
-    }
+    let env_map: std::collections::HashMap<String, String> = env_raw
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                return None;
+            }
+            t.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+        })
+        .collect();
+
+    // 推断 provider：优先 config.yaml.model.provider，其次从 .env 反查
+    let provider_id: String = if !provider_from_yaml.is_empty() {
+        provider_from_yaml.clone()
+    } else {
+        let keys_refs: Vec<&str> = env_map.keys().map(|s| s.as_str()).collect();
+        hermes_providers::infer_provider_from_env_keys(&keys_refs)
+            .map(String::from)
+            .unwrap_or_default()
+    };
+
+    // 按 provider 的 api_key_env_vars 顺序拿 api_key
+    let api_key: String = hermes_providers::get_provider(&provider_id)
+        .and_then(|p| {
+            p.api_key_env_vars
+                .iter()
+                .find_map(|ev| env_map.get(*ev).cloned())
+        })
+        .unwrap_or_default();
+
+    // 有效 base_url：优先 config.yaml.model.base_url，其次 provider 的 base_url_env_var
+    let effective_base_url: String = if !base_url_from_yaml.is_empty() {
+        base_url_from_yaml.clone()
+    } else {
+        hermes_providers::get_provider(&provider_id)
+            .and_then(|p| {
+                if p.base_url_env_var.is_empty() {
+                    None
+                } else {
+                    env_map.get(p.base_url_env_var).cloned()
+                }
+            })
+            .unwrap_or_default()
+    };
 
     // UI 显示用短名（去掉 provider/ 前缀），如 openai/QC-S05 → QC-S05
     let display_model = if let Some(pos) = model_name.find('/') {
@@ -1547,8 +1566,8 @@ pub async fn hermes_read_config() -> Result<Value, String> {
     Ok(serde_json::json!({
         "model": display_model,
         "model_raw": model_name,
-        "base_url": base_url,
-        "provider": provider,
+        "base_url": effective_base_url,
+        "provider": provider_id,
         "api_key": api_key,
         "config_exists": config_path.exists(),
     }))
@@ -1563,13 +1582,41 @@ pub async fn hermes_fetch_models(
     base_url: String,
     api_key: String,
     api_type: Option<String>,
+    provider: Option<String>,
 ) -> Result<Vec<String>, String> {
+    use super::hermes_providers;
+
+    // 如果显式指定了 provider，优先走注册表决定 probe 方式 + fallback
+    if let Some(pid) = provider.as_ref() {
+        if let Some(pcfg) = hermes_providers::get_provider(pid) {
+            // OAuth / external_process / copilot → 不能用 api_key 探测，
+            // 直接返回静态 catalog
+            if pcfg.models_probe == hermes_providers::PROBE_NONE {
+                let mut models: Vec<String> = pcfg.models.iter().map(|s| s.to_string()).collect();
+                models.sort();
+                return Ok(models);
+            }
+        }
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
-    let api = api_type.unwrap_or_else(|| "openai".into());
+    // api_type 优先级：调用方 api_type > provider.transport 推断 > 默认 openai
+    let api = api_type.unwrap_or_else(|| {
+        provider
+            .as_ref()
+            .and_then(|pid| hermes_providers::get_provider(pid))
+            .map(|p| match p.transport {
+                hermes_providers::TRANSPORT_ANTHROPIC => "anthropic-messages".to_string(),
+                hermes_providers::TRANSPORT_GOOGLE => "google-generative-ai".to_string(),
+                _ => "openai".to_string(),
+            })
+            .unwrap_or_else(|| "openai".into())
+    });
+
     let mut base = base_url.trim_end_matches('/').to_string();
     // 移除尾部的 chat/completions 等路径
     for suffix in &[
@@ -1662,34 +1709,100 @@ pub async fn hermes_fetch_models(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn hermes_update_model(model: String) -> Result<String, String> {
+pub async fn hermes_update_model(
+    model: String,
+    provider: Option<String>,
+) -> Result<String, String> {
+    use super::hermes_providers;
+
     let home = hermes_home();
     let config_path = home.join("config.yaml");
     let config_raw =
         std::fs::read_to_string(&config_path).map_err(|e| format!("读取 config.yaml 失败: {e}"))?;
 
-    // Hermes 直接用模型名，不加 provider/ 前缀
     let model_str = model.clone();
 
-    // 替换 model.default 行
-    let mut found = false;
-    let new_content: String = config_raw
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("default:") && !found {
-                found = true;
-                let indent = line.len() - line.trim_start().len();
-                format!("{}default: {}", " ".repeat(indent), model_str)
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Provider 决定策略：
+    //   1. 调用方显式提供 → 直接使用
+    //   2. 从静态 catalog 反查唯一匹配 → 使用反查结果
+    //   3. 找不到 / 模糊 → 保持现有 provider（不改）
+    let resolved_provider: Option<String> =
+        provider.or_else(|| hermes_providers::find_provider_by_model(&model).map(String::from));
 
-    if !found {
+    // 一次性扫描并替换 model 区块中的 default / provider 字段。
+    let lines: Vec<&str> = config_raw.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 1);
+    let mut in_model = false;
+    let mut default_written = false;
+    let mut provider_written = false;
+    let mut default_indent: String = "  ".into();
+
+    for line in lines.iter() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("model:") {
+            in_model = true;
+            out.push(line.to_string());
+            continue;
+        }
+        if in_model {
+            let is_indented = line.starts_with("  ") || line.starts_with('\t');
+            if !is_indented && !trimmed.is_empty() && !trimmed.starts_with('#') {
+                // 离开 model 区块 —— 先补齐未写入的 provider 行
+                if let Some(pid) = resolved_provider.as_ref() {
+                    if !provider_written && !pid.is_empty() && pid != "custom" {
+                        out.push(format!("{default_indent}provider: {pid}"));
+                        provider_written = true;
+                    }
+                }
+                in_model = false;
+                out.push(line.to_string());
+                continue;
+            }
+
+            if trimmed.starts_with("default:") {
+                let indent_len = line.len() - line.trim_start().len();
+                default_indent = " ".repeat(indent_len);
+                out.push(format!("{default_indent}default: {model_str}"));
+                default_written = true;
+                continue;
+            }
+            if trimmed.starts_with("provider:") {
+                if let Some(pid) = resolved_provider.as_ref() {
+                    if !pid.is_empty() && pid != "custom" {
+                        let indent_len = line.len() - line.trim_start().len();
+                        let indent = " ".repeat(indent_len);
+                        out.push(format!("{indent}provider: {pid}"));
+                        provider_written = true;
+                        continue;
+                    }
+                    // custom → 删除 provider 行
+                    continue;
+                }
+                // 未提供新 provider，保留旧值
+                out.push(line.to_string());
+                provider_written = true;
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+
+    // 文件末尾还在 model 块里：补 provider 行
+    if in_model {
+        if let Some(pid) = resolved_provider.as_ref() {
+            if !provider_written && !pid.is_empty() && pid != "custom" {
+                out.push(format!("{default_indent}provider: {pid}"));
+            }
+        }
+    }
+
+    if !default_written {
         return Err("config.yaml 中未找到 model.default 字段".into());
+    }
+
+    let mut new_content = out.join("\n");
+    if !new_content.ends_with('\n') {
+        new_content.push('\n');
     }
 
     std::fs::write(&config_path, new_content).map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
