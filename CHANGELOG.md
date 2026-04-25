@@ -5,6 +5,29 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 新功能 (Features)
+
+- **心甜Claw 引擎入口** — 新增第三个引擎模式「心甜Claw」，提供产品介绍页、官网/下载入口、专属视觉样式与多语言文案
+- **Hermes 服务商注册表** — 新增 22 个 Hermes Provider 注册信息，支持 API Key、OAuth、外部进程与聚合服务商，安装向导和仪表盘可动态加载服务商与模型配置
+- **Hermes .env 高级编辑** — 新增非托管环境变量编辑页，可安全编辑自定义变量，并避免覆盖 ClawPanel 托管的 Provider 密钥
+- **Hermes 会话与用量分析增强** — 新增轻量会话摘要、按 Profile 浏览历史会话、Usage Analytics 后端统计与扩展主题页数据入口
+
+### 改进 (Improvements)
+
+- **Hermes 仪表盘本地化** — 将 Gateway、Provider、连接目标、快捷操作、CLI 表头、保存/探测提示等硬编码文案接入语言包
+- **Hermes 扩展与主题本地化** — 扩展页标题、说明、按钮、插件扫描与主题保存提示统一接入多语言文案
+- **Hermes 记忆编辑体验** — 记忆文件编辑改为大尺寸模态框，避免长内容被卡片区域限制
+- **日志下载反馈** — 桌面端日志下载保存到系统 `Downloads/ClawPanel` 并显示真实路径；Web 端继续浏览器下载并明确提示查看默认下载目录
+- **侧边栏导航补全** — 补齐 Hermes 会话浏览、扩展与主题等导航项图标与文案
+
+### 修复 (Fixes)
+
+- **Hermes Gateway 启动自修复** — 启动前自动检查并修复 `platforms.api_server.enabled`，避免升级或手动编辑配置后 Gateway 缺失 `/v1/runs` 能力
+- **Web/桌面下载行为分流** — `hermes_logs_download` 根据运行时区分桌面真实落盘与 Web Blob 下载，避免 Web 模式误保存到服务端目录
+- **普通记忆文件下载提示** — Blob 下载提示改为说明浏览器默认下载目录，减少“下载没落点”的误解
+
 ## [0.13.4] - 2026-04-20
 
 ### 改进 (Improvements)
