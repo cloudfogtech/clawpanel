@@ -41,6 +41,51 @@ ClawPanel 是支持多 AI Agent 框架的可视化管理面板，目前支持 [O
 
 > 🌐 **官网**: [claw.qt.cool](https://claw.qt.cool/)  |  📦 **下载**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
+## ✨ Hermes Agent 第二引擎：会话、记忆、人格与工具全景管理
+
+<p align="center">
+  <a href="docs/hermes-agent.md">
+    <img src="docs/h00.png" width="880" alt="Hermes Agent 控制台">
+  </a>
+</p>
+
+<p align="center">
+  <strong>把 Agent 从一次性聊天窗口，升级为可持续运营的智能体系统。</strong><br>
+  <a href="docs/hermes-agent.md"><strong>查看 Hermes Agent 图文指南 →</strong></a>
+</p>
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="docs/h00.png"><img src="docs/h00.png" alt="Hermes Agent 控制台"></a><br>
+      <strong>控制台总览</strong><br>
+      <sub>查看运行状态、入口能力和主要管理模块。</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="docs/h01.png"><img src="docs/h01.png" alt="Hermes Agent 长期记忆"></a><br>
+      <strong>长期记忆</strong><br>
+      <sub>Notes / User Profile / Soul 三份 Markdown 沉淀上下文。</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="docs/h02.png"><img src="docs/h02.png" alt="Hermes Agent 会话与消息流"></a><br>
+      <strong>会话与消息流</strong><br>
+      <sub>追踪对话过程、上下文质量和真实运行表现。</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="docs/h03.png"><img src="docs/h03.png" alt="Hermes Agent 工具与运行细节"></a><br>
+      <strong>工具与运行细节</strong><br>
+      <sub>定位工具调用、运行步骤和 Agent 执行链路。</sub>
+    </td>
+  </tr>
+</table>
+
+- **长期记忆可视化** — 在线编辑 Notes、User Profile、Soul，让事实、偏好与人格持续沉淀。
+- **会话可运营** — 统一查看对话、消息流、运行状态和工具调用细节。
+- **人格可维护** — 把 Agent 的表达风格、价值观和偏好固化为可编辑资产。
+- **渠道可扩展** — 面向 QQ、Telegram、Discord 等外部渠道集中管理连接能力。
+
 ### 🎁 晴辰云 AI 接口
 
 > 内部技术测试平台，面向部分用户开放体验。签到领额度，邀请得更多。
