@@ -1,0 +1,66 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Add upstream repo
+        run: |
+          git remote add upstream https://github.com/qingchencloud/clawpanel.git
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream main
+
+      - name: Check updates
+        id: check
+        run: |
+          LOCAL_HASH=$(git rev-parse HEAD)
+          UPSTREAM_HASH=$(git rev-parse upstream/main)
+          
+          if [ "$LOCAL_HASH" != "$UPSTREAM_HASH" ]; then
+            echo "has_update=true" >> $GITHUB_OUTPUT
+            echo "Local: $LOCAL_HASH"
+            echo "Upstream: $UPSTREAM_HASH"
+          else
+            echo "has_update=false" >> $GITHUB_OUTPUT
+            echo "Already up to date. Local: $LOCAL_HASH, Upstream: $UPSTREAM_HASH"
+          fi
+
+      - name: Sync main branch
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git reset --hard upstream/main
+          git push origin main --force
+
+      - name: Rebase release branch
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if git rev-parse release &>/dev/null; then
+            git checkout release
+            git rebase main
+            git push origin release --force
+            echo "rebase release branch main successfully"
+          else
+            echo "release branch is not found, skip rebase"
+          fi
