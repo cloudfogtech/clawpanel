@@ -48,7 +48,8 @@ RUN apk add --no-cache \
     git \
     curl \
     bash \
-    tzdata
+    tzdata \
+    supervisor
 
 # 设置时区
 ENV TZ=Asia/Shanghai
@@ -70,17 +71,23 @@ RUN npm install -g @qingchencloud/openclaw-zh
 # 创建数据目录
 RUN mkdir -p /app/data
 
-# 暴露端口
-EXPOSE 1420
+# 配置 OpenClaw 允许容器内不安全认证（解决 WebSocket 配对问题）
+RUN openclaw config set gateway.controlUi.allowInsecureAuth true && \
+    openclaw config set gateway.controlUi.dangerouslyDisableDeviceAuth true && \
+    openclaw config set gateway.mode local
 
-# 使用 root 用户运行（确保能管理 Gateway 等）
-# 如需安全性，可切换到 appuser，但需确保卷挂载权限正确
+# 创建 Supervisor 配置文件管理两个进程
+RUN mkdir -p /etc/supervisor.d
+COPY supervisord.conf /etc/supervisor.d/supervisord.conf
+
+# 暴露端口
+EXPOSE 1420 18789
 
 # 健康检查
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
     CMD curl -f http://localhost:1420/ || exit 1
 
 USER root
 
-# 启动命令
-CMD ["node", "scripts/serve.js"]
+# 使用 supervisord 启动 Gateway + Panel
+CMD ["supervisord", "-c", "/etc/supervisor.d/supervisord.conf", "-n"]
