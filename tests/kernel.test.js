@@ -9,8 +9,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { parseVersion, versionGte, buildSnapshot } from '../src/lib/kernel.js'
-import { FEATURE_CATALOG, KERNEL_FLOOR } from '../src/lib/feature-catalog.js'
+import { parseVersion, versionGte, buildSnapshot, recommendedIsNewer } from '../src/lib/kernel.js'
+import { FEATURE_CATALOG, KERNEL_FLOOR, KERNEL_TARGET } from '../src/lib/feature-catalog.js'
 
 // ============================================================================
 // parseVersion
@@ -160,14 +160,21 @@ test('buildSnapshot edge case: version slightly below 5.6 feature requirement', 
 })
 
 test('buildSnapshot.isLatest works against KERNEL_TARGET', () => {
-  const at_target = buildSnapshot('openclaw', '2026.5.19')
-  const at_chinese_target = buildSnapshot('openclaw', '2026.5.18-zh.1')
-  const above_target = buildSnapshot('openclaw', '2026.6.0')
-  const below_target = buildSnapshot('openclaw', '2026.5.18')
-  assert.equal(at_target.isLatest, true)
-  assert.equal(at_chinese_target.isLatest, true)
-  assert.equal(above_target.isLatest, true)
-  assert.equal(below_target.isLatest, false)
+  const atOfficial = buildSnapshot('openclaw', KERNEL_TARGET.openclaw.official)
+  const atChinese = buildSnapshot('openclaw', KERNEL_TARGET.openclaw.chinese)
+  const aboveTarget = buildSnapshot('openclaw', '2026.6.0')
+  const belowTarget = buildSnapshot('openclaw', '2026.5.18')
+  assert.equal(atOfficial.isLatest, true)
+  assert.equal(atChinese.isLatest, true)
+  assert.equal(aboveTarget.isLatest, true)
+  assert.equal(belowTarget.isLatest, false)
+})
+
+test('recommendedIsNewer matches suffix patch ordering', () => {
+  assert.equal(recommendedIsNewer('2026.5.18-zh.2', '2026.5.18-zh.1'), true)
+  assert.equal(recommendedIsNewer('2026.5.18-zh.1', '2026.5.18-zh.2'), false)
+  assert.equal(recommendedIsNewer('2026.5.18-zh.1', '2026.5.18-zh.1'), false)
+  assert.equal(recommendedIsNewer('2026.5.19', '2026.5.18-zh.9'), true)
 })
 
 // ============================================================================

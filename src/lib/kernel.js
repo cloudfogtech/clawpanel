@@ -60,6 +60,48 @@ export function versionGte(a, b) {
   return true
 }
 
+function baseVersionStr(v) {
+  const s = String(v || '')
+  const i = s.indexOf('-')
+  return i === -1 ? s : s.slice(0, i)
+}
+
+function hasVersionSuffix(v) {
+  return String(v || '').includes('-')
+}
+
+function allNumericParts(ver) {
+  return String(ver || '')
+    .split(/[^\d]+/)
+    .filter(Boolean)
+    .map(n => parseInt(n, 10))
+    .filter(n => !Number.isNaN(n))
+}
+
+function compareLex(a, b) {
+  if (!a?.length || !b?.length) return 0
+  const len = Math.max(a.length, b.length)
+  for (let i = 0; i < len; i++) {
+    const ai = a[i] || 0
+    const bi = b[i] || 0
+    if (ai < bi) return -1
+    if (ai > bi) return 1
+  }
+  return 0
+}
+
+export function recommendedIsNewer(recommended, current) {
+  const r = parseVersion(baseVersionStr(recommended))
+  const c = parseVersion(baseVersionStr(current))
+  if (!r || !c) return false
+  const baseCmp = compareLex(r, c)
+  if (baseCmp !== 0) return baseCmp > 0
+  if (hasVersionSuffix(recommended) && hasVersionSuffix(current)) {
+    return compareLex(allNumericParts(recommended), allNumericParts(current)) > 0
+  }
+  return false
+}
+
 /**
  * 检测版本是否属于汉化版
  */
@@ -100,7 +142,7 @@ export function buildSnapshot(engineId, version) {
     target,
     floor,
     aboveFloor: !!version && versionGte(version, floor),
-    isLatest: !!version && !!target && versionGte(version, target),
+    isLatest: !!version && !!target && !recommendedIsNewer(target, version),
     features,
     versionLabel: version
       ? `${versionBase}${variant === 'chinese' ? ' 汉化' : ''}`

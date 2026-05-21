@@ -13,7 +13,7 @@ import { attachCliConflictBanner } from '../components/cli-conflict-banner.js'
 import { icon } from '../lib/icons.js'
 
 let _unsubGw = null
-let _loadInFlight = false
+let _dashboardLoadChain = Promise.resolve()
 let _lastGwChangeLoad = 0
 let _detachCliConflict = null
 
@@ -193,16 +193,20 @@ function normalizeDefaultModelConfig(config) {
   for (const fallback of modelConfig.fallbacks) {
     nextMap[fallback] = currentMap[fallback] && typeof currentMap[fallback] === 'object' && !Array.isArray(currentMap[fallback]) ? currentMap[fallback] : {}
   }
+  for (const [key, value] of Object.entries(currentMap)) {
+    if (validModels.has(key) && !nextMap[key]) {
+      nextMap[key] = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+    }
+  }
   config.agents.defaults.models = nextMap
   return modelConfig.primary
 }
 
 async function loadDashboardData(page, fullRefresh = false) {
   // 并发保护：如果上一次加载仍在进行，跳过本次（fullRefresh 除外）
-  if (_loadInFlight && !fullRefresh) return
   const loadSeq = ++_dashboardLoadSeq
-  _loadInFlight = true
-  try { await _loadDashboardDataInner(page, fullRefresh, loadSeq) } finally { if (loadSeq === _dashboardLoadSeq) _loadInFlight = false }
+  _dashboardLoadChain = _dashboardLoadChain.catch(() => {}).then(() => _loadDashboardDataInner(page, fullRefresh, loadSeq))
+  return _dashboardLoadChain
 }
 
 async function _loadDashboardDataInner(page, fullRefresh, loadSeq) {
