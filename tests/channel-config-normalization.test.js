@@ -775,6 +775,151 @@ test('Google Chat 诊断要求 service account 文件或内联 JSON 其中一项
   assert.equal(ready.checks.find(item => item.id === 'credentials')?.ok, true)
 })
 
+test('Microsoft Teams 渠道保存会写入新版认证和运行字段', () => {
+  const cfg = { channels: {} }
+
+  mergeOpenClawMessagingPlatformConfig(cfg, {
+    platform: 'msteams',
+    form: {
+      appId: 'teams-app-id',
+      appPassword: 'teams-secret',
+      tenantId: 'tenant-1',
+      authType: 'federated',
+      certificatePath: '/run/secrets/teams.pem',
+      certificateThumbprint: 'thumbprint-1',
+      useManagedIdentity: 'true',
+      managedIdentityClientId: 'identity-client-id',
+      webhookPort: '3978',
+      webhookPath: '/api/teams/messages',
+      dmPolicy: 'allowlist',
+      allowFrom: 'user-a, user-b',
+      groupPolicy: 'mentioned',
+      groupAllowFrom: 'team-1, team-2',
+      textChunkLimit: '1800',
+      historyLimit: '80',
+      dmHistoryLimit: '20',
+      mediaMaxMb: '100',
+      blockStreaming: 'true',
+      typingIndicator: 'true',
+      replyStyle: 'thread',
+      sharePointSiteId: 'contoso.sharepoint.com,guid1,guid2',
+      responsePrefix: '[Teams]',
+      welcomeCard: 'true',
+      promptStarters: 'help, status',
+      delegatedAuthEnabled: 'true',
+      delegatedAuthScopes: 'User.Read, offline_access',
+      ssoEnabled: 'true',
+      ssoConnectionName: 'teams-oauth',
+    },
+  })
+
+  const entry = cfg.channels.msteams
+  assert.equal(entry.appId, 'teams-app-id')
+  assert.equal(entry.appPassword, 'teams-secret')
+  assert.equal(entry.tenantId, 'tenant-1')
+  assert.equal(entry.authType, 'federated')
+  assert.equal(entry.certificatePath, '/run/secrets/teams.pem')
+  assert.equal(entry.certificateThumbprint, 'thumbprint-1')
+  assert.equal(entry.useManagedIdentity, true)
+  assert.equal(entry.managedIdentityClientId, 'identity-client-id')
+  assert.deepEqual(entry.webhook, { port: 3978, path: '/api/teams/messages' })
+  assert.equal(entry.dmPolicy, 'allowlist')
+  assert.deepEqual(entry.allowFrom, ['user-a', 'user-b'])
+  assert.equal(entry.groupPolicy, 'open')
+  assert.equal(entry.requireMention, true)
+  assert.deepEqual(entry.groupAllowFrom, ['team-1', 'team-2'])
+  assert.equal(entry.textChunkLimit, 1800)
+  assert.equal(entry.historyLimit, 80)
+  assert.equal(entry.dmHistoryLimit, 20)
+  assert.equal(entry.mediaMaxMb, 100)
+  assert.equal(entry.blockStreaming, true)
+  assert.equal(entry.typingIndicator, true)
+  assert.equal(entry.replyStyle, 'thread')
+  assert.equal(entry.sharePointSiteId, 'contoso.sharepoint.com,guid1,guid2')
+  assert.equal(entry.responsePrefix, '[Teams]')
+  assert.equal(entry.welcomeCard, true)
+  assert.deepEqual(entry.promptStarters, ['help', 'status'])
+  assert.deepEqual(entry.delegatedAuth, { enabled: true, scopes: ['User.Read', 'offline_access'] })
+  assert.deepEqual(entry.sso, { enabled: true, connectionName: 'teams-oauth' })
+  assert.equal(cfg.plugins.entries.msteams.enabled, true)
+})
+
+test('Microsoft Teams 渠道读取会回显嵌套 webhook 和运行字段', () => {
+  const values = buildMessagingPlatformFormValues('msteams', {
+    appId: 'teams-app-id',
+    appPassword: 'teams-secret',
+    authType: 'federated',
+    webhook: { port: 3978, path: '/api/teams/messages' },
+    dmPolicy: 'allowlist',
+    allowFrom: ['user-a', 'user-b'],
+    groupPolicy: 'open',
+    requireMention: true,
+    groupAllowFrom: ['team-1', 'team-2'],
+    textChunkLimit: 1800,
+    mediaMaxMb: 100,
+    blockStreaming: true,
+    typingIndicator: true,
+    welcomeCard: true,
+    promptStarters: ['help', 'status'],
+    delegatedAuth: { enabled: true, scopes: ['User.Read', 'offline_access'] },
+    sso: { enabled: true, connectionName: 'teams-oauth' },
+  })
+
+  assert.equal(values.appId, 'teams-app-id')
+  assert.equal(values.appPassword, 'teams-secret')
+  assert.equal(values.authType, 'federated')
+  assert.equal(values.webhookPort, '3978')
+  assert.equal(values.webhookPath, '/api/teams/messages')
+  assert.equal(values.groupPolicy, 'mentioned')
+  assert.equal(values.groupAllowFrom, 'team-1, team-2')
+  assert.equal(values.textChunkLimit, '1800')
+  assert.equal(values.mediaMaxMb, '100')
+  assert.equal(values.blockStreaming, 'true')
+  assert.equal(values.typingIndicator, 'true')
+  assert.equal(values.welcomeCard, 'true')
+  assert.equal(values.promptStarters, 'help, status')
+  assert.equal(values.delegatedAuthEnabled, 'true')
+  assert.equal(values.delegatedAuthScopes, 'User.Read, offline_access')
+  assert.equal(values.ssoEnabled, 'true')
+  assert.equal(values.ssoConnectionName, 'teams-oauth')
+})
+
+test('Microsoft Teams 诊断会按认证模式检查动态必填凭证', () => {
+  const missingSecret = buildOpenClawChannelDiagnosis({
+    platform: 'msteams',
+    configExists: true,
+    channelEnabled: true,
+    form: {
+      appId: 'teams-app-id',
+      authType: 'secret',
+    },
+  })
+  const federatedCert = buildOpenClawChannelDiagnosis({
+    platform: 'msteams',
+    configExists: true,
+    channelEnabled: true,
+    form: {
+      appId: 'teams-app-id',
+      authType: 'federated',
+      certificatePath: '/run/secrets/teams.pem',
+    },
+  })
+  const managedIdentity = buildOpenClawChannelDiagnosis({
+    platform: 'msteams',
+    configExists: true,
+    channelEnabled: true,
+    form: {
+      appId: 'teams-app-id',
+      useManagedIdentity: 'true',
+    },
+  })
+
+  assert.equal(missingSecret.checks.find(item => item.id === 'credentials')?.ok, false)
+  assert.match(missingSecret.checks.find(item => item.id === 'credentials')?.detail || '', /App Password/)
+  assert.equal(federatedCert.checks.find(item => item.id === 'credentials')?.ok, true)
+  assert.equal(managedIdentity.checks.find(item => item.id === 'credentials')?.ok, true)
+})
+
 test('Discord 渠道保存会保留运行时需要的 applicationId', () => {
   const cfg = { channels: {} }
 

@@ -430,13 +430,34 @@ const PLATFORM_REGISTRY = {
     guideFooter: t('channels.msteamsGuideFooter'),
     fields: [
       { key: 'appId', label: 'App ID', placeholder: 'Azure AD Application ID', required: true },
-      { key: 'appPassword', label: 'App Password', placeholder: 'Azure AD Client Secret', secret: true, required: true },
+      { key: 'appPassword', label: 'App Password', placeholder: 'Azure AD Client Secret', secret: true, required: (form) => form.authType !== 'federated' && form.useManagedIdentity !== 'true', hint: t('channels.msteamsAppPasswordHint') },
       { key: 'tenantId', label: 'Tenant ID', placeholder: t('channels.msteamsTenantIdPh'), required: false },
-      { key: 'botEndpoint', label: 'Bot Endpoint', placeholder: 'https://example.com/api/teams/messages', required: false },
-      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/msteams/messages', required: false },
+      { key: 'authType', label: 'Auth Type', type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'secret', label: 'Client Secret' }, { value: 'federated', label: 'Federated / Certificate' }], required: false },
+      { key: 'certificatePath', label: 'Certificate Path', placeholder: t('channels.optionalEg', { example: '/run/secrets/teams.pem' }), required: false },
+      { key: 'certificateThumbprint', label: 'Certificate Thumbprint', placeholder: t('channels.optionalEg', { example: 'ABCD1234' }), required: false },
+      { key: 'useManagedIdentity', label: 'Managed Identity', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'managedIdentityClientId', label: 'Managed Identity Client ID', placeholder: t('channels.optionalEg', { example: '00000000-0000-0000-0000-000000000000' }), required: false },
+      { key: 'webhookPort', label: 'Webhook Port', placeholder: '3978', required: false },
+      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/api/teams/messages', required: false },
       { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
       { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllTeams'), { mention: true }), required: false },
       { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.msteamsAllowFromPh'), required: false },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.msteamsGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '1800', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '100', required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'typingIndicator', label: 'Typing Indicator', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'replyStyle', label: 'Reply Style', type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'thread', label: 'Thread' }, { value: 'top-level', label: 'Top-level' }], required: false },
+      { key: 'sharePointSiteId', label: 'SharePoint Site ID', placeholder: t('channels.optionalEg', { example: 'contoso.sharepoint.com,guid1,guid2' }), required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[Teams]' }), required: false },
+      { key: 'welcomeCard', label: 'Welcome Card', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'promptStarters', label: 'Prompt Starters', placeholder: t('channels.msteamsPromptStartersPh'), required: false },
+      { key: 'delegatedAuthEnabled', label: 'Delegated Auth', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'delegatedAuthScopes', label: 'Delegated Auth Scopes', placeholder: t('channels.msteamsDelegatedScopesPh'), required: false },
+      { key: 'ssoEnabled', label: 'SSO', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'ssoConnectionName', label: 'SSO Connection Name', placeholder: t('channels.optionalEg', { example: 'teams-oauth' }), required: false },
     ],
     configKey: 'msteams',
     pluginRequired: '@openclaw/msteams@latest',
@@ -2204,6 +2225,7 @@ async function openConfigDialog(pid, page, state, accountId) {
   `
 
   const isFieldRequired = (field, form) => {
+    if (typeof field.required === 'function') return field.required(form || {})
     if (field.required) return true
     if (!field.requiredWhen) return false
     return Object.entries(field.requiredWhen).every(([k, expected]) => (form[k] || '') === expected)
@@ -2221,6 +2243,7 @@ async function openConfigDialog(pid, page, state, accountId) {
   const fieldsHtml = reg.fields.map((f, i) => {
     const val = existing[f.key] || ''
     const secretRefLocked = existing.__secretRefs?.[f.key]
+    const fieldRequired = isFieldRequired(f, existing)
     const fieldHint = [
       f.hint,
       secretRefLocked ? t('channels.secretRefPreserveHint') : '',
@@ -2228,7 +2251,7 @@ async function openConfigDialog(pid, page, state, accountId) {
     if (f.type === 'select' && f.options) {
       return `
         <div class="form-group">
-          <label class="form-label">${labelWithHelp(f.label)}${f.required ? ' *' : ''}</label>
+          <label class="form-label">${labelWithHelp(f.label)}<span class="required-marker" data-required-for="${escapeAttr(f.key)}">${fieldRequired ? ' *' : ''}</span></label>
           <select class="form-input" name="${f.key}" data-name="${f.key}">
             ${f.options.map(o => `<option value="${o.value}" ${val === o.value ? 'selected' : ''}>${o.label}</option>`).join('')}
           </select>
@@ -2239,7 +2262,7 @@ async function openConfigDialog(pid, page, state, accountId) {
     if (f.multiline) {
       return `
         <div class="form-group">
-          <label class="form-label">${labelWithHelp(f.label)}${f.required ? ' *' : ''}</label>
+          <label class="form-label">${labelWithHelp(f.label)}<span class="required-marker" data-required-for="${escapeAttr(f.key)}">${fieldRequired ? ' *' : ''}</span></label>
           <textarea class="form-input" name="${f.key}" rows="5" placeholder="${escapeAttr(f.placeholder || '')}" ${i === 0 ? 'autofocus' : ''} style="width:100%;min-height:112px;resize:vertical;font-family:var(--font-mono);line-height:1.5">${escapeAttr(val)}</textarea>
           ${fieldHint ? `<div class="form-hint">${fieldHint}</div>` : ''}
         </div>
@@ -2247,7 +2270,7 @@ async function openConfigDialog(pid, page, state, accountId) {
     }
     return `
       <div class="form-group">
-        <label class="form-label">${labelWithHelp(f.label)}${f.required ? ' *' : ''}</label>
+        <label class="form-label">${labelWithHelp(f.label)}<span class="required-marker" data-required-for="${escapeAttr(f.key)}">${fieldRequired ? ' *' : ''}</span></label>
         <div style="display:flex;gap:8px">
           <input class="form-input" name="${f.key}" type="${f.secret ? 'password' : 'text'}"
                  value="${escapeAttr(val)}" placeholder="${escapeAttr(f.placeholder || '')}"
@@ -2378,6 +2401,19 @@ async function openConfigDialog(pid, page, state, accountId) {
     })
     return obj
   }
+
+  const updateRequiredMarkers = () => {
+    const form = collectForm()
+    reg.fields.forEach(f => {
+      const marker = modal.querySelector(`.required-marker[data-required-for="${f.key}"]`)
+      if (marker) marker.textContent = isFieldRequired(f, form) ? ' *' : ''
+    })
+  }
+  modal.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
+    el.addEventListener('input', updateRequiredMarkers)
+    el.addEventListener('change', updateRequiredMarkers)
+  })
+  updateRequiredMarkers()
 
   // 校验按钮
   const btnVerify = modal.querySelector('#btn-verify')

@@ -179,6 +179,41 @@ fn has_configured_messaging_value(value: Option<&Value>) -> bool {
     }
 }
 
+fn is_enabled_form_flag(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(v)) => *v,
+        Some(Value::Number(v)) => v.as_i64().map(|n| n != 0).unwrap_or(false),
+        Some(Value::String(raw)) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on" | "enabled"
+        ),
+        _ => false,
+    }
+}
+
+fn msteams_credential_missing_labels(form: &Map<String, Value>) -> Vec<&'static str> {
+    if !has_configured_messaging_value(form.get("appId")) {
+        return vec!["App ID"];
+    }
+    if has_configured_messaging_value(form.get("appPassword")) {
+        return vec![];
+    }
+    if is_enabled_form_flag(form.get("useManagedIdentity")) {
+        return vec![];
+    }
+
+    let auth_type = form_string(form, "authType").to_ascii_lowercase();
+    let has_federated_credential = has_configured_messaging_value(form.get("certificatePath"))
+        || has_configured_messaging_value(form.get("certificateThumbprint"));
+    if auth_type == "federated" && has_federated_credential {
+        return vec![];
+    }
+    if auth_type == "federated" {
+        return vec!["Certificate Path / Certificate Thumbprint / Managed Identity / App Password"];
+    }
+    vec!["App Password"]
+}
+
 fn channel_root_has_messaging_credential(root: &Map<String, Value>) -> bool {
     [
         "accessToken",
@@ -223,7 +258,6 @@ fn required_channel_credential_fields(
         "discord" => vec![("token", "Bot Token")],
         "feishu" => vec![("appId", "App ID"), ("appSecret", "App Secret")],
         "dingtalk-connector" => vec![("clientId", "Client ID"), ("clientSecret", "Client Secret")],
-        "msteams" => vec![("appId", "App ID"), ("appPassword", "App Password")],
         "mattermost" => vec![("botToken", "Bot Token"), ("baseUrl", "Base URL")],
         "synology-chat" => vec![("token", "Token"), ("incomingUrl", "Incoming URL")],
         "signal" => vec![("account", "Signal 账号")],
@@ -249,6 +283,16 @@ fn required_channel_credential_fields(
                 ]
             }
         }
+        "msteams" => msteams_credential_missing_labels(form)
+            .into_iter()
+            .map(|label| {
+                if label == "App ID" {
+                    ("appId", "App ID")
+                } else {
+                    ("__msteamsAuth", label)
+                }
+            })
+            .collect(),
         _ => vec![],
     }
 }
@@ -292,6 +336,9 @@ fn channel_any_credential_groups(
 fn channel_diagnosis_credentials_ready(platform: &str, form: &Map<String, Value>) -> bool {
     if platform_storage_key(platform) == "zalouser" {
         return true;
+    }
+    if platform_storage_key(platform) == "msteams" {
+        return msteams_credential_missing_labels(form).is_empty();
     }
     let required_fields = required_channel_credential_fields(platform, form);
     if !required_fields.is_empty() {
@@ -393,11 +440,15 @@ fn build_openclaw_channel_diagnosis(
     let required_fields = required_channel_credential_fields(storage_key, form);
     let any_fields = channel_any_credential_fields(storage_key);
     let any_groups = channel_any_credential_groups(storage_key);
-    let missing: Vec<&str> = required_fields
-        .iter()
-        .filter(|(key, _)| !has_configured_messaging_value(form.get(*key)))
-        .map(|(_, label)| *label)
-        .collect();
+    let missing: Vec<&str> = if storage_key == "msteams" {
+        msteams_credential_missing_labels(form)
+    } else {
+        required_fields
+            .iter()
+            .filter(|(key, _)| !has_configured_messaging_value(form.get(*key)))
+            .map(|(_, label)| *label)
+            .collect()
+    };
     let missing_groups: Vec<&str> = any_groups
         .iter()
         .filter(|(_, fields)| {
@@ -816,6 +867,15 @@ fn normalize_messaging_platform_form(
     normalize_numeric_form_value(&mut normalized, "textChunkLimit");
     normalize_numeric_form_value(&mut normalized, "rateLimitPerMinute");
     normalize_numeric_form_value(&mut normalized, "httpPort");
+    normalize_numeric_form_value(&mut normalized, "webhookPort");
+    normalize_numeric_form_value(&mut normalized, "feedbackReflectionCooldownMs");
+
+    for key in ["promptStarters", "delegatedAuthScopes"] {
+        if normalized.contains_key(key) {
+            let items = json_array_from_csv_value(normalized.get(key));
+            normalized.insert(key.into(), Value::Array(items));
+        }
+    }
 
     for key in [
         "dangerouslyAllowNameMatching",
@@ -824,6 +884,14 @@ fn normalize_messaging_platform_form(
         "allowInsecureSsl",
         "allowBots",
         "blockStreaming",
+        "useManagedIdentity",
+        "typingIndicator",
+        "welcomeCard",
+        "groupWelcomeCard",
+        "feedbackEnabled",
+        "feedbackReflection",
+        "delegatedAuthEnabled",
+        "ssoEnabled",
     ] {
         if normalized.contains_key(key) {
             let value = match normalized.get(key) {
@@ -1451,11 +1519,75 @@ pub async fn read_platform_config(
         "msteams" => {
             insert_secret_aware_form_value(&mut form, &saved, "appId");
             insert_secret_aware_form_value(&mut form, &saved, "appPassword");
-            insert_string_if_present(&mut form, &saved, "tenantId");
-            insert_string_if_present(&mut form, &saved, "botEndpoint");
-            insert_string_if_present(&mut form, &saved, "webhookPath");
+            for key in [
+                "tenantId",
+                "authType",
+                "certificatePath",
+                "certificateThumbprint",
+                "managedIdentityClientId",
+                "botEndpoint",
+                "replyStyle",
+                "sharePointSiteId",
+                "responsePrefix",
+            ] {
+                insert_string_if_present(&mut form, &saved, key);
+            }
+            if let Some(webhook) = saved.get("webhook") {
+                insert_string_if_present(&mut form, webhook, "path");
+                if let Some(v) = form.remove("path") {
+                    form.insert("webhookPath".into(), v);
+                }
+                insert_number_as_string(&mut form, webhook, "port");
+                if let Some(v) = form.remove("port") {
+                    form.insert("webhookPort".into(), v);
+                }
+            } else {
+                insert_string_if_present(&mut form, &saved, "webhookPath");
+            }
             insert_access_policy_form_values(&mut form, &saved, false, true);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
             insert_bool_as_string(&mut form, &saved, "requireMention");
+            for key in [
+                "useManagedIdentity",
+                "blockStreaming",
+                "typingIndicator",
+                "welcomeCard",
+                "groupWelcomeCard",
+                "feedbackEnabled",
+                "feedbackReflection",
+            ] {
+                insert_bool_as_string(&mut form, &saved, key);
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+                "feedbackReflectionCooldownMs",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
+            insert_array_as_csv(&mut form, &saved, "promptStarters");
+            if let Some(delegated_auth) = saved.get("delegatedAuth") {
+                insert_bool_as_string(&mut form, delegated_auth, "enabled");
+                if let Some(v) = form.remove("enabled") {
+                    form.insert("delegatedAuthEnabled".into(), v);
+                }
+                insert_array_as_csv(&mut form, delegated_auth, "scopes");
+                if let Some(v) = form.remove("scopes") {
+                    form.insert("delegatedAuthScopes".into(), v);
+                }
+            }
+            if let Some(sso) = saved.get("sso") {
+                insert_bool_as_string(&mut form, sso, "enabled");
+                if let Some(v) = form.remove("enabled") {
+                    form.insert("ssoEnabled".into(), v);
+                }
+                insert_string_if_present(&mut form, sso, "connectionName");
+                if let Some(v) = form.remove("connectionName") {
+                    form.insert("ssoConnectionName".into(), v);
+                }
+            }
         }
         "line" => {
             for key in [
@@ -2156,33 +2288,99 @@ pub async fn save_messaging_platform(
         "msteams" => {
             let app_id = form_string(form_obj, "appId");
             let app_password = form_string(form_obj, "appPassword");
-            if app_id.is_empty() || app_password.is_empty() {
-                return Err("App ID 和 App Password 不能为空".into());
+            let missing_credentials = msteams_credential_missing_labels(form_obj);
+            if !missing_credentials.is_empty() {
+                return Err(format!("缺少 {}", missing_credentials.join(" / ")));
             }
 
             let mut entry = Map::new();
             entry.insert("enabled".into(), Value::Bool(true));
             put_string(&mut entry, "appId", app_id);
             put_string(&mut entry, "appPassword", app_password);
-            put_string(&mut entry, "tenantId", form_string(form_obj, "tenantId"));
-            put_string(
-                &mut entry,
-                "botEndpoint",
-                form_string(form_obj, "botEndpoint"),
-            );
-            put_string(
-                &mut entry,
-                "webhookPath",
-                form_string(form_obj, "webhookPath"),
-            );
+            for key in [
+                "tenantId",
+                "authType",
+                "certificatePath",
+                "certificateThumbprint",
+                "managedIdentityClientId",
+                "replyStyle",
+                "sharePointSiteId",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            let mut webhook = current_saved
+                .get("webhook")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_number_from_form(&mut webhook, "port", &form_string(form_obj, "webhookPort"));
+            put_string(&mut webhook, "path", form_string(form_obj, "webhookPath"));
+            if !webhook.is_empty() {
+                entry.insert("webhook".into(), Value::Object(webhook));
+            }
             put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
             put_string(
                 &mut entry,
                 "groupPolicy",
                 form_string(form_obj, "groupPolicy"),
             );
-            put_bool_value_if_present(&mut entry, "requireMention", form_obj.get("requireMention"));
             put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            for key in [
+                "useManagedIdentity",
+                "requireMention",
+                "blockStreaming",
+                "typingIndicator",
+                "welcomeCard",
+                "groupWelcomeCard",
+                "feedbackEnabled",
+                "feedbackReflection",
+            ] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+                "feedbackReflectionCooldownMs",
+            ] {
+                put_number_from_form(&mut entry, key, &form_string(form_obj, key));
+            }
+            put_array_from_form_value(&mut entry, "promptStarters", form_obj.get("promptStarters"));
+            let mut delegated_auth = current_saved
+                .get("delegatedAuth")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_bool_value_if_present(
+                &mut delegated_auth,
+                "enabled",
+                form_obj.get("delegatedAuthEnabled"),
+            );
+            put_array_from_form_value(
+                &mut delegated_auth,
+                "scopes",
+                form_obj.get("delegatedAuthScopes"),
+            );
+            if !delegated_auth.is_empty() {
+                entry.insert("delegatedAuth".into(), Value::Object(delegated_auth));
+            }
+            let mut sso = current_saved
+                .get("sso")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_bool_value_if_present(&mut sso, "enabled", form_obj.get("ssoEnabled"));
+            put_string(
+                &mut sso,
+                "connectionName",
+                form_string(form_obj, "ssoConnectionName"),
+            );
+            if !sso.is_empty() {
+                entry.insert("sso".into(), Value::Object(sso));
+            }
             preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
             merge_channel_entry_for_account(
                 channels_map,
@@ -4000,8 +4198,18 @@ async fn verify_msteams(
     if app_id.is_empty() {
         return Ok(json!({ "valid": false, "errors": ["App ID 不能为空"] }));
     }
+    let missing_credentials = msteams_credential_missing_labels(form);
+    if !missing_credentials.is_empty() {
+        return Ok(
+            json!({ "valid": false, "errors": [format!("缺少 {}", missing_credentials.join(" / "))] }),
+        );
+    }
     if app_password.is_empty() {
-        return Ok(json!({ "valid": false, "errors": ["App Password 不能为空"] }));
+        return Ok(json!({
+            "valid": true,
+            "warnings": ["当前 Teams 认证模式不使用 Client Secret；面板已完成结构校验，实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。"],
+            "details": [format!("App ID: {}", app_id)]
+        }));
     }
 
     let token_url = format!(

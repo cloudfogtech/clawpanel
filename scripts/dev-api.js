@@ -2472,7 +2472,11 @@ export function normalizeMessagingPlatformForm(platform, form = {}) {
     normalized.allowedUserIds = csvToStringArray(normalized.allowedUserIds)
   }
 
-  for (const key of ['mediaMaxMb', 'historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'rateLimitPerMinute', 'httpPort']) {
+  for (const key of ['promptStarters', 'delegatedAuthScopes']) {
+    if (Object.hasOwn(normalized, key)) normalized[key] = csvToStringArray(normalized[key])
+  }
+
+  for (const key of ['mediaMaxMb', 'historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'rateLimitPerMinute', 'httpPort', 'webhookPort', 'feedbackReflectionCooldownMs']) {
     if (!Object.hasOwn(normalized, key)) continue
     const value = String(normalized[key] || '').trim()
     if (!value) {
@@ -2485,7 +2489,7 @@ export function normalizeMessagingPlatformForm(platform, form = {}) {
     }
   }
 
-  for (const key of ['dangerouslyAllowNameMatching', 'dangerouslyAllowPrivateNetwork', 'dangerouslyAllowInheritedWebhookPath', 'allowInsecureSsl', 'allowBots', 'blockStreaming']) {
+  for (const key of ['dangerouslyAllowNameMatching', 'dangerouslyAllowPrivateNetwork', 'dangerouslyAllowInheritedWebhookPath', 'allowInsecureSsl', 'allowBots', 'blockStreaming', 'useManagedIdentity', 'typingIndicator', 'welcomeCard', 'groupWelcomeCard', 'feedbackEnabled', 'feedbackReflection', 'delegatedAuthEnabled', 'ssoEnabled']) {
     if (Object.hasOwn(normalized, key)) {
       const value = String(normalized[key] || '').trim()
       if (!value) {
@@ -2612,6 +2616,33 @@ function hasConfiguredMessagingValue(value) {
   return value !== undefined && value !== null
 }
 
+function isEnabledFormFlag(value) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    return ['true', '1', 'yes', 'on', 'enabled'].includes(value.trim().toLowerCase())
+  }
+  return false
+}
+
+function msteamsCredentialMissingLabels(form = {}) {
+  const missing = []
+  if (!hasConfiguredMessagingValue(form?.appId)) missing.push('App ID')
+  if (missing.length) return missing
+
+  if (hasConfiguredMessagingValue(form?.appPassword)) return []
+  if (isEnabledFormFlag(form?.useManagedIdentity)) return []
+
+  const authType = String(form?.authType || '').trim().toLowerCase()
+  const hasFederatedCredential = hasConfiguredMessagingValue(form?.certificatePath) || hasConfiguredMessagingValue(form?.certificateThumbprint)
+  if (authType === 'federated' && hasFederatedCredential) return []
+
+  if (authType === 'federated') {
+    return ['Certificate Path / Certificate Thumbprint / Managed Identity / App Password']
+  }
+  return ['App Password']
+}
+
 function channelRootHasMessagingCredential(root) {
   if (!root || typeof root !== 'object' || Array.isArray(root)) return false
   return MESSAGING_CREDENTIAL_FIELDS.some(key => hasConfiguredMessagingValue(root[key]))
@@ -2649,7 +2680,6 @@ const CHANNEL_DIAG_REQUIRED_FIELDS = {
   feishu: [['appId', 'App ID'], ['appSecret', 'App Secret']],
   dingtalk: [['clientId', 'Client ID'], ['clientSecret', 'Client Secret']],
   'dingtalk-connector': [['clientId', 'Client ID'], ['clientSecret', 'Client Secret']],
-  msteams: [['appId', 'App ID'], ['appPassword', 'App Password']],
   mattermost: [['botToken', 'Bot Token'], ['baseUrl', 'Base URL']],
   'synology-chat': [['token', 'Token'], ['incomingUrl', 'Incoming URL']],
   signal: [['account', 'Signal 账号']],
@@ -2668,11 +2698,15 @@ function requiredChannelCredentialFields(platform, form = {}) {
     if (form.accessToken) return [['accessToken', 'Access Token']]
     return [['homeserver', 'Homeserver'], ['userId', 'User ID'], ['password', 'Password']]
   }
+  if (storageKey === 'msteams') {
+    return msteamsCredentialMissingLabels(form).map(label => [label === 'App ID' ? 'appId' : '__msteamsAuth', label])
+  }
   return CHANNEL_DIAG_REQUIRED_FIELDS[storageKey] || []
 }
 
 function channelDiagnosisCredentialsReady(platform, form = {}) {
   if (platformStorageKey(platform) === 'zalouser') return true
+  if (platformStorageKey(platform) === 'msteams') return msteamsCredentialMissingLabels(form).length === 0
   const requiredFields = requiredChannelCredentialFields(platform, form)
   if (requiredFields.length) {
     return requiredFields.every(([key]) => hasConfiguredMessagingValue(form?.[key]))
@@ -2726,9 +2760,11 @@ export function buildOpenClawChannelDiagnosis({
   const requiredFields = requiredChannelCredentialFields(storageKey, form)
   const anyFields = channelAnyCredentialFields(storageKey)
   const anyGroups = channelAnyCredentialGroups(storageKey)
-  const missing = requiredFields
-    .filter(([key]) => !hasConfiguredMessagingValue(form?.[key]))
-    .map(([, label]) => label)
+  const missing = storageKey === 'msteams'
+    ? msteamsCredentialMissingLabels(form)
+    : requiredFields
+        .filter(([key]) => !hasConfiguredMessagingValue(form?.[key]))
+        .map(([, label]) => label)
   const missingGroups = anyGroups
     .filter(group => !group.fields.some(([key]) => hasConfiguredMessagingValue(form?.[key])))
     .map(group => group.label)
@@ -2907,11 +2943,45 @@ export function buildMessagingPlatformFormValues(platform, saved = {}, options =
   }
 
   if (storageKey === 'msteams') {
-    for (const key of ['appId', 'appPassword', 'tenantId', 'botEndpoint', 'webhookPath']) {
+    for (const key of ['appId', 'appPassword', 'tenantId', 'authType', 'certificatePath', 'certificateThumbprint', 'managedIdentityClientId', 'botEndpoint', 'replyStyle', 'sharePointSiteId', 'responsePrefix', 'ssoConnectionName']) {
       putSecretAwareFormValue(form, saved, key)
     }
-    putAccessPolicyFormValues(form, saved)
+    putStringFormValue(form, saved?.webhook, 'path')
+    if (form.path) {
+      form.webhookPath = form.path
+      delete form.path
+    }
+    if (typeof saved?.webhook?.port === 'number') form.webhookPort = String(saved.webhook.port)
+    putAccessPolicyFormValues(form, saved, { mentionCompat: true })
+    putCsvFormValue(form, saved, 'groupAllowFrom')
     putBoolFormValue(form, saved, 'requireMention')
+    for (const key of ['useManagedIdentity', 'blockStreaming', 'typingIndicator', 'welcomeCard', 'groupWelcomeCard', 'feedbackEnabled', 'feedbackReflection']) {
+      putBoolFormValue(form, saved, key)
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb', 'feedbackReflectionCooldownMs']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    putCsvFormValue(form, saved, 'promptStarters')
+    putBoolFormValue(form, saved?.delegatedAuth, 'enabled')
+    if (form.enabled) {
+      form.delegatedAuthEnabled = form.enabled
+      delete form.enabled
+    }
+    putCsvFormValue(form, saved?.delegatedAuth, 'scopes')
+    if (form.scopes) {
+      form.delegatedAuthScopes = form.scopes
+      delete form.scopes
+    }
+    putBoolFormValue(form, saved?.sso, 'enabled')
+    if (form.enabled) {
+      form.ssoEnabled = form.enabled
+      delete form.enabled
+    }
+    putStringFormValue(form, saved?.sso, 'connectionName')
+    if (form.connectionName) {
+      form.ssoConnectionName = form.connectionName
+      delete form.connectionName
+    }
     return form
   }
 
@@ -3512,6 +3582,33 @@ function buildOpenClawMessagingPlatformEntry(platform, form, currentSaved = {}) 
     for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb']) {
       if (typeof form[key] === 'number') entry[key] = form[key]
     }
+  } else if (storageKey === 'msteams') {
+    for (const key of ['appId', 'appPassword', 'tenantId', 'authType', 'certificatePath', 'certificateThumbprint', 'managedIdentityClientId', 'replyStyle', 'sharePointSiteId', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    const webhook = { ...(currentSaved?.webhook && typeof currentSaved.webhook === 'object' ? currentSaved.webhook : {}) }
+    if (typeof form.webhookPort === 'number') webhook.port = form.webhookPort
+    if (form.webhookPath) webhook.path = form.webhookPath
+    if (Object.keys(webhook).length) entry.webhook = webhook
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    for (const key of ['useManagedIdentity', 'requireMention', 'blockStreaming', 'typingIndicator', 'welcomeCard', 'groupWelcomeCard', 'feedbackEnabled', 'feedbackReflection']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb', 'feedbackReflectionCooldownMs']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+    if (Array.isArray(form.promptStarters) && form.promptStarters.length) entry.promptStarters = form.promptStarters
+    const delegatedAuth = { ...(currentSaved?.delegatedAuth && typeof currentSaved.delegatedAuth === 'object' ? currentSaved.delegatedAuth : {}) }
+    if (typeof form.delegatedAuthEnabled === 'boolean') delegatedAuth.enabled = form.delegatedAuthEnabled
+    if (Array.isArray(form.delegatedAuthScopes) && form.delegatedAuthScopes.length) delegatedAuth.scopes = form.delegatedAuthScopes
+    if (Object.keys(delegatedAuth).length) entry.delegatedAuth = delegatedAuth
+    const sso = { ...(currentSaved?.sso && typeof currentSaved.sso === 'object' ? currentSaved.sso : {}) }
+    if (typeof form.ssoEnabled === 'boolean') sso.enabled = form.ssoEnabled
+    if (form.ssoConnectionName) sso.connectionName = form.ssoConnectionName
+    if (Object.keys(sso).length) entry.sso = sso
   } else if (storageKey === 'zalouser') {
     for (const key of ['profile', 'messagePrefix', 'responsePrefix']) {
       if (form[key]) entry[key] = form[key]
@@ -3589,7 +3686,7 @@ export function mergeOpenClawMessagingPlatformConfig(cfg, { platform, form, acco
   const currentSaved = resolvePlatformConfigEntry(cfg.channels?.[storageKey], platform, normalizedAccountId) || {}
   const entry = buildOpenClawMessagingPlatformEntry(platform, normalizedForm, currentSaved)
   applyMessagingPlatformEntry(cfg, storageKey, normalizedAccountId, entry)
-  if (['zalo', 'zalouser', 'line', 'mattermost', 'synology-chat', 'googlechat'].includes(storageKey)) {
+  if (['zalo', 'zalouser', 'line', 'mattermost', 'synology-chat', 'googlechat', 'msteams'].includes(storageKey)) {
     ensureMessagingPluginAllowed(cfg, storageKey)
   }
   return { entry, accountId: normalizedAccountId, storageKey }
@@ -5059,7 +5156,7 @@ const handlers = {
       } else {
         setRootChannelEntry(entry)
       }
-    } else if (['line', 'mattermost', 'synology-chat', 'googlechat'].includes(storageKey)) {
+    } else if (['line', 'mattermost', 'synology-chat', 'googlechat', 'msteams'].includes(storageKey)) {
       const built = buildOpenClawMessagingPlatformEntry(platform, form, currentSaved)
       applyMessagingPlatformEntry(cfg, storageKey, normalizedAccountId, built)
       ensureMessagingPluginAllowed(cfg, storageKey)
@@ -5068,7 +5165,7 @@ const handlers = {
       preserveMessagingCredentialRefs(entry, form, currentSaved)
     }
 
-    if (platform !== 'qqbot' && platform !== 'feishu' && platform !== 'dingtalk' && platform !== 'dingtalk-connector' && !['line', 'mattermost', 'synology-chat', 'googlechat'].includes(storageKey)) {
+    if (platform !== 'qqbot' && platform !== 'feishu' && platform !== 'dingtalk' && platform !== 'dingtalk-connector' && !['line', 'mattermost', 'synology-chat', 'googlechat', 'msteams'].includes(storageKey)) {
       preserveMessagingCredentialRefs(entry, form, currentSaved)
       // 合并模式：保留用户通过 CLI 或手动编辑的自定义字段
       applyMessagingPlatformEntry(cfg, storageKey, normalizedAccountId, entry)
@@ -5202,6 +5299,39 @@ const handlers = {
         return { valid: false, errors: ['提供的 Token 不属于 Bot 账号'] }
       } catch (e) {
         return { valid: false, errors: [`Discord API 连接失败: ${e.message}`] }
+      }
+    }
+    if (platform === 'msteams') {
+      const missing = msteamsCredentialMissingLabels(form)
+      if (missing.length) return { valid: false, errors: [`缺少 ${missing.join(' / ')}`] }
+      if (!hasConfiguredMessagingValue(form.appPassword)) {
+        return {
+          valid: true,
+          warnings: ['当前 Teams 认证模式不使用 Client Secret；面板已完成结构校验，实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'],
+          details: [`App ID: ${String(form.appId || '').trim()}`],
+        }
+      }
+      const tenantId = String(form.tenantId || 'botframework.com').trim() || 'botframework.com'
+      try {
+        const body = new URLSearchParams({
+          grant_type: 'client_credentials',
+          client_id: String(form.appId || '').trim(),
+          client_secret: String(form.appPassword || '').trim(),
+          scope: 'https://api.botframework.com/.default',
+        })
+        const resp = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+          signal: AbortSignal.timeout(15000),
+        })
+        const result = await resp.json()
+        if (result.access_token) {
+          return { valid: true, errors: [], details: [`App ID: ${form.appId}`, `Tenant: ${tenantId}`, `Token 有效期: ${result.expires_in || 0}s`] }
+        }
+        return { valid: false, errors: [result.error_description || result.error || '凭证无效，请检查 App ID 和 App Password'] }
+      } catch (e) {
+        return { valid: false, errors: [`Azure AD 连接失败: ${e.message}`] }
       }
     }
     return { valid: true, warnings: ['该平台暂不支持在线校验'] }
