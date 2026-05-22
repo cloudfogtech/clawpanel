@@ -146,6 +146,8 @@ const PLATFORM_REGISTRY = {
       { key: 'applicationId', label: 'Application ID', placeholder: '123456789012345678', required: false },
       { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
       { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllChannels')), required: false },
+      { key: 'guildId', label: 'Guild ID', placeholder: 'Discord Server ID', required: false },
+      { key: 'channelId', label: 'Channel ID', placeholder: 'Discord Channel ID；留空匹配整个服务器', required: false },
       { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.allowFromPh'), required: false, hint: t('channels.allowFromHint') },
     ],
     configKey: 'discord',
