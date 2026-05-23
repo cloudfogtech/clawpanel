@@ -151,6 +151,104 @@ test('WhatsApp 读取会回显扫码运行字段且诊断不要求 Bot Token', (
   assert.match(diagnosis.checks.find(item => item.id === 'credentials')?.title || '', /扫码|会话/)
 })
 
+test('ClickClack 渠道保存会写入自托管运行字段并启用插件', () => {
+  const cfg = { channels: {} }
+
+  mergeOpenClawMessagingPlatformConfig(cfg, {
+    platform: 'clickclack',
+    accountId: 'work',
+    form: {
+      name: 'Ops Workspace',
+      enabled: 'true',
+      baseUrl: 'https://clickclack.example.com',
+      token: 'clickclack-token',
+      workspace: 'ops',
+      botUserId: 'bot-1',
+      agentId: 'agent-1',
+      replyMode: 'model',
+      model: 'claude-sonnet-4-5',
+      systemPrompt: 'You are an ops assistant.',
+      timeoutSeconds: '120',
+      toolsAllow: 'shell, browser.search',
+      senderIsOwner: 'true',
+      defaultTo: 'channel:ops',
+      allowFrom: 'channel:ops, dm:alice',
+      reconnectMs: '2500',
+    },
+  })
+
+  const root = cfg.channels.clickclack
+  const account = root.accounts.work
+  assert.equal(root.defaultAccount, 'work')
+  assert.equal(account.enabled, true)
+  assert.equal(account.name, 'Ops Workspace')
+  assert.equal(account.baseUrl, 'https://clickclack.example.com')
+  assert.equal(account.token, 'clickclack-token')
+  assert.equal(account.workspace, 'ops')
+  assert.equal(account.botUserId, 'bot-1')
+  assert.equal(account.agentId, 'agent-1')
+  assert.equal(account.replyMode, 'model')
+  assert.equal(account.model, 'claude-sonnet-4-5')
+  assert.equal(account.systemPrompt, 'You are an ops assistant.')
+  assert.equal(account.timeoutSeconds, 120)
+  assert.deepEqual(account.toolsAllow, ['shell', 'browser.search'])
+  assert.equal(account.senderIsOwner, true)
+  assert.equal(account.defaultTo, 'channel:ops')
+  assert.deepEqual(account.allowFrom, ['channel:ops', 'dm:alice'])
+  assert.equal(account.reconnectMs, 2500)
+  assert.equal(cfg.plugins.entries.clickclack.enabled, true)
+})
+
+test('ClickClack 读取会回显运行字段且诊断要求 Base URL、Token 和 Workspace', () => {
+  const values = buildMessagingPlatformFormValues('clickclack', {
+    name: 'Ops Workspace',
+    enabled: true,
+    baseUrl: 'https://clickclack.example.com',
+    token: 'clickclack-token',
+    workspace: 'ops',
+    botUserId: 'bot-1',
+    agentId: 'agent-1',
+    replyMode: 'agent',
+    model: 'claude-sonnet-4-5',
+    systemPrompt: 'You are an ops assistant.',
+    timeoutSeconds: 90,
+    toolsAllow: ['shell', 'browser.search'],
+    senderIsOwner: false,
+    defaultTo: 'channel:general',
+    allowFrom: ['*'],
+    reconnectMs: 1500,
+  })
+  const missingWorkspace = buildOpenClawChannelDiagnosis({
+    platform: 'clickclack',
+    configExists: true,
+    channelEnabled: true,
+    form: {
+      baseUrl: 'https://clickclack.example.com',
+      token: 'clickclack-token',
+    },
+  })
+  const ready = buildOpenClawChannelDiagnosis({
+    platform: 'clickclack',
+    configExists: true,
+    channelEnabled: true,
+    form: values,
+  })
+
+  assert.equal(values.enabled, 'true')
+  assert.equal(values.baseUrl, 'https://clickclack.example.com')
+  assert.equal(values.token, 'clickclack-token')
+  assert.equal(values.workspace, 'ops')
+  assert.equal(values.replyMode, 'agent')
+  assert.equal(values.timeoutSeconds, '90')
+  assert.equal(values.toolsAllow, 'shell, browser.search')
+  assert.equal(values.senderIsOwner, 'false')
+  assert.equal(values.allowFrom, '*')
+  assert.equal(values.reconnectMs, '1500')
+  assert.equal(missingWorkspace.checks.find(item => item.id === 'credentials')?.ok, false)
+  assert.match(missingWorkspace.checks.find(item => item.id === 'credentials')?.detail || '', /Workspace/)
+  assert.equal(ready.checks.find(item => item.id === 'credentials')?.ok, true)
+})
+
 test('Signal 渠道保存会保留多账号和上游运行字段', () => {
   const cfg = { channels: {} }
 

@@ -274,6 +274,42 @@ const PLATFORM_REGISTRY = {
     pluginRequired: '@openclaw/mattermost@latest',
     pluginId: 'mattermost',
   },
+  clickclack: {
+    label: 'ClickClack',
+    iconName: 'message-square',
+    desc: t('channels.clickclackDesc'),
+    guide: [
+      t('channels.clickclackGuide1'),
+      t('channels.clickclackGuide2'),
+      t('channels.clickclackGuide3'),
+      t('channels.clickclackGuide4'),
+    ],
+    guideFooter: t('channels.clickclackGuideFooter'),
+    fields: [
+      { key: 'baseUrl', label: 'Base URL', placeholder: 'https://clickclack.example.com', required: true, hint: t('channels.clickclackBaseUrlHint') },
+      { key: 'token', label: 'Token', placeholder: t('channels.clickclackTokenPh'), secret: true, required: true },
+      { key: 'workspace', label: 'Workspace', placeholder: 'ops', required: true, hint: t('channels.clickclackWorkspaceHint') },
+      { key: 'name', label: t('channels.accountName'), placeholder: t('channels.optionalEg', { example: 'ops' }), required: false },
+      { key: 'botUserId', label: 'Bot User ID', placeholder: t('channels.optionalEg', { example: 'bot-1' }), required: false },
+      { key: 'agentId', label: 'Agent ID', placeholder: t('channels.optionalEg', { example: 'default' }), required: false },
+      { key: 'replyMode', label: 'Reply Mode', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'agent', label: 'Agent' },
+        { value: 'model', label: 'Model' },
+      ], required: false },
+      { key: 'model', label: 'Model', placeholder: t('channels.optionalEg', { example: 'claude-sonnet-4-5' }), required: false },
+      { key: 'systemPrompt', label: 'System Prompt', placeholder: t('channels.clickclackSystemPromptPh'), multiline: true, required: false },
+      { key: 'timeoutSeconds', label: 'Timeout Seconds', placeholder: '120', required: false, hint: t('channels.clickclackTimeoutHint') },
+      { key: 'toolsAllow', label: 'Tools Allow', placeholder: 'shell, browser.search', required: false, hint: t('channels.clickclackToolsAllowHint') },
+      { key: 'senderIsOwner', label: t('channels.clickclackSenderIsOwner'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.clickclackSenderIsOwnerHint') },
+      { key: 'defaultTo', label: 'Default To', placeholder: 'channel:general', required: false, hint: t('channels.clickclackDefaultToHint') },
+      { key: 'allowFrom', label: 'Allow From', placeholder: '*, channel:general, dm:alice', required: false, hint: t('channels.clickclackAllowFromHint') },
+      { key: 'reconnectMs', label: 'Reconnect MS', placeholder: '1500', required: false },
+    ],
+    configKey: 'clickclack',
+    pairingChannel: 'clickclack',
+    pluginId: 'clickclack',
+  },
   'synology-chat': {
     label: 'Synology Chat',
     iconName: 'message-square',
@@ -796,7 +832,7 @@ function applyRouteIntent(page, state) {
 // ── 已配置平台渲染 ──
 
 // ── 多账号支持的平台：与 OpenClaw 的 accounts/defaultAccount 配置模型保持一致 ──
-const MULTI_INSTANCE_PLATFORMS = ['telegram', 'discord', 'slack', 'feishu', 'dingtalk', 'dingtalk-connector', 'qqbot', 'zalo', 'zalouser', 'line', 'mattermost', 'synology-chat', 'googlechat', 'signal']
+const MULTI_INSTANCE_PLATFORMS = ['telegram', 'discord', 'slack', 'feishu', 'dingtalk', 'dingtalk-connector', 'qqbot', 'zalo', 'zalouser', 'line', 'mattermost', 'clickclack', 'synology-chat', 'googlechat', 'signal']
 
 function supportsMessagingMultiAccount(pid) {
   return MULTI_INSTANCE_PLATFORMS.includes(pid)

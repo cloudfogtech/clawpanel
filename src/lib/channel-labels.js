@@ -19,6 +19,7 @@ export const CHANNEL_LABELS = {
   line: 'LINE',
   nostr: 'Nostr',
   mattermost: 'Mattermost',
+  clickclack: 'ClickClack',
   'openclaw-weixin': '微信',
   weixin: '微信',
 }

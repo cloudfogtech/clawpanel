@@ -66,3 +66,27 @@ test('WhatsApp 渠道 UI 会恢复扫码登录和运行配置入口', () => {
   assert.match(whatsappBlock, /pluginRequired:\s*'@openclaw\/whatsapp@latest'/)
   assert.match(whatsappBlock, /pluginId:\s*'whatsapp'/)
 })
+
+test('ClickClack 渠道 UI 会暴露自托管工作区配置字段', () => {
+  const clickclackBlock = getRegistryBlock('clickclack')
+
+  for (const field of [
+    'baseUrl',
+    'token',
+    'workspace',
+    'botUserId',
+    'agentId',
+    'replyMode',
+    'model',
+    'systemPrompt',
+    'timeoutSeconds',
+    'toolsAllow',
+    'senderIsOwner',
+    'defaultTo',
+    'allowFrom',
+    'reconnectMs',
+  ]) {
+    assert.match(clickclackBlock, new RegExp(`key:\\s*'${field}'`))
+  }
+  assert.match(clickclackBlock, /pluginId:\s*'clickclack'/)
+})

@@ -260,6 +260,11 @@ fn required_channel_credential_fields(
         "dingtalk-connector" => vec![("clientId", "Client ID"), ("clientSecret", "Client Secret")],
         "mattermost" => vec![("botToken", "Bot Token"), ("baseUrl", "Base URL")],
         "synology-chat" => vec![("token", "Token"), ("incomingUrl", "Incoming URL")],
+        "clickclack" => vec![
+            ("baseUrl", "Base URL"),
+            ("token", "Token"),
+            ("workspace", "Workspace"),
+        ],
         "signal" => vec![("account", "Signal 账号")],
         "slack" => {
             let mode = form_string(form, "mode");
@@ -905,12 +910,15 @@ fn normalize_messaging_platform_form(
     normalize_numeric_form_value(&mut normalized, "httpPort");
     normalize_numeric_form_value(&mut normalized, "webhookPort");
     normalize_numeric_form_value(&mut normalized, "feedbackReflectionCooldownMs");
+    normalize_numeric_form_value(&mut normalized, "timeoutSeconds");
+    normalize_numeric_form_value(&mut normalized, "reconnectMs");
 
     for key in [
         "promptStarters",
         "delegatedAuthScopes",
         "attachmentRoots",
         "remoteAttachmentRoots",
+        "toolsAllow",
     ] {
         if normalized.contains_key(key) {
             let items = json_array_from_csv_value(normalized.get(key));
@@ -940,6 +948,7 @@ fn normalize_messaging_platform_form(
         "coalesceSameSenderDms",
         "selfChatMode",
         "ackDirect",
+        "senderIsOwner",
     ] {
         if normalized.contains_key(key) {
             let value = match normalized.get(key) {
@@ -1755,6 +1764,28 @@ pub async fn read_platform_config(
                 insert_string_if_present(&mut form, commands, "callbackPath");
                 insert_string_if_present(&mut form, commands, "callbackUrl");
             }
+        }
+        "clickclack" => {
+            for key in [
+                "name",
+                "baseUrl",
+                "token",
+                "workspace",
+                "botUserId",
+                "agentId",
+                "replyMode",
+                "model",
+                "systemPrompt",
+                "defaultTo",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            insert_bool_as_string(&mut form, &saved, "enabled");
+            insert_bool_as_string(&mut form, &saved, "senderIsOwner");
+            insert_array_as_csv(&mut form, &saved, "toolsAllow");
+            insert_array_as_csv(&mut form, &saved, "allowFrom");
+            insert_number_as_string(&mut form, &saved, "timeoutSeconds");
+            insert_number_as_string(&mut form, &saved, "reconnectMs");
         }
         "synology-chat" => {
             for key in ["token", "incomingUrl", "nasHost", "webhookPath", "botName"] {
@@ -2775,6 +2806,55 @@ pub async fn save_messaging_platform(
             )?;
             ensure_plugin_allowed(&mut cfg, "mattermost")?;
         }
+        "clickclack" => {
+            let base_url = form_string(form_obj, "baseUrl");
+            let token = form_string(form_obj, "token");
+            let workspace = form_string(form_obj, "workspace");
+            if base_url.is_empty() {
+                return Err("ClickClack Base URL 不能为空".into());
+            }
+            if token.is_empty() {
+                return Err("ClickClack Token 不能为空".into());
+            }
+            if workspace.is_empty() {
+                return Err("ClickClack Workspace 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            put_string(&mut entry, "baseUrl", base_url);
+            put_string(&mut entry, "token", token);
+            put_string(&mut entry, "workspace", workspace);
+            for key in [
+                "name",
+                "botUserId",
+                "agentId",
+                "replyMode",
+                "model",
+                "systemPrompt",
+                "defaultTo",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_array_from_form_value(&mut entry, "toolsAllow", form_obj.get("toolsAllow"));
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_bool_value_if_present(&mut entry, "senderIsOwner", form_obj.get("senderIsOwner"));
+            put_number_value_if_present(
+                &mut entry,
+                "timeoutSeconds",
+                form_obj.get("timeoutSeconds"),
+            );
+            put_number_value_if_present(&mut entry, "reconnectMs", form_obj.get("reconnectMs"));
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "clickclack")?;
+        }
         "synology-chat" => {
             let token = form_string(form_obj, "token");
             let incoming_url = form_string(form_obj, "incomingUrl");
@@ -3071,6 +3151,10 @@ pub async fn verify_bot_token(platform: String, form: Value) -> Result<Value, St
         "whatsapp" => Ok(json!({
             "valid": true,
             "warnings": ["WhatsApp 使用扫码登录，无需在线校验凭证；请通过「启动扫码登录」完成配对"]
+        })),
+        "clickclack" => Ok(json!({
+            "valid": true,
+            "warnings": ["ClickClack 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
         })),
         _ => Ok(json!({
             "valid": true,
@@ -6142,6 +6226,82 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("扫码/会话配置")
         );
+    }
+
+    #[test]
+    fn normalize_clickclack_form_preserves_workspace_runtime_fields() {
+        let form = json!({
+            "enabled": "true",
+            "baseUrl": "https://clickclack.example.com",
+            "token": "clickclack-token",
+            "workspace": "ops",
+            "replyMode": "model",
+            "timeoutSeconds": "120",
+            "toolsAllow": "shell, browser.search",
+            "senderIsOwner": "true",
+            "defaultTo": "channel:ops",
+            "allowFrom": "channel:ops, dm:alice",
+            "reconnectMs": "2500"
+        });
+        let normalized =
+            normalize_messaging_platform_form("clickclack", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("timeoutSeconds").and_then(|v| v.as_f64()),
+            Some(120.0)
+        );
+        assert_eq!(
+            normalized.get("reconnectMs").and_then(|v| v.as_f64()),
+            Some(2500.0)
+        );
+        assert_eq!(
+            normalized.get("senderIsOwner").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("toolsAllow")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("allowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready(
+            "clickclack",
+            &normalized
+        ));
+
+        let missing_workspace = json!({
+            "baseUrl": "https://clickclack.example.com",
+            "token": "clickclack-token"
+        });
+        let missing = normalize_messaging_platform_form(
+            "clickclack",
+            missing_workspace.as_object().expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready("clickclack", &missing));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("clickclack", None, true, true, &missing, None, None);
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Workspace"));
     }
 
     #[test]
