@@ -418,6 +418,59 @@ const PLATFORM_REGISTRY = {
     pluginRequired: '@openclaw/nostr@latest',
     pluginId: 'nostr',
   },
+  irc: {
+    label: 'IRC',
+    iconName: 'hash',
+    desc: t('channels.ircDesc'),
+    guide: [
+      t('channels.ircGuide1'),
+      t('channels.ircGuide2'),
+      t('channels.ircGuide3'),
+      t('channels.ircGuide4'),
+    ],
+    guideFooter: t('channels.ircGuideFooter'),
+    fields: [
+      { key: 'host', label: 'Host', placeholder: 'irc.libera.chat', required: true, hint: t('channels.ircHostHint') },
+      { key: 'port', label: 'Port', placeholder: '6697', required: false, hint: t('channels.ircPortHint') },
+      { key: 'tls', label: 'TLS', type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircTlsHint') },
+      { key: 'nick', label: 'Nick', placeholder: 'openclaw-bot', required: true, hint: t('channels.ircNickHint') },
+      { key: 'username', label: 'Username', placeholder: 'openclaw', required: false },
+      { key: 'realname', label: 'Real Name', placeholder: 'OpenClaw Bot', required: false },
+      { key: 'password', label: 'Server Password', placeholder: t('channels.optionalEg', { example: 'server-password' }), secret: true, required: false, hint: t('channels.ircPasswordHint') },
+      { key: 'passwordFile', label: 'Server Password File', placeholder: '/run/secrets/irc-password', required: false, hint: t('channels.ircPasswordFileHint') },
+      { key: 'nickservEnabled', label: t('channels.ircNickservEnabled'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircNickservHint') },
+      { key: 'nickservService', label: 'NickServ Service', placeholder: 'NickServ', required: false },
+      { key: 'nickservPassword', label: 'NickServ Password', placeholder: t('channels.optionalEg', { example: 'nickserv-password' }), secret: true, required: false, hint: t('channels.ircNickservHint') },
+      { key: 'nickservPasswordFile', label: 'NickServ Password File', placeholder: '/run/secrets/irc-nickserv', required: false },
+      { key: 'nickservRegister', label: t('channels.ircNickservRegister'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircNickservRegisterHint') },
+      { key: 'nickservRegisterEmail', label: 'NickServ Register Email', placeholder: 'bot@example.com', required: false },
+      { key: 'channels', label: 'Auto Join Channels', placeholder: '#openclaw, #ops', required: false, hint: t('channels.ircChannelsHint') },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: 'alice!ident@example.org, bob', required: false, hint: t('channels.allowFromHint') },
+      { key: 'defaultTo', label: 'Default To', placeholder: '#openclaw', required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllChannels')), required: false },
+      { key: 'groups', label: 'Allowed Channels', placeholder: '#openclaw, #ops', required: false, hint: t('channels.ircGroupsHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: 'alice!ident@example.org', required: false, hint: t('channels.ircGroupAllowFromHint') },
+      { key: 'requireMention', label: t('channels.ircRequireMention'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'mentionPatterns', label: 'Mention Patterns', placeholder: 'openclaw:, @openclaw', required: false, hint: t('channels.ircMentionPatternsHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '25', required: false },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '350', required: false },
+      { key: 'chunkMode', label: 'Chunk Mode', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'length', label: 'Length' },
+        { value: 'newline', label: 'Newline' },
+      ], required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[IRC]' }), required: false },
+      { key: 'dangerouslyAllowNameMatching', label: t('channels.ircNameMatching'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircNameMatchingHint') },
+    ],
+    configKey: 'irc',
+    pairingChannel: 'irc',
+    pluginRequired: '@openclaw/irc@latest',
+    pluginId: 'irc',
+  },
   'synology-chat': {
     label: 'Synology Chat',
     iconName: 'message-square',
@@ -940,7 +993,7 @@ function applyRouteIntent(page, state) {
 // ── 已配置平台渲染 ──
 
 // ── 多账号支持的平台：与 OpenClaw 的 accounts/defaultAccount 配置模型保持一致 ──
-const MULTI_INSTANCE_PLATFORMS = ['telegram', 'discord', 'slack', 'feishu', 'dingtalk', 'dingtalk-connector', 'qqbot', 'zalo', 'zalouser', 'line', 'mattermost', 'clickclack', 'nextcloud-talk', 'twitch', 'synology-chat', 'googlechat', 'signal']
+const MULTI_INSTANCE_PLATFORMS = ['telegram', 'discord', 'slack', 'feishu', 'dingtalk', 'dingtalk-connector', 'qqbot', 'zalo', 'zalouser', 'line', 'mattermost', 'clickclack', 'nextcloud-talk', 'twitch', 'irc', 'synology-chat', 'googlechat', 'signal']
 
 function supportsMessagingMultiAccount(pid) {
   return MULTI_INSTANCE_PLATFORMS.includes(pid)

@@ -103,6 +103,32 @@ fn insert_secret_aware_form_value(form: &mut Map<String, Value>, source: &Value,
     }
 }
 
+fn insert_secret_aware_form_alias(
+    form: &mut Map<String, Value>,
+    source: &Value,
+    source_key: &str,
+    form_key: &str,
+) {
+    if let Some(v) = source.get(source_key).and_then(|v| v.as_str()) {
+        form.insert(form_key.into(), Value::String(v.into()));
+        return;
+    }
+
+    let Some(value) = source.get(source_key) else {
+        return;
+    };
+    let Some(placeholder) = secret_ref_placeholder(value) else {
+        return;
+    };
+    form.insert(form_key.into(), Value::String(placeholder));
+    let refs = form
+        .entry("__secretRefs")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(obj) = refs.as_object_mut() {
+        obj.insert(form_key.into(), value.clone());
+    }
+}
+
 fn resolve_messaging_credential_value_for_save(
     form_obj: &Map<String, Value>,
     current: &Value,
@@ -114,6 +140,31 @@ fn resolve_messaging_credential_value_for_save(
     };
     let value = raw.trim();
     if let Some(current_value) = current.get(key) {
+        if let Some(placeholder) = secret_ref_placeholder(current_value) {
+            if value.is_empty() || value == placeholder {
+                return Some(current_value.clone());
+            }
+        }
+    }
+    if value.is_empty() {
+        None
+    } else {
+        Some(Value::String(value.to_string()))
+    }
+}
+
+fn resolve_messaging_credential_value_for_save_alias(
+    form_obj: &Map<String, Value>,
+    current: &Value,
+    form_key: &str,
+    current_key: &str,
+) -> Option<Value> {
+    let raw_value = form_obj.get(form_key)?;
+    let Value::String(raw) = raw_value else {
+        return Some(raw_value.clone());
+    };
+    let value = raw.trim();
+    if let Some(current_value) = current.get(current_key) {
         if let Some(placeholder) = secret_ref_placeholder(current_value) {
             if value.is_empty() || value == placeholder {
                 return Some(current_value.clone());
@@ -152,6 +203,7 @@ fn preserve_messaging_credential_refs(
         "gatewayPassword",
         "gatewayToken",
         "password",
+        "passwordFile",
         "privateKey",
         "secretFile",
         "serviceAccount",
@@ -279,6 +331,7 @@ fn required_channel_credential_fields(
         ],
         "nextcloud-talk" => vec![("baseUrl", "Base URL")],
         "nostr" => vec![("privateKey", "Private Key")],
+        "irc" => vec![("host", "Host"), ("nick", "Nick")],
         "twitch" => vec![
             ("username", "Username"),
             ("accessToken", "Access Token"),
@@ -675,6 +728,37 @@ fn insert_array_as_csv(form: &mut Map<String, Value>, source: &Value, key: &str)
     }
 }
 
+fn insert_irc_groups_form_values(form: &mut Map<String, Value>, source: &Value) {
+    let Some(groups) = source.get("groups").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let group_ids = groups
+        .keys()
+        .filter(|key| !key.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !group_ids.is_empty() {
+        form.insert("groups".into(), Value::String(group_ids.join(", ")));
+    }
+    let mention_values = group_ids
+        .iter()
+        .filter_map(|group_id| {
+            groups
+                .get(group_id)
+                .and_then(|group| group.get("requireMention"))
+                .and_then(|v| v.as_bool())
+        })
+        .collect::<Vec<_>>();
+    if let Some(first) = mention_values.first() {
+        if mention_values.iter().all(|value| value == first) {
+            form.insert(
+                "requireMention".into(),
+                Value::String(if *first { "true" } else { "false" }.into()),
+            );
+        }
+    }
+}
+
 fn insert_number_as_string(form: &mut Map<String, Value>, source: &Value, key: &str) {
     if let Some(v) = source.get(key).and_then(|v| v.as_f64()) {
         form.insert(key.into(), Value::String(v.to_string()));
@@ -826,6 +910,30 @@ fn put_array_from_form_value(entry: &mut Map<String, Value>, key: &str, value: O
     }
 }
 
+fn build_irc_groups_from_form(form_obj: &Map<String, Value>) -> Option<Value> {
+    let group_ids = json_array_from_csv_value(form_obj.get("groups"));
+    if group_ids.is_empty() {
+        return None;
+    }
+    let require_mention = form_obj.get("requireMention").and_then(|v| v.as_bool());
+    let mut groups = Map::new();
+    for value in group_ids {
+        let Some(group_id) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let mut group = Map::new();
+        if let Some(require_mention) = require_mention {
+            group.insert("requireMention".into(), Value::Bool(require_mention));
+        }
+        groups.insert(group_id.to_string(), Value::Object(group));
+    }
+    if groups.is_empty() {
+        None
+    } else {
+        Some(Value::Object(groups))
+    }
+}
+
 fn normalize_dm_policy_value(raw: Option<&Value>, fallback: &str) -> String {
     let value = raw.and_then(|v| v.as_str()).unwrap_or("").trim();
     match value {
@@ -885,6 +993,7 @@ fn normalize_messaging_platform_form(
             | "googlechat"
             | "nextcloud-talk"
             | "imessage"
+            | "irc"
     );
     let has_dm_field = normalized.contains_key("dmPolicy") || needs_access_defaults;
     let has_group_field = normalized.contains_key("groupPolicy") || needs_access_defaults;
@@ -959,6 +1068,7 @@ fn normalize_messaging_platform_form(
     normalize_numeric_form_value(&mut normalized, "reconnectMs");
     normalize_numeric_form_value(&mut normalized, "expiresIn");
     normalize_numeric_form_value(&mut normalized, "obtainmentTimestamp");
+    normalize_numeric_form_value(&mut normalized, "port");
 
     for key in [
         "promptStarters",
@@ -968,6 +1078,9 @@ fn normalize_messaging_platform_form(
         "toolsAllow",
         "allowedRoles",
         "relays",
+        "channels",
+        "groups",
+        "mentionPatterns",
     ] {
         if normalized.contains_key(key) {
             let items = json_array_from_csv_value(normalized.get(key));
@@ -999,6 +1112,9 @@ fn normalize_messaging_platform_form(
         "ackDirect",
         "senderIsOwner",
         "requireMention",
+        "tls",
+        "nickservEnabled",
+        "nickservRegister",
     ] {
         if normalized.contains_key(key) {
             let value = match normalized.get(key) {
@@ -1912,6 +2028,69 @@ pub async fn read_platform_config(
                     if let Some(v) = profile.get(source_key).and_then(|v| v.as_str()) {
                         form.insert(form_key.into(), Value::String(v.into()));
                     }
+                }
+            }
+        }
+        "irc" => {
+            for key in [
+                "name",
+                "host",
+                "nick",
+                "username",
+                "realname",
+                "password",
+                "passwordFile",
+                "defaultTo",
+                "chunkMode",
+                "responsePrefix",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            for key in [
+                "enabled",
+                "tls",
+                "blockStreaming",
+                "dangerouslyAllowNameMatching",
+            ] {
+                insert_bool_as_string(&mut form, &saved, key);
+            }
+            insert_access_policy_form_values(&mut form, &saved, false, false);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_array_as_csv(&mut form, &saved, "channels");
+            insert_array_as_csv(&mut form, &saved, "mentionPatterns");
+            insert_irc_groups_form_values(&mut form, &saved);
+            for key in [
+                "port",
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "textChunkLimit",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
+            if let Some(nickserv) = saved.get("nickserv") {
+                if let Some(v) = nickserv.get("enabled").and_then(|v| v.as_bool()) {
+                    form.insert(
+                        "nickservEnabled".into(),
+                        Value::String(if v { "true" } else { "false" }.into()),
+                    );
+                }
+                insert_secret_aware_form_alias(&mut form, nickserv, "service", "nickservService");
+                insert_secret_aware_form_alias(&mut form, nickserv, "password", "nickservPassword");
+                insert_secret_aware_form_alias(
+                    &mut form,
+                    nickserv,
+                    "passwordFile",
+                    "nickservPasswordFile",
+                );
+                if let Some(v) = nickserv.get("register").and_then(|v| v.as_bool()) {
+                    form.insert(
+                        "nickservRegister".into(),
+                        Value::String(if v { "true" } else { "false" }.into()),
+                    );
+                }
+                if let Some(v) = nickserv.get("registerEmail").and_then(|v| v.as_str()) {
+                    form.insert("nickservRegisterEmail".into(), Value::String(v.into()));
                 }
             }
         }
@@ -3153,6 +3332,119 @@ pub async fn save_messaging_platform(
             merge_channel_entry_for_account(channels_map, &storage_key, None, entry)?;
             ensure_plugin_allowed(&mut cfg, "nostr")?;
         }
+        "irc" => {
+            let host = form_string(form_obj, "host");
+            let nick = form_string(form_obj, "nick");
+            if host.is_empty() {
+                return Err("IRC Host 不能为空".into());
+            }
+            if nick.is_empty() {
+                return Err("IRC Nick 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            for key in [
+                "name",
+                "host",
+                "nick",
+                "username",
+                "realname",
+                "password",
+                "passwordFile",
+                "defaultTo",
+                "chunkMode",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            put_array_from_form_value(&mut entry, "channels", form_obj.get("channels"));
+            put_array_from_form_value(
+                &mut entry,
+                "mentionPatterns",
+                form_obj.get("mentionPatterns"),
+            );
+            if let Some(groups) = build_irc_groups_from_form(form_obj) {
+                entry.insert("groups".into(), groups);
+            }
+            for key in ["tls", "blockStreaming", "dangerouslyAllowNameMatching"] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "port",
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "textChunkLimit",
+            ] {
+                put_number_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+
+            let mut nickserv = current_saved
+                .get("nickserv")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_bool_value_if_present(&mut nickserv, "enabled", form_obj.get("nickservEnabled"));
+            put_string(
+                &mut nickserv,
+                "service",
+                form_string(form_obj, "nickservService"),
+            );
+            match resolve_messaging_credential_value_for_save_alias(
+                form_obj,
+                current_saved.get("nickserv").unwrap_or(&Value::Null),
+                "nickservPassword",
+                "password",
+            ) {
+                Some(value) => {
+                    nickserv.insert("password".into(), value);
+                }
+                None => {
+                    nickserv.remove("password");
+                }
+            }
+            match resolve_messaging_credential_value_for_save_alias(
+                form_obj,
+                current_saved.get("nickserv").unwrap_or(&Value::Null),
+                "nickservPasswordFile",
+                "passwordFile",
+            ) {
+                Some(value) => {
+                    nickserv.insert("passwordFile".into(), value);
+                }
+                None => {
+                    nickserv.remove("passwordFile");
+                }
+            }
+            put_bool_value_if_present(&mut nickserv, "register", form_obj.get("nickservRegister"));
+            put_string(
+                &mut nickserv,
+                "registerEmail",
+                form_string(form_obj, "nickservRegisterEmail"),
+            );
+            if !nickserv.is_empty() {
+                entry.insert("nickserv".into(), Value::Object(nickserv));
+            }
+
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "irc")?;
+        }
         "synology-chat" => {
             let token = form_string(form_obj, "token");
             let incoming_url = form_string(form_obj, "incomingUrl");
@@ -3465,6 +3757,10 @@ pub async fn verify_bot_token(platform: String, form: Value) -> Result<Value, St
         "nostr" => Ok(json!({
             "valid": true,
             "warnings": ["Nostr 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
+        })),
+        "irc" => Ok(json!({
+            "valid": true,
+            "warnings": ["IRC 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
         })),
         _ => Ok(json!({
             "valid": true,
@@ -4389,6 +4685,7 @@ pub async fn list_configured_platforms() -> Result<Value, String> {
                     if let Some(display_id) = account_display_value(acct_val, "appId")
                         .or_else(|| account_display_value(acct_val, "clientId"))
                         .or_else(|| account_display_value(acct_val, "account"))
+                        .or_else(|| account_display_value(acct_val, "nick"))
                     {
                         entry["appId"] = Value::String(display_id);
                     }
@@ -6867,6 +7164,136 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .contains("Private Key"));
+    }
+
+    #[test]
+    fn normalize_irc_form_preserves_server_nickserv_and_group_fields() {
+        let form = json!({
+            "enabled": "true",
+            "host": "irc.libera.chat",
+            "port": "6697",
+            "tls": "true",
+            "nick": "openclaw-bot",
+            "username": "openclaw",
+            "realname": "OpenClaw Bot",
+            "passwordFile": "/run/secrets/irc-password",
+            "nickservEnabled": "true",
+            "nickservService": "NickServ",
+            "nickservPasswordFile": "/run/secrets/irc-nickserv",
+            "nickservRegister": "false",
+            "channels": "#openclaw, #ops",
+            "dmPolicy": "allowlist",
+            "allowFrom": "alice!ident@example.org, bob",
+            "groupPolicy": "allowlist",
+            "groups": "#openclaw, #ops",
+            "groupAllowFrom": "alice!ident@example.org",
+            "requireMention": "false",
+            "mentionPatterns": "openclaw:, @openclaw",
+            "historyLimit": "80",
+            "dmHistoryLimit": "20",
+            "mediaMaxMb": "25",
+            "textChunkLimit": "350",
+            "blockStreaming": "true",
+            "dangerouslyAllowNameMatching": "true"
+        });
+        let normalized =
+            normalize_messaging_platform_form("irc", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("port").and_then(|v| v.as_f64()),
+            Some(6697.0)
+        );
+        assert_eq!(normalized.get("tls").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            normalized
+                .get("channels")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("groups")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized.get("requireMention").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            normalized.get("nickservEnabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("nickservRegister").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            normalized
+                .get("mentionPatterns")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready("irc", &normalized));
+
+        let groups = build_irc_groups_from_form(&normalized).expect("groups");
+        assert_eq!(
+            groups
+                .get("#openclaw")
+                .and_then(|group| group.get("requireMention"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let missing = normalize_messaging_platform_form(
+            "irc",
+            json!({
+                "host": "irc.libera.chat"
+            })
+            .as_object()
+            .expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready("irc", &missing));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("irc", None, true, true, &missing, None, None);
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Nick"));
+    }
+
+    #[test]
+    fn verify_irc_token_returns_probe_guidance_warning() {
+        let result = tauri::async_runtime::block_on(verify_bot_token(
+            "irc".to_string(),
+            json!({
+                "host": "irc.libera.chat",
+                "nick": "openclaw-bot"
+            }),
+        ))
+        .expect("verify result");
+
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(true));
+        assert!(result
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("IRC 面板已完成基础字段校验"));
     }
 
     #[test]

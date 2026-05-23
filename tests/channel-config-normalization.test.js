@@ -530,6 +530,165 @@ test('Nostr 读取和诊断会回显 relay、访问控制和 profile 字段', ()
   assert.equal(ready.checks.find(item => item.id === 'credentials')?.ok, true)
 })
 
+test('IRC 渠道保存会写入多账号服务器、NickServ 和频道访问结构并启用插件', () => {
+  const cfg = { channels: {} }
+
+  mergeOpenClawMessagingPlatformConfig(cfg, {
+    platform: 'irc',
+    accountId: 'libera',
+    form: {
+      enabled: 'true',
+      name: 'Libera Ops',
+      host: 'irc.libera.chat',
+      port: '6697',
+      tls: 'true',
+      nick: 'openclaw-bot',
+      username: 'openclaw',
+      realname: 'OpenClaw Bot',
+      password: 'server-password',
+      passwordFile: '/run/secrets/irc-password',
+      nickservEnabled: 'true',
+      nickservService: 'NickServ',
+      nickservPassword: 'nickserv-password',
+      nickservPasswordFile: '/run/secrets/irc-nickserv',
+      nickservRegister: 'false',
+      nickservRegisterEmail: 'bot@example.com',
+      channels: '#openclaw, #ops',
+      dmPolicy: 'allowlist',
+      allowFrom: 'alice!ident@example.org, bob',
+      defaultTo: '#openclaw',
+      groupPolicy: 'allowlist',
+      groups: '#openclaw, #ops',
+      groupAllowFrom: 'alice!ident@example.org',
+      requireMention: 'false',
+      mentionPatterns: 'openclaw:, @openclaw',
+      historyLimit: '80',
+      dmHistoryLimit: '20',
+      mediaMaxMb: '25',
+      textChunkLimit: '350',
+      chunkMode: 'newline',
+      blockStreaming: 'true',
+      responsePrefix: '[IRC]',
+      dangerouslyAllowNameMatching: 'true',
+    },
+  })
+
+  const root = cfg.channels.irc
+  const account = root.accounts.libera
+  assert.equal(root.defaultAccount, 'libera')
+  assert.equal(account.enabled, true)
+  assert.equal(account.name, 'Libera Ops')
+  assert.equal(account.host, 'irc.libera.chat')
+  assert.equal(account.port, 6697)
+  assert.equal(account.tls, true)
+  assert.equal(account.nick, 'openclaw-bot')
+  assert.equal(account.username, 'openclaw')
+  assert.equal(account.realname, 'OpenClaw Bot')
+  assert.equal(account.password, 'server-password')
+  assert.equal(account.passwordFile, '/run/secrets/irc-password')
+  assert.deepEqual(account.nickserv, {
+    enabled: true,
+    service: 'NickServ',
+    password: 'nickserv-password',
+    passwordFile: '/run/secrets/irc-nickserv',
+    register: false,
+    registerEmail: 'bot@example.com',
+  })
+  assert.deepEqual(account.channels, ['#openclaw', '#ops'])
+  assert.equal(account.dmPolicy, 'allowlist')
+  assert.deepEqual(account.allowFrom, ['alice!ident@example.org', 'bob'])
+  assert.equal(account.defaultTo, '#openclaw')
+  assert.equal(account.groupPolicy, 'allowlist')
+  assert.deepEqual(Object.keys(account.groups), ['#openclaw', '#ops'])
+  assert.equal(account.groups['#openclaw'].requireMention, false)
+  assert.deepEqual(account.groupAllowFrom, ['alice!ident@example.org'])
+  assert.deepEqual(account.mentionPatterns, ['openclaw:', '@openclaw'])
+  assert.equal(account.historyLimit, 80)
+  assert.equal(account.dmHistoryLimit, 20)
+  assert.equal(account.mediaMaxMb, 25)
+  assert.equal(account.textChunkLimit, 350)
+  assert.equal(account.chunkMode, 'newline')
+  assert.equal(account.blockStreaming, true)
+  assert.equal(account.responsePrefix, '[IRC]')
+  assert.equal(account.dangerouslyAllowNameMatching, true)
+  assert.equal(cfg.plugins.entries.irc.enabled, true)
+})
+
+test('IRC 读取和诊断会回显服务器、NickServ 与频道字段', () => {
+  const values = buildMessagingPlatformFormValues('irc', {
+    enabled: true,
+    name: 'Libera Ops',
+    host: 'irc.libera.chat',
+    port: 6697,
+    tls: true,
+    nick: 'openclaw-bot',
+    username: 'openclaw',
+    realname: 'OpenClaw Bot',
+    password: 'server-password',
+    passwordFile: '/run/secrets/irc-password',
+    nickserv: {
+      enabled: true,
+      service: 'NickServ',
+      password: 'nickserv-password',
+      passwordFile: '/run/secrets/irc-nickserv',
+      register: false,
+      registerEmail: 'bot@example.com',
+    },
+    channels: ['#openclaw', '#ops'],
+    dmPolicy: 'allowlist',
+    allowFrom: ['alice!ident@example.org'],
+    defaultTo: '#openclaw',
+    groupPolicy: 'allowlist',
+    groups: {
+      '#openclaw': { requireMention: false },
+      '#ops': { requireMention: false },
+    },
+    groupAllowFrom: ['alice!ident@example.org'],
+    mentionPatterns: ['openclaw:', '@openclaw'],
+    historyLimit: 80,
+    dmHistoryLimit: 20,
+    mediaMaxMb: 25,
+    textChunkLimit: 350,
+    chunkMode: 'newline',
+    blockStreaming: true,
+    responsePrefix: '[IRC]',
+    dangerouslyAllowNameMatching: true,
+  })
+  const missingNick = buildOpenClawChannelDiagnosis({
+    platform: 'irc',
+    configExists: true,
+    channelEnabled: true,
+    form: { host: 'irc.libera.chat' },
+  })
+  const ready = buildOpenClawChannelDiagnosis({
+    platform: 'irc',
+    configExists: true,
+    channelEnabled: true,
+    form: values,
+  })
+
+  assert.equal(values.enabled, 'true')
+  assert.equal(values.name, 'Libera Ops')
+  assert.equal(values.host, 'irc.libera.chat')
+  assert.equal(values.port, '6697')
+  assert.equal(values.tls, 'true')
+  assert.equal(values.nick, 'openclaw-bot')
+  assert.equal(values.nickservEnabled, 'true')
+  assert.equal(values.nickservService, 'NickServ')
+  assert.equal(values.nickservPassword, 'nickserv-password')
+  assert.equal(values.nickservRegister, 'false')
+  assert.equal(values.channels, '#openclaw, #ops')
+  assert.equal(values.groups, '#openclaw, #ops')
+  assert.equal(values.requireMention, 'false')
+  assert.equal(values.groupAllowFrom, 'alice!ident@example.org')
+  assert.equal(values.mentionPatterns, 'openclaw:, @openclaw')
+  assert.equal(values.blockStreaming, 'true')
+  assert.equal(values.dangerouslyAllowNameMatching, 'true')
+  assert.equal(missingNick.checks.find(item => item.id === 'credentials')?.ok, false)
+  assert.match(missingNick.checks.find(item => item.id === 'credentials')?.detail || '', /Nick/)
+  assert.equal(ready.checks.find(item => item.id === 'credentials')?.ok, true)
+})
+
 test('Signal 渠道保存会保留多账号和上游运行字段', () => {
   const cfg = { channels: {} }
 
@@ -767,6 +926,20 @@ test('渠道账号列表会把 SecretRef 标识显示为安全占位', () => {
   assert.deepEqual(accounts, [
     { accountId: 'backup', appId: 'SecretRef(env:default:DINGTALK_CLIENT_ID)' },
     { accountId: 'prod', appId: 'SecretRef(env:default:FEISHU_APP_ID)' },
+  ])
+})
+
+test('渠道账号列表会使用 IRC Nick 作为安全展示标识', () => {
+  const accounts = listPlatformAccounts({
+    accounts: {
+      libera: {
+        nick: 'openclaw-bot',
+      },
+    },
+  })
+
+  assert.deepEqual(accounts, [
+    { accountId: 'libera', appId: 'openclaw-bot' },
   ])
 })
 
