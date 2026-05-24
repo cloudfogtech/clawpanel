@@ -5088,6 +5088,55 @@ fn merge_hermes_checkpoints_config(
     Ok(())
 }
 
+fn build_hermes_cron_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let cron = root.and_then(|map| yaml_get_mapping(map, "cron"));
+    let cron_wrap_response = cron
+        .and_then(|map| yaml_bool_field(map, "wrap_response"))
+        .unwrap_or(true);
+    let cron_max_parallel_jobs = cron
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_parallel_jobs"), 0, 0, 10000))
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "cronWrapResponse": cron_wrap_response,
+        "cronMaxParallelJobs": cron_max_parallel_jobs,
+    })
+}
+
+fn merge_hermes_cron_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_cron_config_values(config);
+    let cron_wrap_response = form_bool(form, "cronWrapResponse")
+        .unwrap_or_else(|| current["cronWrapResponse"].as_bool().unwrap_or(true));
+    let cron_max_parallel_jobs = validate_hermes_i64(
+        if form.get("cronMaxParallelJobs").is_some() {
+            form_i64(form, "cronMaxParallelJobs")
+        } else {
+            Some(current["cronMaxParallelJobs"].as_i64().unwrap_or(0))
+        },
+        "cron.max_parallel_jobs",
+        0,
+        0,
+        10000,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let cron = yaml_child_object(root, "cron")?;
+    cron.insert(
+        yaml_key("wrap_response"),
+        serde_yaml::Value::Bool(cron_wrap_response),
+    );
+    cron.insert(
+        yaml_key("max_parallel_jobs"),
+        if cron_max_parallel_jobs == 0 {
+            serde_yaml::Value::Null
+        } else {
+            serde_yaml::Value::Number(cron_max_parallel_jobs.into())
+        },
+    );
+    Ok(())
+}
+
 fn build_hermes_approvals_config_values(config: &serde_yaml::Value) -> Value {
     let root = config.as_mapping();
     let approvals = root.and_then(|map| yaml_get_mapping(map, "approvals"));
@@ -6810,6 +6859,30 @@ pub fn hermes_checkpoints_config_save(form: Value) -> Result<Value, String> {
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_checkpoints_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_cron_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_cron_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_cron_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_cron_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_cron_config_values(&config),
     }))
 }
 
@@ -12781,6 +12854,93 @@ streaming:
         )
         .unwrap_err();
         assert!(err.contains("checkpoints.min_interval_hours"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_cron_config_tests {
+    use super::{build_hermes_cron_config_values, merge_hermes_cron_config};
+    use serde_json::json;
+
+    #[test]
+    fn cron_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_cron_config_values(&config);
+        assert_eq!(values["cronWrapResponse"], true);
+        assert_eq!(values["cronMaxParallelJobs"], 0);
+    }
+
+    #[test]
+    fn cron_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+cron:
+  wrap_response: false
+  max_parallel_jobs: 4
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_cron_config_values(&config);
+        assert_eq!(values["cronWrapResponse"], false);
+        assert_eq!(values["cronMaxParallelJobs"], 4);
+    }
+
+    #[test]
+    fn merge_cron_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+cron:
+  wrap_response: true
+  custom_flag: keep-cron
+approvals:
+  cron_mode: deny
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_cron_config(
+            &mut config,
+            &json!({
+                "cronWrapResponse": false,
+                "cronMaxParallelJobs": "3",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["approvals"]["cron_mode"].as_str(), Some("deny"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["cron"]["wrap_response"].as_bool(), Some(false));
+        assert_eq!(config["cron"]["max_parallel_jobs"].as_i64(), Some(3));
+        assert_eq!(config["cron"]["custom_flag"].as_str(), Some("keep-cron"));
+    }
+
+    #[test]
+    fn merge_cron_config_writes_unbounded_null_and_rejects_invalid_values() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+cron:
+  max_parallel_jobs: 8
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_cron_config(
+            &mut config,
+            &json!({
+                "cronMaxParallelJobs": "0",
+            }),
+        )
+        .unwrap();
+        assert_eq!(config["cron"]["max_parallel_jobs"], serde_yaml::Value::Null);
+
+        let err = merge_hermes_cron_config(&mut config, &json!({ "cronMaxParallelJobs": -1 }))
+            .unwrap_err();
+        assert!(err.contains("cron.max_parallel_jobs"));
+        let err = merge_hermes_cron_config(&mut config, &json!({ "cronMaxParallelJobs": 10001 }))
+            .unwrap_err();
+        assert!(err.contains("cron.max_parallel_jobs"));
     }
 }
 

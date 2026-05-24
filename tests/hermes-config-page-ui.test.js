@@ -205,6 +205,16 @@ test('Hermes 配置页会暴露审批安全结构化配置字段', () => {
   }
 })
 
+test('Hermes 配置页会暴露定时任务结构化配置字段', () => {
+  for (const id of [
+    'hm-cron-save',
+    'hm-cron-wrap-response',
+    'hm-cron-max-parallel-jobs',
+  ]) {
+    assert.match(source, new RegExp(`id="${id}"`), `缺少 ${id}`)
+  }
+})
+
 test('Hermes 配置页会暴露隐私脱敏结构化配置字段', () => {
   for (const id of [
     'hm-privacy-save',
@@ -266,7 +276,8 @@ test('Hermes 配置页新增结构化配置不会暴露翻译 key', () => {
     key.includes('BrowserConfig') ||
     key.includes('TerminalConfig') ||
     key.includes('CheckpointsConfig') ||
-    key.includes('ApprovalsConfig')
+    key.includes('ApprovalsConfig') ||
+    key.includes('CronConfig')
   )))
 
   assert.ok(keys.size > 0, '应能提取新增结构化配置用到的 engine 翻译 key')

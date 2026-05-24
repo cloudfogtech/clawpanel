@@ -4066,6 +4066,31 @@ export function mergeHermesCheckpointsConfig(config = {}, form = {}) {
   return next
 }
 
+export function buildHermesCronConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const cron = root.cron && typeof root.cron === 'object' && !Array.isArray(root.cron)
+    ? root.cron
+    : {}
+  return {
+    cronWrapResponse: readHermesBool(cron.wrap_response, true),
+    cronMaxParallelJobs: parseHermesInteger(cron.max_parallel_jobs, 'cron.max_parallel_jobs', 0, 0, 10000, false),
+  }
+}
+
+export function mergeHermesCronConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesCronConfigValues(next)
+  const cron = next.cron && typeof next.cron === 'object' && !Array.isArray(next.cron)
+    ? mergeConfigsPreservingFields(next.cron, {})
+    : {}
+
+  cron.wrap_response = formHermesBool(form, 'cronWrapResponse', currentValues.cronWrapResponse)
+  const maxParallelJobs = parseHermesInteger(Object.hasOwn(form, 'cronMaxParallelJobs') ? form.cronMaxParallelJobs : currentValues.cronMaxParallelJobs, 'cron.max_parallel_jobs', 0, 0, 10000, true)
+  cron.max_parallel_jobs = maxParallelJobs === 0 ? null : maxParallelJobs
+  next.cron = cron
+  return next
+}
+
 export function buildHermesApprovalsConfigValues(config = {}) {
   const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
   const approvals = root.approvals && typeof root.approvals === 'object' && !Array.isArray(root.approvals)
@@ -10806,6 +10831,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesCheckpointsConfigValues(next),
+    }
+  },
+
+  hermes_cron_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesCronConfigValues(config),
+    }
+  },
+
+  hermes_cron_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesCronConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesCronConfigValues(next),
     }
   },
 
