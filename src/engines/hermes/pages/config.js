@@ -136,6 +136,14 @@ const CHECKPOINTS_DEFAULTS = {
   checkpointMinIntervalHours: 24,
 }
 
+const APPROVALS_DEFAULTS = {
+  approvalMode: 'manual',
+  approvalTimeout: 60,
+  approvalCronMode: 'deny',
+  approvalMcpReloadConfirm: true,
+  approvalDestructiveSlashConfirm: true,
+}
+
 const PRIVACY_DEFAULTS = {
   redactPii: false,
 }
@@ -171,6 +179,8 @@ const DISPLAY_TOOL_PROGRESS_VALUES = ['off', 'new', 'all', 'verbose']
 const DISPLAY_LANGUAGE_VALUES = ['en', 'zh', 'zh-hant', 'ja', 'de', 'es', 'fr', 'tr', 'uk', 'af', 'ko', 'it', 'ga', 'pt', 'ru', 'hu']
 const DISPLAY_RESUME_VALUES = ['full', 'minimal']
 const HUMAN_DELAY_MODES = ['off', 'natural', 'custom']
+const APPROVAL_MODES = ['manual', 'smart', 'off']
+const APPROVAL_CRON_MODES = ['deny', 'approve']
 
 export function render() {
   const el = document.createElement('div')
@@ -193,6 +203,7 @@ export function render() {
   let executionLimitsValues = { ...EXECUTION_LIMITS_DEFAULTS }
   let ioSafetyValues = { ...IO_SAFETY_DEFAULTS }
   let checkpointsValues = { ...CHECKPOINTS_DEFAULTS }
+  let approvalsValues = { ...APPROVALS_DEFAULTS }
   let privacyValues = { ...PRIVACY_DEFAULTS }
   let browserValues = { ...BROWSER_DEFAULTS }
   let terminalValues = { ...TERMINAL_DEFAULTS }
@@ -213,6 +224,7 @@ export function render() {
   let executionLimitsLoading = true
   let ioSafetyLoading = true
   let checkpointsLoading = true
+  let approvalsLoading = true
   let privacyLoading = true
   let browserLoading = true
   let terminalLoading = true
@@ -233,6 +245,7 @@ export function render() {
   let executionLimitsSaving = false
   let ioSafetySaving = false
   let checkpointsSaving = false
+  let approvalsSaving = false
   let privacySaving = false
   let browserSaving = false
   let terminalSaving = false
@@ -253,6 +266,7 @@ export function render() {
   let executionLimitsError = null
   let ioSafetyError = null
   let checkpointsError = null
+  let approvalsError = null
   let privacyError = null
   let browserError = null
   let terminalError = null
@@ -266,7 +280,7 @@ export function render() {
   }
 
   function isBusy() {
-    return loading || runtimeLoading || compressionLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || quickCommandsLoading || agentToolsetsLoading || agentRuntimeLoading || unauthorizedDmLoading || securityLoading || displayLoading || humanDelayLoading || streamingLoading || executionLimitsLoading || ioSafetyLoading || checkpointsLoading || privacyLoading || browserLoading || terminalLoading || saving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || privacySaving || browserSaving || terminalSaving
+    return loading || runtimeLoading || compressionLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || quickCommandsLoading || agentToolsetsLoading || agentRuntimeLoading || unauthorizedDmLoading || securityLoading || displayLoading || humanDelayLoading || streamingLoading || executionLimitsLoading || ioSafetyLoading || checkpointsLoading || approvalsLoading || privacyLoading || browserLoading || terminalLoading || saving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || approvalsSaving || privacySaving || browserSaving || terminalSaving
   }
 
   function option(labelKey, value, selected) {
@@ -283,7 +297,7 @@ export function render() {
   }
 
   function renderRuntimePanel() {
-    const disabled = loading || saving || runtimeLoading || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || runtimeLoading || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel">
         <div class="hm-panel-header">
@@ -331,7 +345,7 @@ export function render() {
   }
 
   function renderCompressionPanel() {
-    const disabled = loading || saving || compressionLoading || compressionSaving || runtimeSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || compressionLoading || compressionSaving || runtimeSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-compression-panel">
         <div class="hm-panel-header">
@@ -381,7 +395,7 @@ export function render() {
   }
 
   function renderToolGuardrailsPanel() {
-    const disabled = loading || saving || toolGuardrailsLoading || toolGuardrailsSaving || runtimeSaving || compressionSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || toolGuardrailsLoading || toolGuardrailsSaving || runtimeSaving || compressionSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-guardrails-panel">
         <div class="hm-panel-header">
@@ -443,7 +457,7 @@ export function render() {
   }
 
   function renderMemoryPanel() {
-    const disabled = loading || saving || memoryLoading || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || memoryLoading || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-memory-panel">
         <div class="hm-panel-header">
@@ -493,7 +507,7 @@ export function render() {
   }
 
   function renderSkillsConfigPanel() {
-    const disabled = loading || saving || skillsLoading || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || skillsLoading || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-skills-panel">
         <div class="hm-panel-header">
@@ -525,7 +539,7 @@ export function render() {
   }
 
   function renderQuickCommandsConfigPanel() {
-    const disabled = loading || saving || quickCommandsLoading || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || quickCommandsLoading || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-quick-commands-panel">
         <div class="hm-panel-header">
@@ -551,7 +565,7 @@ export function render() {
   }
 
   function renderAgentToolsetsConfigPanel() {
-    const disabled = loading || saving || agentToolsetsLoading || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || agentToolsetsLoading || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-agent-toolsets-panel">
         <div class="hm-panel-header">
@@ -577,7 +591,7 @@ export function render() {
   }
 
   function renderAgentRuntimeConfigPanel() {
-    const disabled = loading || saving || agentRuntimeLoading || agentRuntimeSaving || agentToolsetsSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || privacySaving || browserSaving || terminalSaving
+    const disabled = loading || saving || agentRuntimeLoading || agentRuntimeSaving || agentToolsetsSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || approvalsSaving || privacySaving || browserSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-agent-runtime-panel">
         <div class="hm-panel-header">
@@ -639,7 +653,7 @@ export function render() {
   }
 
   function renderUnauthorizedDmConfigPanel() {
-    const disabled = loading || saving || unauthorizedDmLoading || unauthorizedDmSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || securitySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || unauthorizedDmLoading || unauthorizedDmSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || securitySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-unauthorized-dm-panel">
         <div class="hm-panel-header">
@@ -669,7 +683,7 @@ export function render() {
   }
 
   function renderSecurityConfigPanel() {
-    const disabled = loading || saving || securityLoading || securitySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || securityLoading || securitySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-security-panel">
         <div class="hm-panel-header">
@@ -711,7 +725,7 @@ export function render() {
   }
 
   function renderDisplayConfigPanel() {
-    const disabled = loading || saving || displayLoading || displaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || displayLoading || displaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-display-panel">
         <div class="hm-panel-header">
@@ -775,7 +789,7 @@ export function render() {
   }
 
   function renderHumanDelayConfigPanel() {
-    const disabled = loading || saving || humanDelayLoading || humanDelaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || humanDelayLoading || humanDelaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-human-delay-panel">
         <div class="hm-panel-header">
@@ -813,7 +827,7 @@ export function render() {
   }
 
   function renderStreamingPanel() {
-    const disabled = loading || saving || streamingLoading || streamingSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || executionLimitsSaving || checkpointsSaving || terminalSaving
+    const disabled = loading || saving || streamingLoading || streamingSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || executionLimitsSaving || checkpointsSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-streaming-panel">
         <div class="hm-panel-header">
@@ -865,7 +879,7 @@ export function render() {
   }
 
   function renderExecutionLimitsPanel() {
-    const disabled = loading || saving || executionLimitsLoading || executionLimitsSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || checkpointsSaving
+    const disabled = loading || saving || executionLimitsLoading || executionLimitsSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || checkpointsSaving || approvalsSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-execution-limits-panel">
         <div class="hm-panel-header">
@@ -937,7 +951,7 @@ export function render() {
   }
 
   function renderIoSafetyPanel() {
-    const disabled = loading || saving || ioSafetyLoading || ioSafetySaving || checkpointsSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving
+    const disabled = loading || saving || ioSafetyLoading || ioSafetySaving || checkpointsSaving || approvalsSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-io-safety-panel">
         <div class="hm-panel-header">
@@ -977,7 +991,7 @@ export function render() {
   }
 
   function renderCheckpointsPanel() {
-    const disabled = loading || saving || checkpointsLoading || checkpointsSaving || ioSafetySaving || privacySaving || browserSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving
+    const disabled = loading || saving || checkpointsLoading || checkpointsSaving || ioSafetySaving || approvalsSaving || privacySaving || browserSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-checkpoints-panel">
         <div class="hm-panel-header">
@@ -1034,8 +1048,58 @@ export function render() {
     `
   }
 
+  function renderApprovalsPanel() {
+    const disabled = loading || saving || approvalsLoading || approvalsSaving || checkpointsSaving || privacySaving || browserSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || ioSafetySaving
+    return `
+      <div class="hm-panel hm-config-runtime-panel hm-config-approvals-panel">
+        <div class="hm-panel-header">
+          <div>
+            <div class="hm-panel-title">${t('engine.hermesApprovalsConfigTitle')}</div>
+            <div class="hm-channel-panel-desc">${t('engine.hermesApprovalsConfigDesc')}</div>
+          </div>
+          <div class="hm-panel-actions">
+            <span class="hm-muted">${approvalsSaving ? t('engine.hermesConfigStatusSaving') : approvalsLoading ? t('engine.hermesConfigStatusLoading') : t('engine.hermesApprovalsConfigStatusReady')}</span>
+            <button class="hm-btn hm-btn--cta hm-btn--sm" id="hm-approvals-save" ${disabled ? 'disabled' : ''}>${t('engine.hermesApprovalsConfigSave')}</button>
+          </div>
+        </div>
+        <div class="hm-panel-body">
+          ${renderError(approvalsError)}
+          <div class="hm-config-runtime-grid hm-config-approvals-grid">
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesApprovalsConfigMode')}</span>
+              <select id="hm-approval-mode" class="hm-input" ${disabled ? 'disabled' : ''}>
+                ${APPROVAL_MODES.map(mode => option(`engine.hermesApprovalsConfigMode_${mode}`, mode, approvalsValues.approvalMode)).join('')}
+              </select>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesApprovalsConfigTimeout')}</span>
+              <input id="hm-approval-timeout" class="hm-input" type="number" inputmode="numeric" min="1" max="86400" step="1" value="${esc(approvalsValues.approvalTimeout)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesApprovalsConfigCronMode')}</span>
+              <select id="hm-approval-cron-mode" class="hm-input" ${disabled ? 'disabled' : ''}>
+                ${APPROVAL_CRON_MODES.map(mode => option(`engine.hermesApprovalsConfigCronMode_${mode}`, mode, approvalsValues.approvalCronMode)).join('')}
+              </select>
+            </label>
+          </div>
+          <div class="hm-config-check-grid">
+            <label class="hm-channel-check">
+              <input id="hm-approval-mcp-reload-confirm" type="checkbox" ${approvalsValues.approvalMcpReloadConfirm ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesApprovalsConfigMcpReloadConfirm')}</span>
+            </label>
+            <label class="hm-channel-check hm-channel-check--danger">
+              <input id="hm-approval-destructive-slash-confirm" type="checkbox" ${approvalsValues.approvalDestructiveSlashConfirm ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesApprovalsConfigDestructiveSlashConfirm')}</span>
+            </label>
+          </div>
+          <div class="hm-channel-footnote">${t('engine.hermesApprovalsConfigFootnote')}</div>
+        </div>
+      </div>
+    `
+  }
+
   function renderPrivacyPanel() {
-    const disabled = loading || saving || privacyLoading || privacySaving || browserSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving
+    const disabled = loading || saving || privacyLoading || privacySaving || approvalsSaving || browserSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-privacy-panel">
         <div class="hm-panel-header">
@@ -1063,7 +1127,7 @@ export function render() {
   }
 
   function renderBrowserPanel() {
-    const disabled = loading || saving || browserLoading || browserSaving || privacySaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving
+    const disabled = loading || saving || browserLoading || browserSaving || approvalsSaving || privacySaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-browser-panel">
         <div class="hm-panel-header">
@@ -1107,7 +1171,7 @@ export function render() {
   }
 
   function renderTerminalPanel() {
-    const disabled = loading || saving || terminalLoading || terminalSaving || browserSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving
+    const disabled = loading || saving || terminalLoading || terminalSaving || approvalsSaving || browserSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || streamingSaving || executionLimitsSaving || checkpointsSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-terminal-panel">
         <div class="hm-panel-header">
@@ -1197,6 +1261,7 @@ export function render() {
       ${renderExecutionLimitsPanel()}
       ${renderIoSafetyPanel()}
       ${renderCheckpointsPanel()}
+      ${renderApprovalsPanel()}
       ${renderPrivacyPanel()}
       ${renderBrowserPanel()}
       ${renderCompressionPanel()}
@@ -1245,6 +1310,7 @@ export function render() {
     el.querySelector('#hm-execution-limits-save')?.addEventListener('click', saveExecutionLimits)
     el.querySelector('#hm-io-safety-save')?.addEventListener('click', saveIoSafety)
     el.querySelector('#hm-checkpoints-save')?.addEventListener('click', saveCheckpoints)
+    el.querySelector('#hm-approvals-save')?.addEventListener('click', saveApprovalsConfig)
     el.querySelector('#hm-privacy-save')?.addEventListener('click', savePrivacyConfig)
     el.querySelector('#hm-browser-save')?.addEventListener('click', saveBrowserConfig)
     el.querySelector('#hm-terminal-save')?.addEventListener('click', saveTerminal)
@@ -1335,6 +1401,11 @@ export function render() {
     checkpointsValues = { ...CHECKPOINTS_DEFAULTS, ...(data?.values || {}) }
   }
 
+  async function loadApprovalsConfig() {
+    const data = await api.hermesApprovalsConfigRead()
+    approvalsValues = { ...APPROVALS_DEFAULTS, ...(data?.values || {}) }
+  }
+
   async function loadPrivacyConfig() {
     const data = await api.hermesPrivacyConfigRead()
     privacyValues = { ...PRIVACY_DEFAULTS, ...(data?.values || {}) }
@@ -1368,6 +1439,7 @@ export function render() {
     executionLimitsLoading = true
     ioSafetyLoading = true
     checkpointsLoading = true
+    approvalsLoading = true
     privacyLoading = true
     browserLoading = true
     terminalLoading = true
@@ -1388,6 +1460,7 @@ export function render() {
     executionLimitsError = null
     ioSafetyError = null
     checkpointsError = null
+    approvalsError = null
     privacyError = null
     browserError = null
     terminalError = null
@@ -1453,6 +1526,14 @@ export function render() {
       checkpointsError = humanizeError(err, t('engine.hermesCheckpointsConfigLoadFailed') || 'Load checkpoints config failed')
     } finally {
       checkpointsLoading = false
+      draw()
+    }
+    try {
+      await loadApprovalsConfig()
+    } catch (err) {
+      approvalsError = humanizeError(err, t('engine.hermesApprovalsConfigLoadFailed') || 'Load approvals config failed')
+    } finally {
+      approvalsLoading = false
       draw()
     }
     try {
@@ -1619,6 +1700,9 @@ export function render() {
       } catch {}
       try {
         await loadCheckpoints()
+      } catch {}
+      try {
+        await loadApprovalsConfig()
       } catch {}
       try {
         await loadPrivacyConfig()
@@ -2100,6 +2184,35 @@ export function render() {
       toast(checkpointsError, 'error')
     } finally {
       checkpointsSaving = false
+      draw()
+    }
+  }
+
+  async function saveApprovalsConfig() {
+    const form = {
+      approvalMode: el.querySelector('#hm-approval-mode')?.value || 'manual',
+      approvalTimeout: el.querySelector('#hm-approval-timeout')?.value || '60',
+      approvalCronMode: el.querySelector('#hm-approval-cron-mode')?.value || 'deny',
+      approvalMcpReloadConfirm: !!el.querySelector('#hm-approval-mcp-reload-confirm')?.checked,
+      approvalDestructiveSlashConfirm: !!el.querySelector('#hm-approval-destructive-slash-confirm')?.checked,
+    }
+    approvalsSaving = true
+    approvalsError = null
+    draw()
+    try {
+      const result = await api.hermesApprovalsConfigSave(form)
+      approvalsValues = { ...APPROVALS_DEFAULTS, ...(result?.values || form) }
+      await refreshRawAfterStructuredSave()
+      const backup = result?.backup || ''
+      toast({
+        message: t('engine.hermesApprovalsConfigSaveSuccess'),
+        hint: backup ? t('engine.hermesConfigBackupHint', { path: backup }) : '',
+      }, 'success')
+    } catch (err) {
+      approvalsError = humanizeError(err, t('engine.hermesApprovalsConfigSaveFailed') || 'Save approvals config failed')
+      toast(approvalsError, 'error')
+    } finally {
+      approvalsSaving = false
       draw()
     }
   }

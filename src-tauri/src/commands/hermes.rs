@@ -4631,6 +4631,43 @@ fn normalize_hermes_browser_engine(value: Option<String>, strict: bool) -> Resul
     }
 }
 
+fn normalize_hermes_approval_mode(value: Option<String>, strict: bool) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "manual".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "manual" | "smart" | "off") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("approvals.mode 必须是 manual、smart 或 off".to_string())
+    } else {
+        Ok("manual".to_string())
+    }
+}
+
+fn normalize_hermes_approval_cron_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "deny".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "deny" | "approve") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("approvals.cron_mode 必须是 deny 或 approve".to_string())
+    } else {
+        Ok("deny".to_string())
+    }
+}
+
 fn hermes_streaming_config_source(config: &serde_yaml::Value) -> Option<&serde_yaml::Mapping> {
     let root = config.as_mapping()?;
     if let Some(streaming) = yaml_get_mapping(root, "streaming") {
@@ -5047,6 +5084,107 @@ fn merge_hermes_checkpoints_config(
     checkpoints.insert(
         yaml_key("min_interval_hours"),
         serde_yaml::Value::Number(checkpoint_min_interval_hours.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_approvals_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let approvals = root.and_then(|map| yaml_get_mapping(map, "approvals"));
+    let approval_mode = normalize_hermes_approval_mode(
+        approvals.and_then(|map| yaml_string_field(map, "mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "manual".to_string());
+    let approval_timeout = approvals
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 60, 1, 86400))
+        .unwrap_or(60);
+    let approval_cron_mode = normalize_hermes_approval_cron_mode(
+        approvals.and_then(|map| yaml_string_field(map, "cron_mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "deny".to_string());
+    let approval_mcp_reload_confirm = approvals
+        .and_then(|map| yaml_bool_field(map, "mcp_reload_confirm"))
+        .unwrap_or(true);
+    let approval_destructive_slash_confirm = approvals
+        .and_then(|map| yaml_bool_field(map, "destructive_slash_confirm"))
+        .unwrap_or(true);
+
+    serde_json::json!({
+        "approvalMode": approval_mode,
+        "approvalTimeout": approval_timeout,
+        "approvalCronMode": approval_cron_mode,
+        "approvalMcpReloadConfirm": approval_mcp_reload_confirm,
+        "approvalDestructiveSlashConfirm": approval_destructive_slash_confirm,
+    })
+}
+
+fn merge_hermes_approvals_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_approvals_config_values(config);
+    let approval_mode = normalize_hermes_approval_mode(
+        if form.get("approvalMode").is_some() {
+            form_string(form, "approvalMode")
+        } else {
+            current["approvalMode"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let approval_timeout = validate_hermes_i64(
+        if form.get("approvalTimeout").is_some() {
+            form_i64(form, "approvalTimeout")
+        } else {
+            Some(current["approvalTimeout"].as_i64().unwrap_or(60))
+        },
+        "approvals.timeout",
+        60,
+        1,
+        86400,
+    )?;
+    let approval_cron_mode = normalize_hermes_approval_cron_mode(
+        if form.get("approvalCronMode").is_some() {
+            form_string(form, "approvalCronMode")
+        } else {
+            current["approvalCronMode"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let approval_mcp_reload_confirm =
+        form_bool(form, "approvalMcpReloadConfirm").unwrap_or_else(|| {
+            current["approvalMcpReloadConfirm"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+    let approval_destructive_slash_confirm = form_bool(form, "approvalDestructiveSlashConfirm")
+        .unwrap_or_else(|| {
+            current["approvalDestructiveSlashConfirm"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+
+    let root = ensure_yaml_object(config)?;
+    let approvals = yaml_child_object(root, "approvals")?;
+    approvals.insert(yaml_key("mode"), serde_yaml::Value::String(approval_mode));
+    approvals.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(approval_timeout.into()),
+    );
+    approvals.insert(
+        yaml_key("cron_mode"),
+        serde_yaml::Value::String(approval_cron_mode),
+    );
+    approvals.insert(
+        yaml_key("mcp_reload_confirm"),
+        serde_yaml::Value::Bool(approval_mcp_reload_confirm),
+    );
+    approvals.insert(
+        yaml_key("destructive_slash_confirm"),
+        serde_yaml::Value::Bool(approval_destructive_slash_confirm),
     );
     Ok(())
 }
@@ -6672,6 +6810,30 @@ pub fn hermes_checkpoints_config_save(form: Value) -> Result<Value, String> {
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_checkpoints_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_approvals_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_approvals_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_approvals_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_approvals_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_approvals_config_values(&config),
     }))
 }
 
@@ -12619,6 +12781,108 @@ streaming:
         )
         .unwrap_err();
         assert!(err.contains("checkpoints.min_interval_hours"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_approvals_config_tests {
+    use super::{build_hermes_approvals_config_values, merge_hermes_approvals_config};
+    use serde_json::json;
+
+    #[test]
+    fn approvals_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_approvals_config_values(&config);
+        assert_eq!(values["approvalMode"], "manual");
+        assert_eq!(values["approvalTimeout"], 60);
+        assert_eq!(values["approvalCronMode"], "deny");
+        assert_eq!(values["approvalMcpReloadConfirm"], true);
+        assert_eq!(values["approvalDestructiveSlashConfirm"], true);
+    }
+
+    #[test]
+    fn approvals_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+approvals:
+  mode: smart
+  timeout: 120
+  cron_mode: approve
+  mcp_reload_confirm: false
+  destructive_slash_confirm: false
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_approvals_config_values(&config);
+        assert_eq!(values["approvalMode"], "smart");
+        assert_eq!(values["approvalTimeout"], 120);
+        assert_eq!(values["approvalCronMode"], "approve");
+        assert_eq!(values["approvalMcpReloadConfirm"], false);
+        assert_eq!(values["approvalDestructiveSlashConfirm"], false);
+    }
+
+    #[test]
+    fn merge_approvals_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+approvals:
+  mode: manual
+  custom_flag: keep-approvals
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_approvals_config(
+            &mut config,
+            &json!({
+                "approvalMode": "off",
+                "approvalTimeout": "15",
+                "approvalCronMode": "approve",
+                "approvalMcpReloadConfirm": false,
+                "approvalDestructiveSlashConfirm": false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["approvals"]["mode"].as_str(), Some("off"));
+        assert_eq!(config["approvals"]["timeout"].as_i64(), Some(15));
+        assert_eq!(config["approvals"]["cron_mode"].as_str(), Some("approve"));
+        assert_eq!(
+            config["approvals"]["mcp_reload_confirm"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["approvals"]["destructive_slash_confirm"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["approvals"]["custom_flag"].as_str(),
+            Some("keep-approvals")
+        );
+    }
+
+    #[test]
+    fn merge_approvals_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_approvals_config(&mut config, &json!({ "approvalMode": "always" }))
+            .unwrap_err();
+        assert!(err.contains("approvals.mode"));
+        let err =
+            merge_hermes_approvals_config(&mut config, &json!({ "approvalCronMode": "prompt" }))
+                .unwrap_err();
+        assert!(err.contains("approvals.cron_mode"));
+        let err = merge_hermes_approvals_config(&mut config, &json!({ "approvalTimeout": 0 }))
+            .unwrap_err();
+        assert!(err.contains("approvals.timeout"));
+        let err = merge_hermes_approvals_config(&mut config, &json!({ "approvalTimeout": 86401 }))
+            .unwrap_err();
+        assert!(err.contains("approvals.timeout"));
     }
 }
 

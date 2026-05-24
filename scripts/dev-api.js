@@ -3325,6 +3325,8 @@ const HERMES_STREAMING_TRANSPORTS = new Set(['auto', 'draft', 'edit', 'off'])
 const HERMES_CODE_EXECUTION_MODES = new Set(['project', 'strict'])
 const HERMES_TERMINAL_BACKENDS = new Set(['local', 'ssh', 'docker', 'singularity', 'modal', 'daytona', 'vercel_sandbox'])
 const HERMES_BROWSER_ENGINES = new Set(['auto', 'lightpanda', 'chrome'])
+const HERMES_APPROVAL_MODES = new Set(['manual', 'smart', 'off'])
+const HERMES_APPROVAL_CRON_MODES = new Set(['deny', 'approve'])
 const HERMES_AGENT_IMAGE_INPUT_MODES = new Set(['auto', 'native', 'text'])
 const HERMES_DISPLAY_TOOL_PROGRESS_VALUES = new Set(['off', 'new', 'all', 'verbose'])
 const HERMES_DISPLAY_STREAMING_VALUES = new Set(['inherit', 'true', 'false'])
@@ -3408,6 +3410,20 @@ function normalizeHermesBrowserEngine(value, strict = false) {
   if (HERMES_BROWSER_ENGINES.has(engine)) return engine
   if (strict) throw new Error('browser.engine 必须是 auto、lightpanda 或 chrome')
   return 'auto'
+}
+
+function normalizeHermesApprovalMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'manual'
+  if (HERMES_APPROVAL_MODES.has(mode)) return mode
+  if (strict) throw new Error('approvals.mode 必须是 manual、smart 或 off')
+  return 'manual'
+}
+
+function normalizeHermesApprovalCronMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'deny'
+  if (HERMES_APPROVAL_CRON_MODES.has(mode)) return mode
+  if (strict) throw new Error('approvals.cron_mode 必须是 deny 或 approve')
+  return 'deny'
 }
 
 function normalizeHermesImageInputMode(value, strict = false) {
@@ -4047,6 +4063,36 @@ export function mergeHermesCheckpointsConfig(config = {}, form = {}) {
   checkpoints.delete_orphans = formHermesBool(form, 'checkpointDeleteOrphans', currentValues.checkpointDeleteOrphans)
   checkpoints.min_interval_hours = parseHermesInteger(Object.hasOwn(form, 'checkpointMinIntervalHours') ? form.checkpointMinIntervalHours : currentValues.checkpointMinIntervalHours, 'checkpoints.min_interval_hours', 24, 0, 8760, true)
   next.checkpoints = checkpoints
+  return next
+}
+
+export function buildHermesApprovalsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const approvals = root.approvals && typeof root.approvals === 'object' && !Array.isArray(root.approvals)
+    ? root.approvals
+    : {}
+  return {
+    approvalMode: normalizeHermesApprovalMode(approvals.mode, false),
+    approvalTimeout: parseHermesInteger(approvals.timeout, 'approvals.timeout', 60, 1, 86400, false),
+    approvalCronMode: normalizeHermesApprovalCronMode(approvals.cron_mode, false),
+    approvalMcpReloadConfirm: readHermesBool(approvals.mcp_reload_confirm, true),
+    approvalDestructiveSlashConfirm: readHermesBool(approvals.destructive_slash_confirm, true),
+  }
+}
+
+export function mergeHermesApprovalsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesApprovalsConfigValues(next)
+  const approvals = next.approvals && typeof next.approvals === 'object' && !Array.isArray(next.approvals)
+    ? mergeConfigsPreservingFields(next.approvals, {})
+    : {}
+
+  approvals.mode = normalizeHermesApprovalMode(Object.hasOwn(form, 'approvalMode') ? form.approvalMode : currentValues.approvalMode, true)
+  approvals.timeout = parseHermesInteger(Object.hasOwn(form, 'approvalTimeout') ? form.approvalTimeout : currentValues.approvalTimeout, 'approvals.timeout', 60, 1, 86400, true)
+  approvals.cron_mode = normalizeHermesApprovalCronMode(Object.hasOwn(form, 'approvalCronMode') ? form.approvalCronMode : currentValues.approvalCronMode, true)
+  approvals.mcp_reload_confirm = formHermesBool(form, 'approvalMcpReloadConfirm', currentValues.approvalMcpReloadConfirm)
+  approvals.destructive_slash_confirm = formHermesBool(form, 'approvalDestructiveSlashConfirm', currentValues.approvalDestructiveSlashConfirm)
+  next.approvals = approvals
   return next
 }
 
@@ -10760,6 +10806,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesCheckpointsConfigValues(next),
+    }
+  },
+
+  hermes_approvals_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesApprovalsConfigValues(config),
+    }
+  },
+
+  hermes_approvals_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesApprovalsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesApprovalsConfigValues(next),
     }
   },
 
