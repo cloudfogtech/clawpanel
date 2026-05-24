@@ -2269,6 +2269,21 @@ fn yaml_string_field(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
         .map(|v| v.to_string())
 }
 
+fn yaml_string_sequence_field(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    yaml_get(map, key)
+        .and_then(|value| value.as_sequence())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn yaml_scalar_string_field(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
     let value = yaml_get(map, key)?;
     if let Some(value) = value.as_str() {
@@ -3668,6 +3683,71 @@ fn merge_hermes_memory_config(config: &mut serde_yaml::Value, form: &Value) -> R
         yaml_key("flush_min_turns"),
         serde_yaml::Value::Number(flush_min_turns.into()),
     );
+    Ok(())
+}
+
+fn normalize_hermes_multiline_list(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn build_hermes_skills_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let skills = root.and_then(|map| yaml_get_mapping(map, "skills"));
+    let creation_nudge_interval = skills
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "creation_nudge_interval"), 15, 0, 10000))
+        .unwrap_or(15);
+    let external_dirs = skills
+        .map(|map| yaml_string_sequence_field(map, "external_dirs").join("\n"))
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "creationNudgeInterval": creation_nudge_interval,
+        "externalDirs": external_dirs,
+    })
+}
+
+fn merge_hermes_skills_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_skills_config_values(config);
+    let creation_nudge_interval = validate_hermes_i64(
+        if form.get("creationNudgeInterval").is_some() {
+            form_i64(form, "creationNudgeInterval")
+        } else {
+            Some(current["creationNudgeInterval"].as_i64().unwrap_or(15))
+        },
+        "skills.creation_nudge_interval",
+        15,
+        0,
+        10000,
+    )?;
+    let external_dirs = normalize_hermes_multiline_list(
+        form_string(form, "externalDirs")
+            .or_else(|| current["externalDirs"].as_str().map(ToString::to_string)),
+    );
+
+    let root = ensure_yaml_object(config)?;
+    let skills = yaml_child_object(root, "skills")?;
+    skills.insert(
+        yaml_key("creation_nudge_interval"),
+        serde_yaml::Value::Number(creation_nudge_interval.into()),
+    );
+    if external_dirs.is_empty() {
+        skills.remove(yaml_key("external_dirs"));
+    } else {
+        skills.insert(
+            yaml_key("external_dirs"),
+            serde_yaml::Value::Sequence(
+                external_dirs
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -5138,6 +5218,30 @@ pub fn hermes_memory_config_save(form: Value) -> Result<Value, String> {
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_memory_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_skills_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_skills_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_skills_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_skills_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_skills_config_values(&config),
     }))
 }
 
@@ -10934,6 +11038,103 @@ streaming:
         let err =
             merge_hermes_memory_config(&mut config, &json!({ "flushMinTurns": 1001 })).unwrap_err();
         assert!(err.contains("memory.flush_min_turns"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_skills_config_tests {
+    use super::{build_hermes_skills_config_values, merge_hermes_skills_config};
+    use serde_json::json;
+
+    #[test]
+    fn skills_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_skills_config_values(&config);
+        assert_eq!(values["creationNudgeInterval"], 15);
+        assert_eq!(values["externalDirs"], "");
+    }
+
+    #[test]
+    fn skills_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+skills:
+  creation_nudge_interval: 30
+  external_dirs:
+    - ~/.agents/skills
+    - /home/shared/team-skills
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_skills_config_values(&config);
+        assert_eq!(values["creationNudgeInterval"], 30);
+        assert_eq!(
+            values["externalDirs"],
+            "~/.agents/skills\n/home/shared/team-skills"
+        );
+    }
+
+    #[test]
+    fn merge_skills_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+skills:
+  creation_nudge_interval: 15
+  disabled:
+    - legacy-skill
+  custom_flag: keep-skills
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_skills_config(
+            &mut config,
+            &json!({
+                "creationNudgeInterval": "0",
+                "externalDirs": " ~/.agents/skills \n\n /home/shared/team-skills ",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["skills"]["creation_nudge_interval"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            config["skills"]["external_dirs"][0].as_str(),
+            Some("~/.agents/skills")
+        );
+        assert_eq!(
+            config["skills"]["external_dirs"][1].as_str(),
+            Some("/home/shared/team-skills")
+        );
+        assert_eq!(
+            config["skills"]["disabled"][0].as_str(),
+            Some("legacy-skill")
+        );
+        assert_eq!(
+            config["skills"]["custom_flag"].as_str(),
+            Some("keep-skills")
+        );
+    }
+
+    #[test]
+    fn merge_skills_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_skills_config(&mut config, &json!({ "creationNudgeInterval": -1 }))
+            .unwrap_err();
+        assert!(err.contains("skills.creation_nudge_interval"));
+        let err =
+            merge_hermes_skills_config(&mut config, &json!({ "creationNudgeInterval": 10001 }))
+                .unwrap_err();
+        assert!(err.contains("skills.creation_nudge_interval"));
     }
 }
 

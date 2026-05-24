@@ -265,6 +265,8 @@ pub fn run() {
             hermes::hermes_tool_loop_guardrails_config_save,
             hermes::hermes_memory_config_read,
             hermes::hermes_memory_config_save,
+            hermes::hermes_skills_config_read,
+            hermes::hermes_skills_config_save,
             hermes::hermes_streaming_config_read,
             hermes::hermes_streaming_config_save,
             hermes::hermes_execution_limits_config_read,

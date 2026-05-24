@@ -3574,6 +3574,44 @@ export function mergeHermesMemoryConfig(config = {}, form = {}) {
   return next
 }
 
+function normalizeHermesMultilineList(value) {
+  if (Array.isArray(value)) {
+    return value.map(item => String(item ?? '').trim()).filter(Boolean)
+  }
+  return String(value ?? '')
+    .split(/\r?\n/)
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
+export function buildHermesSkillsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const skills = root.skills && typeof root.skills === 'object' && !Array.isArray(root.skills)
+    ? root.skills
+    : {}
+  const externalDirs = Array.isArray(skills.external_dirs)
+    ? skills.external_dirs.map(item => String(item ?? '').trim()).filter(Boolean).join('\n')
+    : ''
+  return {
+    creationNudgeInterval: parseHermesInteger(skills.creation_nudge_interval, 'skills.creation_nudge_interval', 15, 0, 10000, false),
+    externalDirs,
+  }
+}
+
+export function mergeHermesSkillsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesSkillsConfigValues(next)
+  const skills = next.skills && typeof next.skills === 'object' && !Array.isArray(next.skills)
+    ? mergeConfigsPreservingFields(next.skills, {})
+    : {}
+  skills.creation_nudge_interval = parseHermesInteger(Object.hasOwn(form, 'creationNudgeInterval') ? form.creationNudgeInterval : currentValues.creationNudgeInterval, 'skills.creation_nudge_interval', 15, 0, 10000, true)
+  const externalDirs = normalizeHermesMultilineList(Object.hasOwn(form, 'externalDirs') ? form.externalDirs : currentValues.externalDirs)
+  if (externalDirs.length) skills.external_dirs = externalDirs
+  else delete skills.external_dirs
+  next.skills = skills
+  return next
+}
+
 export function buildHermesStreamingConfigValues(config = {}) {
   const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
   const streaming = hermesStreamingConfigSource(root)
@@ -10035,6 +10073,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesMemoryConfigValues(next),
+    }
+  },
+
+  hermes_skills_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesSkillsConfigValues(config),
+    }
+  },
+
+  hermes_skills_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesSkillsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesSkillsConfigValues(next),
     }
   },
 

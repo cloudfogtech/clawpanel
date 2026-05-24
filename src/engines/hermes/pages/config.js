@@ -43,6 +43,11 @@ const MEMORY_DEFAULTS = {
   flushMinTurns: 6,
 }
 
+const SKILLS_DEFAULTS = {
+  creationNudgeInterval: 15,
+  externalDirs: '',
+}
+
 const STREAMING_DEFAULTS = {
   enabled: false,
   transport: 'edit',
@@ -92,6 +97,7 @@ export function render() {
   let compressionValues = { ...COMPRESSION_DEFAULTS }
   let toolGuardrailsValues = { ...TOOL_GUARDRAILS_DEFAULTS }
   let memoryValues = { ...MEMORY_DEFAULTS }
+  let skillsValues = { ...SKILLS_DEFAULTS }
   let streamingValues = { ...STREAMING_DEFAULTS }
   let executionLimitsValues = { ...EXECUTION_LIMITS_DEFAULTS }
   let terminalValues = { ...TERMINAL_DEFAULTS }
@@ -100,6 +106,7 @@ export function render() {
   let compressionLoading = true
   let toolGuardrailsLoading = true
   let memoryLoading = true
+  let skillsLoading = true
   let streamingLoading = true
   let executionLimitsLoading = true
   let terminalLoading = true
@@ -108,6 +115,7 @@ export function render() {
   let compressionSaving = false
   let toolGuardrailsSaving = false
   let memorySaving = false
+  let skillsSaving = false
   let streamingSaving = false
   let executionLimitsSaving = false
   let terminalSaving = false
@@ -116,6 +124,7 @@ export function render() {
   let compressionError = null
   let toolGuardrailsError = null
   let memoryError = null
+  let skillsError = null
   let streamingError = null
   let executionLimitsError = null
   let terminalError = null
@@ -129,7 +138,7 @@ export function render() {
   }
 
   function isBusy() {
-    return loading || runtimeLoading || compressionLoading || toolGuardrailsLoading || memoryLoading || streamingLoading || executionLimitsLoading || terminalLoading || saving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || streamingSaving || executionLimitsSaving || terminalSaving
+    return loading || runtimeLoading || compressionLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || streamingLoading || executionLimitsLoading || terminalLoading || saving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || terminalSaving
   }
 
   function option(labelKey, value, selected) {
@@ -146,7 +155,7 @@ export function render() {
   }
 
   function renderRuntimePanel() {
-    const disabled = loading || saving || runtimeLoading || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || streamingSaving || executionLimitsSaving || terminalSaving
+    const disabled = loading || saving || runtimeLoading || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel">
         <div class="hm-panel-header">
@@ -194,7 +203,7 @@ export function render() {
   }
 
   function renderCompressionPanel() {
-    const disabled = loading || saving || compressionLoading || compressionSaving || runtimeSaving || toolGuardrailsSaving || memorySaving || streamingSaving || executionLimitsSaving || terminalSaving
+    const disabled = loading || saving || compressionLoading || compressionSaving || runtimeSaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-compression-panel">
         <div class="hm-panel-header">
@@ -244,7 +253,7 @@ export function render() {
   }
 
   function renderToolGuardrailsPanel() {
-    const disabled = loading || saving || toolGuardrailsLoading || toolGuardrailsSaving || runtimeSaving || compressionSaving || memorySaving || streamingSaving || executionLimitsSaving || terminalSaving
+    const disabled = loading || saving || toolGuardrailsLoading || toolGuardrailsSaving || runtimeSaving || compressionSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-guardrails-panel">
         <div class="hm-panel-header">
@@ -306,7 +315,7 @@ export function render() {
   }
 
   function renderMemoryPanel() {
-    const disabled = loading || saving || memoryLoading || memorySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || streamingSaving || executionLimitsSaving || terminalSaving
+    const disabled = loading || saving || memoryLoading || memorySaving || skillsSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || streamingSaving || executionLimitsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-memory-panel">
         <div class="hm-panel-header">
@@ -355,8 +364,40 @@ export function render() {
     `
   }
 
+  function renderSkillsConfigPanel() {
+    const disabled = loading || saving || skillsLoading || skillsSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || streamingSaving || executionLimitsSaving || terminalSaving
+    return `
+      <div class="hm-panel hm-config-runtime-panel hm-config-skills-panel">
+        <div class="hm-panel-header">
+          <div>
+            <div class="hm-panel-title">${t('engine.hermesSkillsConfigTitle')}</div>
+            <div class="hm-channel-panel-desc">${t('engine.hermesSkillsConfigDesc')}</div>
+          </div>
+          <div class="hm-panel-actions">
+            <span class="hm-muted">${skillsSaving ? t('engine.hermesConfigStatusSaving') : skillsLoading ? t('engine.hermesConfigStatusLoading') : t('engine.hermesSkillsConfigStatusReady')}</span>
+            <button class="hm-btn hm-btn--cta hm-btn--sm" id="hm-skills-config-save" ${disabled ? 'disabled' : ''}>${t('engine.hermesSkillsConfigSave')}</button>
+          </div>
+        </div>
+        <div class="hm-panel-body">
+          ${renderError(skillsError)}
+          <div class="hm-config-runtime-grid hm-config-skills-grid">
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesSkillsConfigCreationNudgeInterval')}</span>
+              <input id="hm-skills-creation-nudge-interval" class="hm-input" type="number" inputmode="numeric" min="0" max="10000" step="1" value="${esc(skillsValues.creationNudgeInterval)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field hm-field--wide">
+              <span class="hm-field-label">${t('engine.hermesSkillsConfigExternalDirs')}</span>
+              <textarea id="hm-skills-external-dirs" class="hm-input" spellcheck="false" rows="3" ${disabled ? 'disabled' : ''}>${esc(skillsValues.externalDirs)}</textarea>
+            </label>
+          </div>
+          <div class="hm-channel-footnote">${t('engine.hermesSkillsConfigFootnote')}</div>
+        </div>
+      </div>
+    `
+  }
+
   function renderStreamingPanel() {
-    const disabled = loading || saving || streamingLoading || streamingSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || executionLimitsSaving || terminalSaving
+    const disabled = loading || saving || streamingLoading || streamingSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || executionLimitsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-streaming-panel">
         <div class="hm-panel-header">
@@ -408,7 +449,7 @@ export function render() {
   }
 
   function renderExecutionLimitsPanel() {
-    const disabled = loading || saving || executionLimitsLoading || executionLimitsSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || streamingSaving
+    const disabled = loading || saving || executionLimitsLoading || executionLimitsSaving || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-execution-limits-panel">
         <div class="hm-panel-header">
@@ -480,7 +521,7 @@ export function render() {
   }
 
   function renderTerminalPanel() {
-    const disabled = loading || saving || terminalLoading || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || streamingSaving || executionLimitsSaving
+    const disabled = loading || saving || terminalLoading || terminalSaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-terminal-panel">
         <div class="hm-panel-header">
@@ -571,6 +612,7 @@ export function render() {
       ${renderCompressionPanel()}
       ${renderToolGuardrailsPanel()}
       ${renderMemoryPanel()}
+      ${renderSkillsConfigPanel()}
 
       <div class="hm-panel">
         <div class="hm-panel-header">
@@ -594,6 +636,7 @@ export function render() {
     el.querySelector('#hm-compression-save')?.addEventListener('click', saveCompression)
     el.querySelector('#hm-tool-guardrails-save')?.addEventListener('click', saveToolGuardrails)
     el.querySelector('#hm-memory-save')?.addEventListener('click', saveMemory)
+    el.querySelector('#hm-skills-config-save')?.addEventListener('click', saveSkillsConfig)
     el.querySelector('#hm-streaming-save')?.addEventListener('click', saveStreaming)
     el.querySelector('#hm-execution-limits-save')?.addEventListener('click', saveExecutionLimits)
     el.querySelector('#hm-terminal-save')?.addEventListener('click', saveTerminal)
@@ -624,6 +667,11 @@ export function render() {
     memoryValues = { ...MEMORY_DEFAULTS, ...(data?.values || {}) }
   }
 
+  async function loadSkillsConfig() {
+    const data = await api.hermesSkillsConfigRead()
+    skillsValues = { ...SKILLS_DEFAULTS, ...(data?.values || {}) }
+  }
+
   async function loadStreaming() {
     const data = await api.hermesStreamingConfigRead()
     streamingValues = { ...STREAMING_DEFAULTS, ...(data?.values || {}) }
@@ -645,6 +693,7 @@ export function render() {
     compressionLoading = true
     toolGuardrailsLoading = true
     memoryLoading = true
+    skillsLoading = true
     streamingLoading = true
     executionLimitsLoading = true
     terminalLoading = true
@@ -653,6 +702,7 @@ export function render() {
     compressionError = null
     toolGuardrailsError = null
     memoryError = null
+    skillsError = null
     streamingError = null
     executionLimitsError = null
     terminalError = null
@@ -720,6 +770,14 @@ export function render() {
       memoryLoading = false
       draw()
     }
+    try {
+      await loadSkillsConfig()
+    } catch (err) {
+      skillsError = humanizeError(err, t('engine.hermesSkillsConfigLoadFailed') || 'Load skills config failed')
+    } finally {
+      skillsLoading = false
+      draw()
+    }
   }
 
   async function refreshRawAfterStructuredSave() {
@@ -752,6 +810,9 @@ export function render() {
       } catch {}
       try {
         await loadMemory()
+      } catch {}
+      try {
+        await loadSkillsConfig()
       } catch {}
       try {
         await loadStreaming()
@@ -888,6 +949,32 @@ export function render() {
       toast(memoryError, 'error')
     } finally {
       memorySaving = false
+      draw()
+    }
+  }
+
+  async function saveSkillsConfig() {
+    const form = {
+      creationNudgeInterval: el.querySelector('#hm-skills-creation-nudge-interval')?.value || '15',
+      externalDirs: el.querySelector('#hm-skills-external-dirs')?.value || '',
+    }
+    skillsSaving = true
+    skillsError = null
+    draw()
+    try {
+      const result = await api.hermesSkillsConfigSave(form)
+      skillsValues = { ...SKILLS_DEFAULTS, ...(result?.values || form) }
+      await refreshRawAfterStructuredSave()
+      const backup = result?.backup || ''
+      toast({
+        message: t('engine.hermesSkillsConfigSaveSuccess'),
+        hint: backup ? t('engine.hermesConfigBackupHint', { path: backup }) : '',
+      }, 'success')
+    } catch (err) {
+      skillsError = humanizeError(err, t('engine.hermesSkillsConfigSaveFailed') || 'Save skills config failed')
+      toast(skillsError, 'error')
+    } finally {
+      skillsSaving = false
       draw()
     }
   }

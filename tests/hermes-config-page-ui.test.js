@@ -39,6 +39,16 @@ test('Hermes 配置页会暴露记忆结构化配置字段', () => {
   }
 })
 
+test('Hermes 配置页会暴露 Skills 结构化配置字段', () => {
+  for (const id of [
+    'hm-skills-config-save',
+    'hm-skills-creation-nudge-interval',
+    'hm-skills-external-dirs',
+  ]) {
+    assert.match(source, new RegExp(`id="${id}"`), `缺少 ${id}`)
+  }
+})
+
 test('Hermes 配置页会暴露网关流式结构化配置字段', () => {
   for (const id of [
     'hm-streaming-save',
@@ -97,6 +107,7 @@ test('Hermes 配置页新增结构化配置不会暴露翻译 key', () => {
   const keys = new Set(extractEngineKeys().filter(key => (
     key.includes('ToolGuardrails') ||
     key.includes('MemoryConfig') ||
+    key.includes('SkillsConfig') ||
     key.includes('StreamingConfig') ||
     key.includes('ExecutionLimits') ||
     key.includes('TerminalConfig')
