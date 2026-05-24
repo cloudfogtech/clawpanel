@@ -63,6 +63,17 @@ const SECURITY_DEFAULTS = {
   tirithFailOpen: true,
 }
 
+const DISPLAY_DEFAULTS = {
+  displayToolProgress: 'all',
+  displayToolProgressCommand: false,
+  displayInterimAssistantMessages: true,
+  displayRuntimeFooterEnabled: false,
+  displayRuntimeFooterFields: 'model\ncontext_pct\ncwd',
+  displayFileMutationVerifier: true,
+  displayLanguage: 'en',
+  displayResumeDisplay: 'full',
+}
+
 const HUMAN_DELAY_DEFAULTS = {
   humanDelayMode: 'off',
   humanDelayMinMs: 800,
@@ -109,6 +120,9 @@ const STREAMING_TRANSPORTS = ['edit', 'auto', 'draft', 'off']
 const CODE_EXECUTION_MODES = ['project', 'strict']
 const TERMINAL_BACKENDS = ['local', 'ssh', 'docker', 'singularity', 'modal', 'daytona', 'vercel_sandbox']
 const UNAUTHORIZED_DM_BEHAVIORS = ['pair', 'ignore']
+const DISPLAY_TOOL_PROGRESS_VALUES = ['off', 'new', 'all', 'verbose']
+const DISPLAY_LANGUAGE_VALUES = ['en', 'zh', 'zh-hant', 'ja', 'de', 'es', 'fr', 'tr', 'uk', 'af', 'ko', 'it', 'ga', 'pt', 'ru', 'hu']
+const DISPLAY_RESUME_VALUES = ['full', 'minimal']
 const HUMAN_DELAY_MODES = ['off', 'natural', 'custom']
 
 export function render() {
@@ -124,6 +138,7 @@ export function render() {
   let quickCommandsValues = { ...QUICK_COMMANDS_DEFAULTS }
   let unauthorizedDmValues = { ...UNAUTHORIZED_DM_DEFAULTS }
   let securityValues = { ...SECURITY_DEFAULTS }
+  let displayValues = { ...DISPLAY_DEFAULTS }
   let humanDelayValues = { ...HUMAN_DELAY_DEFAULTS }
   let streamingValues = { ...STREAMING_DEFAULTS }
   let executionLimitsValues = { ...EXECUTION_LIMITS_DEFAULTS }
@@ -137,6 +152,7 @@ export function render() {
   let quickCommandsLoading = true
   let unauthorizedDmLoading = true
   let securityLoading = true
+  let displayLoading = true
   let humanDelayLoading = true
   let streamingLoading = true
   let executionLimitsLoading = true
@@ -150,6 +166,7 @@ export function render() {
   let quickCommandsSaving = false
   let unauthorizedDmSaving = false
   let securitySaving = false
+  let displaySaving = false
   let humanDelaySaving = false
   let streamingSaving = false
   let executionLimitsSaving = false
@@ -163,6 +180,7 @@ export function render() {
   let quickCommandsError = null
   let unauthorizedDmError = null
   let securityError = null
+  let displayError = null
   let humanDelayError = null
   let streamingError = null
   let executionLimitsError = null
@@ -177,7 +195,7 @@ export function render() {
   }
 
   function isBusy() {
-    return loading || runtimeLoading || compressionLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || quickCommandsLoading || unauthorizedDmLoading || securityLoading || humanDelayLoading || streamingLoading || executionLimitsLoading || terminalLoading || saving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || unauthorizedDmSaving || securitySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || terminalSaving
+    return loading || runtimeLoading || compressionLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || quickCommandsLoading || unauthorizedDmLoading || securityLoading || displayLoading || humanDelayLoading || streamingLoading || executionLimitsLoading || terminalLoading || saving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || terminalSaving
   }
 
   function option(labelKey, value, selected) {
@@ -533,6 +551,70 @@ export function render() {
     `
   }
 
+  function renderDisplayConfigPanel() {
+    const disabled = loading || saving || displayLoading || displaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || unauthorizedDmSaving || securitySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || terminalSaving
+    return `
+      <div class="hm-panel hm-config-runtime-panel hm-config-display-panel">
+        <div class="hm-panel-header">
+          <div>
+            <div class="hm-panel-title">${t('engine.hermesDisplayConfigTitle')}</div>
+            <div class="hm-channel-panel-desc">${t('engine.hermesDisplayConfigDesc')}</div>
+          </div>
+          <div class="hm-panel-actions">
+            <span class="hm-muted">${displaySaving ? t('engine.hermesConfigStatusSaving') : displayLoading ? t('engine.hermesConfigStatusLoading') : t('engine.hermesDisplayConfigStatusReady')}</span>
+            <button class="hm-btn hm-btn--cta hm-btn--sm" id="hm-display-save" ${disabled ? 'disabled' : ''}>${t('engine.hermesDisplayConfigSave')}</button>
+          </div>
+        </div>
+        <div class="hm-panel-body">
+          ${renderError(displayError)}
+          <div class="hm-config-runtime-grid hm-config-display-grid">
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesDisplayConfigToolProgress')}</span>
+              <select id="hm-display-tool-progress" class="hm-input" ${disabled ? 'disabled' : ''}>
+                ${DISPLAY_TOOL_PROGRESS_VALUES.map(mode => option(`engine.hermesDisplayConfigToolProgress_${mode}`, mode, displayValues.displayToolProgress)).join('')}
+              </select>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesDisplayConfigLanguage')}</span>
+              <select id="hm-display-language" class="hm-input" ${disabled ? 'disabled' : ''}>
+                ${DISPLAY_LANGUAGE_VALUES.map(mode => option(`engine.hermesDisplayConfigLanguage_${mode}`, mode, displayValues.displayLanguage)).join('')}
+              </select>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesDisplayConfigResumeDisplay')}</span>
+              <select id="hm-display-resume-display" class="hm-input" ${disabled ? 'disabled' : ''}>
+                ${DISPLAY_RESUME_VALUES.map(mode => option(`engine.hermesDisplayConfigResumeDisplay_${mode}`, mode, displayValues.displayResumeDisplay)).join('')}
+              </select>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesDisplayConfigRuntimeFooterFields')}</span>
+              <textarea id="hm-display-runtime-footer-fields" class="hm-input" ${disabled ? 'disabled' : ''} style="min-height:96px;resize:vertical">${esc(displayValues.displayRuntimeFooterFields)}</textarea>
+            </label>
+          </div>
+          <div class="hm-config-check-grid">
+            <label class="hm-channel-check">
+              <input id="hm-display-tool-progress-command" type="checkbox" ${displayValues.displayToolProgressCommand ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesDisplayConfigToolProgressCommand')}</span>
+            </label>
+            <label class="hm-channel-check">
+              <input id="hm-display-interim-assistant-messages" type="checkbox" ${displayValues.displayInterimAssistantMessages ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesDisplayConfigInterimAssistantMessages')}</span>
+            </label>
+            <label class="hm-channel-check">
+              <input id="hm-display-runtime-footer-enabled" type="checkbox" ${displayValues.displayRuntimeFooterEnabled ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesDisplayConfigRuntimeFooterEnabled')}</span>
+            </label>
+            <label class="hm-channel-check">
+              <input id="hm-display-file-mutation-verifier" type="checkbox" ${displayValues.displayFileMutationVerifier ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesDisplayConfigFileMutationVerifier')}</span>
+            </label>
+          </div>
+          <div class="hm-channel-footnote">${t('engine.hermesDisplayConfigFootnote')}</div>
+        </div>
+      </div>
+    `
+  }
+
   function renderHumanDelayConfigPanel() {
     const disabled = loading || saving || humanDelayLoading || humanDelaySaving || runtimeSaving || compressionSaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || unauthorizedDmSaving || securitySaving || streamingSaving || executionLimitsSaving || terminalSaving
     return `
@@ -791,6 +873,7 @@ export function render() {
       ${renderQuickCommandsConfigPanel()}
       ${renderUnauthorizedDmConfigPanel()}
       ${renderSecurityConfigPanel()}
+      ${renderDisplayConfigPanel()}
       ${renderHumanDelayConfigPanel()}
 
       <div class="hm-panel">
@@ -819,6 +902,7 @@ export function render() {
     el.querySelector('#hm-quick-commands-save')?.addEventListener('click', saveQuickCommandsConfig)
     el.querySelector('#hm-unauthorized-dm-save')?.addEventListener('click', saveUnauthorizedDmConfig)
     el.querySelector('#hm-security-save')?.addEventListener('click', saveSecurityConfig)
+    el.querySelector('#hm-display-save')?.addEventListener('click', saveDisplayConfig)
     el.querySelector('#hm-human-delay-save')?.addEventListener('click', saveHumanDelayConfig)
     el.querySelector('#hm-streaming-save')?.addEventListener('click', saveStreaming)
     el.querySelector('#hm-execution-limits-save')?.addEventListener('click', saveExecutionLimits)
@@ -870,6 +954,11 @@ export function render() {
     securityValues = { ...SECURITY_DEFAULTS, ...(data?.values || {}) }
   }
 
+  async function loadDisplayConfig() {
+    const data = await api.hermesDisplayConfigRead()
+    displayValues = { ...DISPLAY_DEFAULTS, ...(data?.values || {}) }
+  }
+
   async function loadHumanDelayConfig() {
     const data = await api.hermesHumanDelayConfigRead()
     humanDelayValues = { ...HUMAN_DELAY_DEFAULTS, ...(data?.values || {}) }
@@ -900,6 +989,7 @@ export function render() {
     quickCommandsLoading = true
     unauthorizedDmLoading = true
     securityLoading = true
+    displayLoading = true
     humanDelayLoading = true
     streamingLoading = true
     executionLimitsLoading = true
@@ -913,6 +1003,7 @@ export function render() {
     quickCommandsError = null
     unauthorizedDmError = null
     securityError = null
+    displayError = null
     humanDelayError = null
     streamingError = null
     executionLimitsError = null
@@ -1014,6 +1105,14 @@ export function render() {
       draw()
     }
     try {
+      await loadDisplayConfig()
+    } catch (err) {
+      displayError = humanizeError(err, t('engine.hermesDisplayConfigLoadFailed') || 'Load display config failed')
+    } finally {
+      displayLoading = false
+      draw()
+    }
+    try {
       await loadHumanDelayConfig()
     } catch (err) {
       humanDelayError = humanizeError(err, t('engine.hermesHumanDelayConfigLoadFailed') || 'Load human delay config failed')
@@ -1065,6 +1164,9 @@ export function render() {
       } catch {}
       try {
         await loadSecurityConfig()
+      } catch {}
+      try {
+        await loadDisplayConfig()
       } catch {}
       try {
         await loadHumanDelayConfig()
@@ -1308,6 +1410,38 @@ export function render() {
       toast(securityError, 'error')
     } finally {
       securitySaving = false
+      draw()
+    }
+  }
+
+  async function saveDisplayConfig() {
+    const form = {
+      displayToolProgress: el.querySelector('#hm-display-tool-progress')?.value || 'all',
+      displayToolProgressCommand: !!el.querySelector('#hm-display-tool-progress-command')?.checked,
+      displayInterimAssistantMessages: !!el.querySelector('#hm-display-interim-assistant-messages')?.checked,
+      displayRuntimeFooterEnabled: !!el.querySelector('#hm-display-runtime-footer-enabled')?.checked,
+      displayRuntimeFooterFields: el.querySelector('#hm-display-runtime-footer-fields')?.value || 'model\ncontext_pct\ncwd',
+      displayFileMutationVerifier: !!el.querySelector('#hm-display-file-mutation-verifier')?.checked,
+      displayLanguage: el.querySelector('#hm-display-language')?.value || 'en',
+      displayResumeDisplay: el.querySelector('#hm-display-resume-display')?.value || 'full',
+    }
+    displaySaving = true
+    displayError = null
+    draw()
+    try {
+      const result = await api.hermesDisplayConfigSave(form)
+      displayValues = { ...DISPLAY_DEFAULTS, ...(result?.values || form) }
+      await refreshRawAfterStructuredSave()
+      const backup = result?.backup || ''
+      toast({
+        message: t('engine.hermesDisplayConfigSaveSuccess'),
+        hint: backup ? t('engine.hermesConfigBackupHint', { path: backup }) : '',
+      }, 'success')
+    } catch (err) {
+      displayError = humanizeError(err, t('engine.hermesDisplayConfigSaveFailed') || 'Save display config failed')
+      toast(displayError, 'error')
+    } finally {
+      displaySaving = false
       draw()
     }
   }

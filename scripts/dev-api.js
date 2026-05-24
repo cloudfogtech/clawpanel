@@ -3326,6 +3326,9 @@ const HERMES_CODE_EXECUTION_MODES = new Set(['project', 'strict'])
 const HERMES_TERMINAL_BACKENDS = new Set(['local', 'ssh', 'docker', 'singularity', 'modal', 'daytona', 'vercel_sandbox'])
 const HERMES_DISPLAY_TOOL_PROGRESS_VALUES = new Set(['off', 'new', 'all', 'verbose'])
 const HERMES_DISPLAY_STREAMING_VALUES = new Set(['inherit', 'true', 'false'])
+const HERMES_DISPLAY_RESUME_VALUES = new Set(['full', 'minimal'])
+const HERMES_DISPLAY_LANGUAGE_VALUES = new Set(['en', 'zh', 'zh-hant', 'ja', 'de', 'es', 'fr', 'tr', 'uk', 'af', 'ko', 'it', 'ga', 'pt', 'ru', 'hu'])
+const HERMES_RUNTIME_FOOTER_FIELDS = new Set(['model', 'context_pct', 'cwd', 'duration', 'tokens', 'cost'])
 
 function parseHermesInteger(value, key, fallback, min, max, strict = false) {
   const raw = String(value ?? '').trim()
@@ -3413,6 +3416,34 @@ function normalizeHermesDisplayStreaming(value, strict = false, key = 'display.s
   return 'inherit'
 }
 
+function normalizeHermesDisplayResume(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'full'
+  if (HERMES_DISPLAY_RESUME_VALUES.has(mode)) return mode
+  if (strict) throw new Error('display.resume_display 必须是 full 或 minimal')
+  return 'full'
+}
+
+function normalizeHermesDisplayLanguage(value, strict = false) {
+  const language = String(value ?? '').trim().toLowerCase() || 'en'
+  if (HERMES_DISPLAY_LANGUAGE_VALUES.has(language)) return language
+  if (strict) throw new Error('display.language 不在支持列表中')
+  return 'en'
+}
+
+function normalizeHermesRuntimeFooterFields(value, strict = false) {
+  const items = Array.isArray(value)
+    ? value
+    : String(value ?? '').split(/\r?\n|,/)
+  const normalized = [...new Set(items.map(item => String(item ?? '').trim()).filter(Boolean))]
+  if (!normalized.length) return ['model', 'context_pct', 'cwd']
+  const invalid = normalized.find(item => !HERMES_RUNTIME_FOOTER_FIELDS.has(item))
+  if (invalid) {
+    if (strict) throw new Error(`display.runtime_footer.fields 包含不支持的字段: ${invalid}`)
+    return ['model', 'context_pct', 'cwd']
+  }
+  return normalized
+}
+
 function hermesDisplayConfigParts(config = {}, platform = '') {
   const display = config?.display && typeof config.display === 'object' && !Array.isArray(config.display)
     ? config.display
@@ -3424,6 +3455,49 @@ function hermesDisplayConfigParts(config = {}, platform = '') {
     ? platforms[platform]
     : {}
   return { display, platformDisplay }
+}
+
+export function buildHermesDisplayConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const display = root.display && typeof root.display === 'object' && !Array.isArray(root.display)
+    ? root.display
+    : {}
+  const runtimeFooter = display.runtime_footer && typeof display.runtime_footer === 'object' && !Array.isArray(display.runtime_footer)
+    ? display.runtime_footer
+    : {}
+  return {
+    displayToolProgress: normalizeHermesDisplayToolProgress(display.tool_progress, false),
+    displayToolProgressCommand: readHermesBool(display.tool_progress_command, false),
+    displayInterimAssistantMessages: readHermesBool(display.interim_assistant_messages, true),
+    displayRuntimeFooterEnabled: readHermesBool(runtimeFooter.enabled, false),
+    displayRuntimeFooterFields: normalizeHermesRuntimeFooterFields(runtimeFooter.fields, false).join('\n'),
+    displayFileMutationVerifier: readHermesBool(display.file_mutation_verifier, true),
+    displayLanguage: normalizeHermesDisplayLanguage(display.language, false),
+    displayResumeDisplay: normalizeHermesDisplayResume(display.resume_display, false),
+  }
+}
+
+export function mergeHermesDisplayConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesDisplayConfigValues(next)
+  const display = next.display && typeof next.display === 'object' && !Array.isArray(next.display)
+    ? mergeConfigsPreservingFields(next.display, {})
+    : {}
+  const runtimeFooter = display.runtime_footer && typeof display.runtime_footer === 'object' && !Array.isArray(display.runtime_footer)
+    ? mergeConfigsPreservingFields(display.runtime_footer, {})
+    : {}
+
+  display.tool_progress = normalizeHermesDisplayToolProgress(Object.hasOwn(form, 'displayToolProgress') ? form.displayToolProgress : currentValues.displayToolProgress, true, 'display.tool_progress')
+  display.tool_progress_command = formHermesBool(form, 'displayToolProgressCommand', currentValues.displayToolProgressCommand)
+  display.interim_assistant_messages = formHermesBool(form, 'displayInterimAssistantMessages', currentValues.displayInterimAssistantMessages)
+  runtimeFooter.enabled = formHermesBool(form, 'displayRuntimeFooterEnabled', currentValues.displayRuntimeFooterEnabled)
+  runtimeFooter.fields = normalizeHermesRuntimeFooterFields(Object.hasOwn(form, 'displayRuntimeFooterFields') ? form.displayRuntimeFooterFields : currentValues.displayRuntimeFooterFields, true)
+  display.runtime_footer = runtimeFooter
+  display.file_mutation_verifier = formHermesBool(form, 'displayFileMutationVerifier', currentValues.displayFileMutationVerifier)
+  display.language = normalizeHermesDisplayLanguage(Object.hasOwn(form, 'displayLanguage') ? form.displayLanguage : currentValues.displayLanguage, true)
+  display.resume_display = normalizeHermesDisplayResume(Object.hasOwn(form, 'displayResumeDisplay') ? form.displayResumeDisplay : currentValues.displayResumeDisplay, true)
+  next.display = display
+  return next
 }
 
 function putHermesChannelDisplayFields(form, config, platform) {
@@ -10335,6 +10409,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesHumanDelayConfigValues(next),
+    }
+  },
+
+  hermes_display_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesDisplayConfigValues(config),
+    }
+  },
+
+  hermes_display_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesDisplayConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesDisplayConfigValues(next),
     }
   },
 

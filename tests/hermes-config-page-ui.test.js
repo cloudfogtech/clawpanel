@@ -90,6 +90,22 @@ test('Hermes 配置页会暴露响应节奏结构化配置字段', () => {
   }
 })
 
+test('Hermes 配置页会暴露全局显示与可靠性结构化配置字段', () => {
+  for (const id of [
+    'hm-display-save',
+    'hm-display-tool-progress',
+    'hm-display-tool-progress-command',
+    'hm-display-interim-assistant-messages',
+    'hm-display-runtime-footer-enabled',
+    'hm-display-runtime-footer-fields',
+    'hm-display-file-mutation-verifier',
+    'hm-display-language',
+    'hm-display-resume-display',
+  ]) {
+    assert.match(source, new RegExp(`id="${id}"`), `缺少 ${id}`)
+  }
+})
+
 test('Hermes 配置页会暴露网关流式结构化配置字段', () => {
   for (const id of [
     'hm-streaming-save',
@@ -153,6 +169,7 @@ test('Hermes 配置页新增结构化配置不会暴露翻译 key', () => {
     key.includes('UnauthorizedDmConfig') ||
     key.includes('SecurityConfig') ||
     key.includes('HumanDelayConfig') ||
+    key.includes('DisplayConfig') ||
     key.includes('StreamingConfig') ||
     key.includes('ExecutionLimits') ||
     key.includes('TerminalConfig')

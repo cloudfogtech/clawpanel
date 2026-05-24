@@ -4004,6 +4004,263 @@ fn normalize_hermes_human_delay_mode(
     }
 }
 
+const HERMES_DISPLAY_LANGUAGE_VALUES: &[&str] = &[
+    "en", "zh", "zh-hant", "ja", "de", "es", "fr", "tr", "uk", "af", "ko", "it", "ga", "pt", "ru",
+    "hu",
+];
+
+const HERMES_RUNTIME_FOOTER_FIELDS: &[&str] =
+    &["model", "context_pct", "cwd", "duration", "tokens", "cost"];
+
+fn normalize_hermes_display_language(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let language = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let language = if language.is_empty() {
+        "en".to_string()
+    } else {
+        language
+    };
+    if HERMES_DISPLAY_LANGUAGE_VALUES.contains(&language.as_str()) {
+        Ok(language)
+    } else if strict {
+        Err("display.language 不在支持列表中".to_string())
+    } else {
+        Ok("en".to_string())
+    }
+}
+
+fn normalize_hermes_display_resume(value: Option<String>, strict: bool) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "full".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "full" | "minimal") {
+        Ok(mode)
+    } else if strict {
+        Err("display.resume_display 必须是 full 或 minimal".to_string())
+    } else {
+        Ok("full".to_string())
+    }
+}
+
+fn normalize_hermes_runtime_footer_fields_text(
+    value: Option<String>,
+    strict: bool,
+) -> Result<Vec<String>, String> {
+    let fields = match value {
+        Some(value) => {
+            let text = value.trim().to_string();
+            if text.contains('\n') || text.contains(',') {
+                text.split(['\n', ','])
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            } else if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text]
+            }
+        }
+        None => Vec::new(),
+    };
+    let fields = if fields.is_empty() {
+        vec![
+            "model".to_string(),
+            "context_pct".to_string(),
+            "cwd".to_string(),
+        ]
+    } else {
+        fields
+    };
+    if let Some(invalid) = fields
+        .iter()
+        .find(|item| !HERMES_RUNTIME_FOOTER_FIELDS.contains(&item.as_str()))
+    {
+        if strict {
+            return Err(format!(
+                "display.runtime_footer.fields 包含不支持的字段: {invalid}"
+            ));
+        }
+        return Ok(vec![
+            "model".to_string(),
+            "context_pct".to_string(),
+            "cwd".to_string(),
+        ]);
+    }
+    Ok(fields)
+}
+
+fn normalize_hermes_runtime_footer_fields(
+    value: Option<&serde_yaml::Value>,
+    strict: bool,
+) -> Result<Vec<String>, String> {
+    let fields = match value {
+        Some(serde_yaml::Value::Sequence(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::trim))
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        Some(serde_yaml::Value::String(text)) => text
+            .split(['\n', ','])
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    normalize_hermes_runtime_footer_fields_text(
+        if fields.is_empty() {
+            None
+        } else {
+            Some(fields.join("\n"))
+        },
+        strict,
+    )
+}
+
+fn build_hermes_display_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let display = root.and_then(|map| yaml_get_mapping(map, "display"));
+    let runtime_footer = display.and_then(|map| yaml_get_mapping(map, "runtime_footer"));
+    let runtime_footer_fields = normalize_hermes_runtime_footer_fields(
+        runtime_footer.and_then(|map| yaml_get(map, "fields")),
+        false,
+    )
+    .unwrap_or_else(|_| {
+        vec![
+            "model".to_string(),
+            "context_pct".to_string(),
+            "cwd".to_string(),
+        ]
+    });
+
+    serde_json::json!({
+        "displayToolProgress": normalize_hermes_display_tool_progress(
+            display.and_then(|map| yaml_string_field(map, "tool_progress")),
+            false,
+            "display.tool_progress",
+        ).unwrap_or_else(|_| "all".to_string()),
+        "displayToolProgressCommand": display.and_then(|map| yaml_bool_field(map, "tool_progress_command")).unwrap_or(false),
+        "displayInterimAssistantMessages": display.and_then(|map| yaml_bool_field(map, "interim_assistant_messages")).unwrap_or(true),
+        "displayRuntimeFooterEnabled": runtime_footer.and_then(|map| yaml_bool_field(map, "enabled")).unwrap_or(false),
+        "displayRuntimeFooterFields": runtime_footer_fields.join("\n"),
+        "displayFileMutationVerifier": display.and_then(|map| yaml_bool_field(map, "file_mutation_verifier")).unwrap_or(true),
+        "displayLanguage": normalize_hermes_display_language(
+            display.and_then(|map| yaml_string_field(map, "language")),
+            false,
+        ).unwrap_or_else(|_| "en".to_string()),
+        "displayResumeDisplay": normalize_hermes_display_resume(
+            display.and_then(|map| yaml_string_field(map, "resume_display")),
+            false,
+        ).unwrap_or_else(|_| "full".to_string()),
+    })
+}
+
+fn merge_hermes_display_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_display_config_values(config);
+    let tool_progress = normalize_hermes_display_tool_progress(
+        form_string(form, "displayToolProgress").or_else(|| {
+            current["displayToolProgress"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        true,
+        "display.tool_progress",
+    )?;
+    let runtime_footer_fields = normalize_hermes_runtime_footer_fields_text(
+        form.get("displayRuntimeFooterFields")
+            .and_then(|value| value.as_str().map(ToString::to_string))
+            .or_else(|| {
+                current["displayRuntimeFooterFields"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+        true,
+    )?;
+
+    let display = yaml_child_object(ensure_yaml_object(config)?, "display")?;
+    display.insert(
+        yaml_key("tool_progress"),
+        serde_yaml::Value::String(tool_progress),
+    );
+    display.insert(
+        yaml_key("tool_progress_command"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayToolProgressCommand").unwrap_or_else(|| {
+                current["displayToolProgressCommand"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+        ),
+    );
+    display.insert(
+        yaml_key("interim_assistant_messages"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayInterimAssistantMessages").unwrap_or_else(|| {
+                current["displayInterimAssistantMessages"]
+                    .as_bool()
+                    .unwrap_or(true)
+            }),
+        ),
+    );
+    display.insert(
+        yaml_key("file_mutation_verifier"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayFileMutationVerifier").unwrap_or_else(|| {
+                current["displayFileMutationVerifier"]
+                    .as_bool()
+                    .unwrap_or(true)
+            }),
+        ),
+    );
+    display.insert(
+        yaml_key("language"),
+        serde_yaml::Value::String(normalize_hermes_display_language(
+            form_string(form, "displayLanguage")
+                .or_else(|| current["displayLanguage"].as_str().map(ToString::to_string)),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("resume_display"),
+        serde_yaml::Value::String(normalize_hermes_display_resume(
+            form_string(form, "displayResumeDisplay").or_else(|| {
+                current["displayResumeDisplay"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+            true,
+        )?),
+    );
+    let runtime_footer = yaml_child_object(display, "runtime_footer")?;
+    runtime_footer.insert(
+        yaml_key("enabled"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayRuntimeFooterEnabled").unwrap_or_else(|| {
+                current["displayRuntimeFooterEnabled"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+        ),
+    );
+    runtime_footer.insert(
+        yaml_key("fields"),
+        serde_yaml::Value::Sequence(
+            runtime_footer_fields
+                .into_iter()
+                .map(serde_yaml::Value::String)
+                .collect(),
+        ),
+    );
+    Ok(())
+}
+
 fn build_hermes_human_delay_config_values(config: &serde_yaml::Value) -> Value {
     let root = config.as_mapping();
     let human_delay = root.and_then(|map| yaml_get_mapping(map, "human_delay"));
@@ -5633,6 +5890,29 @@ pub fn hermes_security_config_save(form: Value) -> Result<Value, String> {
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_security_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_display_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_display_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_display_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_display_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_display_config_values(&config),
     }))
 }
 
@@ -11841,6 +12121,169 @@ memory:
         )
         .unwrap_err();
         assert!(err.contains("human_delay.max_ms"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_display_config_tests {
+    use super::{build_hermes_display_config_values, merge_hermes_display_config};
+    use serde_json::json;
+
+    #[test]
+    fn display_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_display_config_values(&config);
+        assert_eq!(values["displayToolProgress"], "all");
+        assert_eq!(values["displayToolProgressCommand"], false);
+        assert_eq!(values["displayInterimAssistantMessages"], true);
+        assert_eq!(values["displayRuntimeFooterEnabled"], false);
+        assert_eq!(
+            values["displayRuntimeFooterFields"],
+            "model\ncontext_pct\ncwd"
+        );
+        assert_eq!(values["displayFileMutationVerifier"], true);
+        assert_eq!(values["displayLanguage"], "en");
+        assert_eq!(values["displayResumeDisplay"], "full");
+    }
+
+    #[test]
+    fn display_values_normalize_existing_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+display:
+  tool_progress: VERBOSE
+  tool_progress_command: true
+  interim_assistant_messages: false
+  runtime_footer:
+    enabled: true
+    fields:
+      - model
+      - duration
+      - cost
+  file_mutation_verifier: false
+  language: ZH
+  resume_display: minimal
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_display_config_values(&config);
+        assert_eq!(values["displayToolProgress"], "verbose");
+        assert_eq!(values["displayToolProgressCommand"], true);
+        assert_eq!(values["displayInterimAssistantMessages"], false);
+        assert_eq!(values["displayRuntimeFooterEnabled"], true);
+        assert_eq!(
+            values["displayRuntimeFooterFields"],
+            "model\nduration\ncost"
+        );
+        assert_eq!(values["displayFileMutationVerifier"], false);
+        assert_eq!(values["displayLanguage"], "zh");
+        assert_eq!(values["displayResumeDisplay"], "minimal");
+    }
+
+    #[test]
+    fn merge_display_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+display:
+  skin: midnight
+  runtime_footer:
+    enabled: false
+    custom_flag: keep-footer
+  platforms:
+    telegram:
+      tool_progress: new
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_display_config(
+            &mut config,
+            &json!({
+                "displayToolProgress": "off",
+                "displayToolProgressCommand": true,
+                "displayInterimAssistantMessages": false,
+                "displayRuntimeFooterEnabled": true,
+                "displayRuntimeFooterFields": "model\ncontext_pct\nduration",
+                "displayFileMutationVerifier": true,
+                "displayLanguage": "zh-hant",
+                "displayResumeDisplay": "minimal",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(config["display"]["skin"].as_str(), Some("midnight"));
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["tool_progress"].as_str(),
+            Some("new")
+        );
+        assert_eq!(config["display"]["tool_progress"].as_str(), Some("off"));
+        assert_eq!(
+            config["display"]["tool_progress_command"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["display"]["interim_assistant_messages"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["display"]["runtime_footer"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["display"]["runtime_footer"]["custom_flag"].as_str(),
+            Some("keep-footer")
+        );
+        assert_eq!(
+            config["display"]["runtime_footer"]["fields"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model", "context_pct", "duration"]
+        );
+        assert_eq!(
+            config["display"]["file_mutation_verifier"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(config["display"]["language"].as_str(), Some("zh-hant"));
+        assert_eq!(
+            config["display"]["resume_display"].as_str(),
+            Some("minimal")
+        );
+    }
+
+    #[test]
+    fn merge_display_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayToolProgress": "everything" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.tool_progress"));
+
+        let err =
+            merge_hermes_display_config(&mut config, &json!({ "displayResumeDisplay": "compact" }))
+                .unwrap_err();
+        assert!(err.contains("display.resume_display"));
+
+        let err = merge_hermes_display_config(&mut config, &json!({ "displayLanguage": "cn" }))
+            .unwrap_err();
+        assert!(err.contains("display.language"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayRuntimeFooterFields": "model\npassword" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.runtime_footer.fields"));
     }
 }
 
