@@ -2,7 +2,7 @@
  * 关于页面
  * 版本信息、项目链接、相关项目、系统环境
  */
-import { api } from '../lib/tauri-api.js'
+import { api, safeTauriListen } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
 import { showUpgradeModal, showConfirm, showContentModal } from '../components/modal.js'
 import { setUpgrading } from '../lib/app-state.js'
@@ -154,8 +154,7 @@ async function loadHermesData(page) {
           ${!installed ? `<a class="btn btn-primary btn-sm" href="#/h/setup" style="${btnSm}">${t('about.hermesSetup')}</a>` : ''}
           ${installed ? `
             <button class="btn btn-secondary btn-sm" id="btn-hermes-config" style="${btnSm}">${t('about.hermesConfig')}</button>
-            <button class="btn btn-secondary btn-sm" id="btn-hermes-upgrade" style="${btnSm}">${t('about.hermesUpgrade')}</button>
-            <button class="btn btn-danger btn-sm" id="btn-hermes-uninstall" style="${btnSm}">${t('about.hermesUninstall')}</button>
+            <button class="btn btn-primary btn-sm" id="btn-hermes-services" style="${btnSm}">${t('engine.hermesServicesTitle')}</button>
           ` : ''}
         </div>
       </div>
@@ -198,6 +197,10 @@ async function loadHermesData(page) {
         }
       })
 
+      cards.querySelector('#btn-hermes-services')?.addEventListener('click', () => {
+        window.location.hash = '#/h/services'
+      })
+
       // --- 升级模态框（带实时日志） ---
       cards.querySelector('#btn-hermes-upgrade')?.addEventListener('click', async () => {
         const confirmed = await showConfirm(t('about.hermesUpgradeConfirm'))
@@ -214,8 +217,7 @@ async function loadHermesData(page) {
 
         let unlisten = null
         try {
-          const { listen } = await import('@tauri-apps/api/event')
-          unlisten = await listen('hermes-install-log', (e) => {
+          unlisten = await safeTauriListen('hermes-install-log', (e) => {
             modal.appendLog(String(e.payload))
           })
         } catch (_) {}
@@ -313,7 +315,8 @@ async function loadData(page) {
                  <button class="btn btn-primary btn-sm" id="btn-apply-recommended" style="${btnSm}">${t('about.switchToRecommended')}</button>`
               : `<span style="color:var(--success)">${t('about.isRecommended')}</span>`)
             : ''}
-          ${version.latest_update_available && version.latest ? `<span style="color:var(--text-tertiary)">${t('about.latestUpstream', { ver: version.latest })}</span>` : ''}
+          ${version.latest_update_available && version.latest ? `<span style="color:var(--text-tertiary)">${t('about.latestUpstream', { ver: version.latest })}</span>
+             <button class="btn btn-primary btn-sm" id="btn-apply-latest" style="${btnSm}">${t('about.switchToLatest')}</button>` : ''}
           <button class="btn btn-${isInstalled ? 'secondary' : 'primary'} btn-sm" id="btn-version-mgmt" style="${btnSm}">
             ${isInstalled ? t('about.switchVersion') : t('about.installOpenclaw')}
           </button>
@@ -333,6 +336,10 @@ async function loadData(page) {
     const applyRecommendedBtn = cards.querySelector('#btn-apply-recommended')
     if (applyRecommendedBtn && version.recommended) {
       applyRecommendedBtn.onclick = () => doInstall(page, aheadOfRecommended ? t('about.rollbackToRecommendedStable') : t('about.switchToRecommendedStable'), version.source, version.recommended)
+    }
+    const applyLatestBtn = cards.querySelector('#btn-apply-latest')
+    if (applyLatestBtn && version.latest) {
+      applyLatestBtn.onclick = () => doInstall(page, t('about.switchToLatestVersion'), version.source, version.latest)
     }
 
     // 版本管理 / 安装

@@ -9,6 +9,8 @@
  */
 import { api } from '../../../lib/tauri-api.js'
 import { toast } from '../../../components/toast.js'
+import { showConfirm } from '../../../components/modal.js'
+import { humanizeError } from '../../../lib/humanize-error.js'
 
 // NOTE: i18n keys for this page are not yet wired up in src/locales; using
 // inline Chinese copy (with occasional English fallback) for now. When the
@@ -214,7 +216,7 @@ export function render() {
           row.revealed = true
           renderList()
         } catch (err) {
-          toast(String(err).replace(/^Error:\s*/, ''), 'error')
+          toast(humanizeError(err, '读取失败'), 'error')
         }
       })
       rowEl.querySelector('.env-cancel-btn')?.addEventListener('click', () => {
@@ -249,18 +251,23 @@ export function render() {
           toast('已保存', 'success')
           renderList()
         } catch (err) {
-          toast(String(err).replace(/^Error:\s*/, ''), 'error')
+          toast(humanizeError(err, '保存失败'), 'error')
         }
       })
       rowEl.querySelector('.env-delete-btn')?.addEventListener('click', async () => {
-        if (!confirm(`确定删除 ${row.key} 吗？`)) return
+        const ok = await showConfirm({
+          message: `确定删除 ${row.key} 吗？`,
+          confirmText: '删除',
+          variant: 'danger',
+        })
+        if (!ok) return
         try {
           await api.hermesEnvDelete(row.key)
           rows.splice(idx, 1)
           toast('已删除', 'success')
           renderList()
         } catch (err) {
-          toast(String(err).replace(/^Error:\s*/, ''), 'error')
+          toast(humanizeError(err, '删除失败'), 'error')
         }
       })
     })
@@ -282,7 +289,7 @@ export function render() {
         isNew: false,
       }))
     } catch (err) {
-      loadError = String(err).replace(/^Error:\s*/, '')
+      loadError = humanizeError(err, '加载失败')
       const errEl = el.querySelector('#env-error')
       if (errEl) {
         errEl.textContent = loadError

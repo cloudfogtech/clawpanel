@@ -1,17 +1,21 @@
 /**
  * 仪表盘页面
  */
-import { api } from '../lib/tauri-api.js'
+import { api, invalidate } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
+import { humanizeError } from '../lib/humanize-error.js'
 import { getActiveInstance, onGatewayChange } from '../lib/app-state.js'
 import { isForeignGatewayError, isForeignGatewayService, maybeShowForeignGatewayBindingPrompt, showGatewayConflictGuidance, showInstallationCleanup } from '../lib/gateway-ownership.js'
 import { navigate } from '../router.js'
 import { t } from '../lib/i18n.js'
 import { wsClient } from '../lib/ws-client.js'
+import { attachCliConflictBanner } from '../components/cli-conflict-banner.js'
+import { icon } from '../lib/icons.js'
 
 let _unsubGw = null
-let _loadInFlight = false
+let _dashboardLoadChain = Promise.resolve()
 let _lastGwChangeLoad = 0
+let _detachCliConflict = null
 
 export async function render() {
   const page = document.createElement('div')
@@ -22,6 +26,8 @@ export async function render() {
       <h1 class="page-title">${t('dashboard.title')}</h1>
       <p class="page-desc">${t('dashboard.desc')}</p>
     </div>
+    <div id="cli-conflict-mount"></div>
+    <div id="onboarding-mount"></div>
     <div class="stat-cards" id="stat-cards">
       <div class="stat-card loading-placeholder"></div>
       <div class="stat-card loading-placeholder"></div>
@@ -35,6 +41,7 @@ export async function render() {
       <button class="btn btn-secondary" id="btn-restart-gw">${t('dashboard.restartGw')}</button>
       <button class="btn btn-secondary" id="btn-check-update">${t('dashboard.checkUpdate')}</button>
       <button class="btn btn-secondary" id="btn-create-backup">${t('dashboard.createBackup')}</button>
+      <button class="btn btn-ghost" id="btn-open-glossary">${icon('scroll', 16)} ${t('glossary.title')}</button>
     </div>
     <div class="config-section">
       <div class="config-section-title">${t('dashboard.recentLogs')}</div>
@@ -45,6 +52,13 @@ export async function render() {
   // 绑定事件（只绑一次）
   bindActions(page)
 
+  // 挂载 CLI 冲突检测横幅（异步扫描 PATH，发现非 standalone 的 openclaw 时显示）
+  const cliConflictMount = page.querySelector('#cli-conflict-mount')
+  if (cliConflictMount) {
+    if (_detachCliConflict) { try { _detachCliConflict() } catch (_) {} }
+    _detachCliConflict = attachCliConflictBanner(cliConflictMount)
+  }
+
   // 异步加载数据
   loadDashboardData(page).catch(e => {
     console.error('[dashboard] loadDashboardData 异常:', e)
@@ -53,6 +67,14 @@ export async function render() {
       cardsEl.innerHTML = `<div class="stat-card" style="grid-column:1/-1;text-align:center;color:var(--text-secondary)"><div>${t('common.loadFailed')}: ${escapeHtml(String(e?.message || e))}</div><button class="btn btn-sm btn-secondary" style="margin-top:8px" onclick="this.closest('.page')&&this.closest('.page').__retryLoad?.()">${t('dashboard.retry')}</button></div>`
     }
   })
+  setTimeout(() => {
+    const cardsEl = page.querySelector('#stat-cards')
+    if (cardsEl && cardsEl.querySelector('.loading-placeholder')) {
+      console.warn('[dashboard] first paint fallback: dashboard APIs are still pending')
+      renderStatCards(page, [], _dashboardVersionCache || {}, [], null, null)
+      renderLogs(page, '')
+    }
+  }, 1200)
   page.__retryLoad = () => loadDashboardData(page).catch(() => {})
 
   // 监听 Gateway 状态变化，节流刷新仪表盘（至少间隔 5 秒，防止状态抖动导致 UI 闪烁）
@@ -69,6 +91,7 @@ export async function render() {
 
 export function cleanup() {
   if (_unsubGw) { _unsubGw(); _unsubGw = null }
+  if (_detachCliConflict) { try { _detachCliConflict() } catch (_) {} _detachCliConflict = null }
 }
 
 function openclawInstallationIdentity(installation) {
@@ -96,10 +119,27 @@ function dedupeOpenclawInstallations(list = []) {
   return [...map.values()]
 }
 
+function isCliMissingError(err) {
+  const message = String(err?.message || err || '')
+  return message.includes('openclaw CLI 未安装') || message.includes('CLI 未安装')
+}
+
+async function handleGatewayStartError(page, err, fallbackText) {
+  if (isForeignGatewayError(err)) {
+    await openGatewayConflict(page, err)
+    return
+  }
+  toast(humanizeError(err, fallbackText), isCliMissingError(err) ? 'warning' : 'error')
+  if (isCliMissingError(err)) {
+    await showInstallationCleanup({ onRefresh: () => loadDashboardData(page, true) })
+  }
+}
+
 let _dashboardInitialized = false
 let _dashboardVersionCache = null
 let _dashboardStatusSummaryCache = null
 let _dashboardInstanceId = ''
+let _dashboardLoadSeq = 0
 
 function syncDashboardInstanceScope() {
   const instanceId = getActiveInstance()?.id || 'local'
@@ -111,52 +151,117 @@ function syncDashboardInstanceScope() {
   _dashboardInstanceId = instanceId
 }
 
-async function loadDashboardData(page, fullRefresh = false) {
-  // 并发保护：如果上一次加载仍在进行，跳过本次（fullRefresh 除外）
-  if (_loadInFlight && !fullRefresh) return
-  _loadInFlight = true
-  try { await _loadDashboardDataInner(page, fullRefresh) } finally { _loadInFlight = false }
+function versionInfoIncomplete(version) {
+  return !version || !version.current || !version.source || version.source === 'unknown'
 }
 
-async function _loadDashboardDataInner(page, fullRefresh) {
+function collectConfigModels(config) {
+  const result = []
+  const providers = config?.models?.providers || {}
+  for (const [providerKey, provider] of Object.entries(providers)) {
+    for (const model of (provider?.models || [])) {
+      const id = typeof model === 'string' ? model : model?.id
+      if (id) result.push(`${providerKey}/${id}`)
+    }
+  }
+  return result
+}
+
+function defaultModelNeedsNormalization(config) {
+  const validModels = new Set(collectConfigModels(config))
+  const modelConfig = config?.agents?.defaults?.model || {}
+  const primary = modelConfig.primary || ''
+  const fallbacks = Array.isArray(modelConfig.fallbacks) ? modelConfig.fallbacks : []
+  if (!validModels.size) return !!primary || fallbacks.length > 0 || Object.keys(config?.agents?.defaults?.models || {}).length > 0
+  if (!validModels.has(primary)) return true
+  if (fallbacks.some(f => f === primary || !validModels.has(f))) return true
+  return Object.keys(config?.agents?.defaults?.models || {}).some(key => !validModels.has(key))
+}
+
+function normalizeDefaultModelConfig(config) {
+  const allModels = collectConfigModels(config)
+  const validModels = new Set(allModels)
+  if (!config.agents) config.agents = {}
+  if (!config.agents.defaults) config.agents.defaults = {}
+  if (!config.agents.defaults.model) config.agents.defaults.model = {}
+  const modelConfig = config.agents.defaults.model
+  if (!Array.isArray(modelConfig.fallbacks)) modelConfig.fallbacks = []
+  if (!allModels.length) {
+    modelConfig.primary = ''
+    modelConfig.fallbacks = []
+    config.agents.defaults.models = {}
+    return ''
+  }
+  if (!validModels.has(modelConfig.primary || '')) {
+    modelConfig.primary = modelConfig.fallbacks.find(f => validModels.has(f)) || allModels[0]
+  }
+  const seen = new Set([modelConfig.primary])
+  modelConfig.fallbacks = modelConfig.fallbacks
+    .filter(f => validModels.has(f))
+    .filter(f => {
+      if (seen.has(f)) return false
+      seen.add(f)
+      return true
+    })
+  const currentMap = config.agents.defaults.models && typeof config.agents.defaults.models === 'object' && !Array.isArray(config.agents.defaults.models) ? config.agents.defaults.models : {}
+  const nextMap = {}
+  nextMap[modelConfig.primary] = currentMap[modelConfig.primary] && typeof currentMap[modelConfig.primary] === 'object' && !Array.isArray(currentMap[modelConfig.primary]) ? currentMap[modelConfig.primary] : {}
+  for (const fallback of modelConfig.fallbacks) {
+    nextMap[fallback] = currentMap[fallback] && typeof currentMap[fallback] === 'object' && !Array.isArray(currentMap[fallback]) ? currentMap[fallback] : {}
+  }
+  for (const [key, value] of Object.entries(currentMap)) {
+    if (validModels.has(key) && !nextMap[key]) {
+      nextMap[key] = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+    }
+  }
+  config.agents.defaults.models = nextMap
+  return modelConfig.primary
+}
+
+async function loadDashboardData(page, fullRefresh = false) {
+  // 并发保护：如果上一次加载仍在进行，跳过本次（fullRefresh 除外）
+  const loadSeq = ++_dashboardLoadSeq
+  _dashboardLoadChain = _dashboardLoadChain.catch(() => {}).then(() => _loadDashboardDataInner(page, fullRefresh, loadSeq))
+  return _dashboardLoadChain
+}
+
+async function _loadDashboardDataInner(page, fullRefresh, loadSeq) {
   syncDashboardInstanceScope()
   // 分波加载：关键数据先渲染，次要数据后填充，减少白屏等待
   // 轻量调用（读文件）每次都做；重量调用（spawn CLI/网络请求）只在首次或手动刷新时做
   const withTimeout = (promise, ms) => Promise.race([
     promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`超时(${ms/1000}s)`)), ms))
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out after ${(ms/1000).toFixed(1)}s`)), ms))
   ])
+  const shouldFetchVersion = !_dashboardInitialized || fullRefresh || !_dashboardVersionCache || versionInfoIncomplete(_dashboardVersionCache)
+  if (shouldFetchVersion && (fullRefresh || versionInfoIncomplete(_dashboardVersionCache))) {
+    invalidate('get_version_info')
+  }
   // 每个请求独立超时：避免单个慢请求拖垮整体渲染
   const coreP = Promise.allSettled([
-    withTimeout(api.getServicesStatus(), 12000),
-    withTimeout(api.readOpenclawConfig(), 5000),
-    // 版本信息：首次加载或手动刷新时才查询（避免 ARM 设备上频繁查 npm registry）
-    (!_dashboardInitialized || fullRefresh || !_dashboardVersionCache) ? withTimeout(api.getVersionInfo(), 8000) : Promise.resolve(_dashboardVersionCache),
-    withTimeout(api.readPanelConfig(), 5000),
+    withTimeout(api.getServicesStatus(), 2500),
+    withTimeout(api.readOpenclawConfig(), 2000),
+    withTimeout(api.readPanelConfig(), 2000),
   ])
-  const secondaryP = Promise.allSettled([
-    withTimeout(api.listAgents(), 10000),
-    withTimeout(api.readMcpConfig(), 10000),
-    withTimeout(api.listBackups(), 10000),
-    withTimeout(api.listConfiguredPlatforms(), 10000).catch(() => []),
-  ])
-  const logsP = api.readLogTail('gateway', 20).catch(() => '')
 
   // 第一波：服务状态 + 配置 + 版本 → 立即渲染统计卡片
-  const [servicesRes, configRes, versionRes, panelConfigRes] = await coreP
+  const [servicesRes, configRes, panelConfigRes] = await coreP
   const services = servicesRes.status === 'fulfilled' ? servicesRes.value : []
-  const version = (versionRes.status === 'fulfilled' && versionRes.value)
-    ? (_dashboardVersionCache = versionRes.value)
-    : (_dashboardVersionCache || {})
-  const config = configRes.status === 'fulfilled' ? configRes.value : null
+  let version = _dashboardVersionCache || {}
+  let config = configRes.status === 'fulfilled' ? configRes.value : null
   const panelConfig = panelConfigRes.status === 'fulfilled' ? panelConfigRes.value : null
   const gw = services.find(s => s.label === 'ai.openclaw.gateway')
+  let agents = []
   const shouldLoadStatusSummary = gw?.running === true
   if (!shouldLoadStatusSummary) {
     _dashboardStatusSummaryCache = null
   }
-  if (servicesRes.status === 'rejected') toast(t('dashboard.servicesLoadFail'), 'error')
-  if (versionRes.status === 'rejected') toast(t('dashboard.versionLoadFail'), 'error')
+  if (servicesRes.status === 'rejected') {
+    console.warn('[dashboard] getServicesStatus slow/failed:', servicesRes.reason)
+    toast(t('dashboard.servicesLoadFail'), 'error')
+  }
+  if (configRes.status === 'rejected') console.warn('[dashboard] readOpenclawConfig slow/failed:', configRes.reason)
+  if (panelConfigRes.status === 'rejected') console.warn('[dashboard] readPanelConfig slow/failed:', panelConfigRes.reason)
 
   // 自愈：补全关键默认值（先重新读取最新配置再 patch，避免用缓存覆盖其他页面的写入）
   if (config) {
@@ -164,6 +269,7 @@ async function _loadDashboardDataInner(page, fullRefresh) {
     if (!config.gateway?.mode) needsPatch = true
     if (config.mode) needsPatch = true
     if (!config.tools || config.tools.profile !== 'full') needsPatch = true
+    if (defaultModelNeedsNormalization(config)) needsPatch = true
     if (needsPatch) {
       try {
         const freshConfig = await api.readOpenclawConfig()
@@ -178,12 +284,21 @@ async function _loadDashboardDataInner(page, fullRefresh) {
           freshConfig.tools.sessions.visibility = 'all'
           patched = true
         }
-        if (patched) api.writeOpenclawConfig(freshConfig).catch(() => {})
+        if (defaultModelNeedsNormalization(freshConfig)) {
+          normalizeDefaultModelConfig(freshConfig)
+          patched = true
+        }
+        if (patched) {
+          config = freshConfig
+          api.writeOpenclawConfig(freshConfig).catch(() => {})
+        }
       } catch {}
     }
   }
 
+  if (loadSeq !== _dashboardLoadSeq || !page.isConnected) return
   renderStatCards(page, services, version, [], config, panelConfig)
+  renderLogs(page, '')
   if (gw) {
     maybeShowForeignGatewayBindingPrompt({
       service: gw,
@@ -191,9 +306,38 @@ async function _loadDashboardDataInner(page, fullRefresh) {
     }).catch(() => {})
   }
 
+  const versionP = shouldFetchVersion
+    ? withTimeout(api.getVersionInfo(), 8000)
+      .then(v => {
+        if (v) _dashboardVersionCache = v
+        return _dashboardVersionCache || {}
+      })
+      .catch(e => {
+        console.warn('[dashboard] getVersionInfo slow/failed:', e)
+        return _dashboardVersionCache || {}
+      })
+    : Promise.resolve(_dashboardVersionCache || {})
+  versionP.then(v => {
+    if (loadSeq !== _dashboardLoadSeq || !page.isConnected) return
+    version = v || {}
+    renderStatCards(page, services, version, agents, config, panelConfig)
+  })
+
+  const secondaryP = Promise.allSettled([
+    withTimeout(api.listAgents(), 5000),
+    withTimeout(api.readMcpConfig(), 5000),
+    withTimeout(api.listBackups(), 5000),
+    withTimeout(api.listConfiguredPlatforms(), 5000).catch(() => []),
+  ])
+  const logsP = withTimeout(api.readLogTail('gateway', 20), 5000).catch(e => {
+    console.warn('[dashboard] readLogTail slow/failed:', e)
+    return ''
+  })
+
   // 第二波：Agent、MCP、备份 → 更新卡片 + 渲染总览
   const [agentsRes, mcpRes, backupsRes, channelsRes] = await secondaryP
-  const agents = agentsRes.status === 'fulfilled' ? agentsRes.value : []
+  if (loadSeq !== _dashboardLoadSeq || !page.isConnected) return
+  agents = agentsRes.status === 'fulfilled' ? agentsRes.value : []
   const mcpConfig = mcpRes.status === 'fulfilled' ? mcpRes.value : null
   const backups = backupsRes.status === 'fulfilled' ? backupsRes.value : []
   const channels = channelsRes.status === 'fulfilled' ? (channelsRes.value || []) : []
@@ -211,9 +355,11 @@ async function _loadDashboardDataInner(page, fullRefresh) {
 
   renderStatCards(page, services, version, agents, config, panelConfig)
   renderOverview(page, services, mcpConfig, backups, config, agents, statusSummary, channels)
+  renderOnboarding(page, { gw, config, agents, channels })
 
   // 第三波：日志（最低优先级）
   const logs = await logsP
+  if (loadSeq !== _dashboardLoadSeq || !page.isConnected) return
   renderLogs(page, logs)
 
   _dashboardInitialized = true
@@ -503,18 +649,18 @@ function renderWsStatus() {
     </div>`
 }
 
-const CHANNEL_ICONS = { qqbot: '🐧', qq: '🐧', feishu: '🪶', dingtalk: '📌', telegram: '✈️', discord: '🎮', slack: '💬', weixin: '💚', wechat: '💚', webchat: '🌐', whatsapp: '📱', line: '🟢', teams: '👥', matrix: '🔗' }
+const CHANNEL_ICONS = { qqbot: 'message-square', qq: 'message-circle', feishu: 'message-square', dingtalk: 'message-square', telegram: 'send', discord: 'hash', slack: 'hash', weixin: 'message-circle', wechat: 'message-circle', webchat: 'globe', whatsapp: 'phone', line: 'message-circle', teams: 'users', msteams: 'users', matrix: 'globe' }
 
 function renderChannelsOverview(channels) {
   if (!channels || channels.length === 0) return ''
   const items = channels.map(ch => {
-    const icon = CHANNEL_ICONS[ch.platform] || '📡'
+    const channelIcon = icon(CHANNEL_ICONS[ch.platform] || 'radio', 14)
     const enabled = ch.enabled !== false
     const dot = enabled ? 'var(--success)' : 'var(--text-tertiary)'
     const name = ch.name || ch.platform || ch.id || ''
     return `<span style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:20px;background:var(--bg-secondary);font-size:var(--font-size-xs);white-space:nowrap">
       <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${dot}"></span>
-      ${icon} ${escapeHtml(name)}
+      ${channelIcon} ${escapeHtml(name)}
     </span>`
   })
   return `
@@ -564,6 +710,7 @@ function bindActions(page) {
   const btnRestart = page.querySelector('#btn-restart-gw')
   const btnUpdate = page.querySelector('#btn-check-update')
   const btnCreateBackup = page.querySelector('#btn-create-backup')
+  page.querySelector('#btn-open-glossary')?.addEventListener('click', () => navigate('/glossary'))
 
   // Control UI 卡片点击 → 打开 OpenClaw 原生面板（用事件委托，因为卡片是动态渲染的）
   page.addEventListener('click', async (e) => {
@@ -629,8 +776,7 @@ function bindActions(page) {
         toast(t('dashboard.gwStartSent'), 'success')
         setTimeout(() => loadDashboardData(page), 2000)
       } catch (err) {
-        if (isForeignGatewayError(err)) await openGatewayConflict(page, err)
-        else toast(t('dashboard.startFail') + ': ' + err, 'error')
+        await handleGatewayStartError(page, err, t('dashboard.startFail'))
       }
       finally { actionBtn.disabled = false; actionBtn.textContent = t('dashboard.startBtn') }
     }
@@ -653,8 +799,7 @@ function bindActions(page) {
         toast(t('dashboard.gwRestartSent'), 'success')
         setTimeout(() => loadDashboardData(page), 3000)
       } catch (err) {
-        if (isForeignGatewayError(err)) await openGatewayConflict(page, err)
-        else toast(t('dashboard.restartFail') + ': ' + err, 'error')
+        await handleGatewayStartError(page, err, t('dashboard.restartFail'))
       }
       finally { actionBtn.disabled = false; actionBtn.textContent = t('dashboard.restartBtn') }
     }
@@ -667,8 +812,7 @@ function bindActions(page) {
     try {
       await api.restartService('ai.openclaw.gateway')
     } catch (e) {
-      if (isForeignGatewayError(e)) await openGatewayConflict(page, e)
-      else toast(t('dashboard.restartFail') + ': ' + e, 'error')
+      await handleGatewayStartError(page, e, t('dashboard.restartFail'))
       btnRestart.disabled = false
       btnRestart.classList.remove('btn-loading')
       btnRestart.textContent = t('dashboard.restartGw')
@@ -716,7 +860,7 @@ function bindActions(page) {
         toast(t('dashboard.upToDate'), 'success')
       }
     } catch (e) {
-      toast(t('dashboard.checkUpdateFail') + ': ' + e, 'error')
+      toast(humanizeError(e, t('dashboard.checkUpdateFail')), 'error')
     } finally {
       btnUpdate.disabled = false
       btnUpdate.textContent = t('dashboard.checkUpdate')
@@ -731,11 +875,125 @@ function bindActions(page) {
       toast(t('dashboard.backupDone', { name: res.name }), 'success')
       setTimeout(() => loadDashboardData(page), 500)
     } catch (e) {
-      toast(t('dashboard.backupFail') + ': ' + e, 'error')
+      toast(humanizeError(e, t('dashboard.backupFail')), 'error')
     } finally {
       btnCreateBackup.disabled = false
       btnCreateBackup.textContent = t('dashboard.createBackup')
     }
+  })
+}
+
+// ── 新手引导卡片 ──
+// 4 步任务：启动 Gateway / 加模型 / 创建 Agent / 第一次聊天。
+// 全部完成或用户主动关闭后，localStorage 标记隐藏，dashboard 不再渲染。
+
+const ONBOARDING_HIDDEN_KEY = 'clawpanel_onboarding_hidden'
+
+function isOnboardingHidden() {
+  try { return localStorage.getItem(ONBOARDING_HIDDEN_KEY) === '1' } catch { return false }
+}
+
+function hideOnboarding() {
+  try { localStorage.setItem(ONBOARDING_HIDDEN_KEY, '1') } catch {}
+}
+
+function getOnboardingSteps({ gw, config, agents, channels }) {
+  // 步骤 1：Gateway 启动
+  const gwRunning = !!gw?.running
+  // 步骤 2：至少配了一个 provider 且非空
+  const providers = config?.models?.providers || {}
+  const hasModel = Object.keys(providers).length > 0
+  // 步骤 3：自定义 Agent（默认 main 不算）
+  const agentList = Array.isArray(agents) ? agents : []
+  const hasCustomAgent = agentList.some(a => a && a.id && a.id !== 'main')
+  // 步骤 4：渠道接入（不是必须，但作为「已开始用」的标志）
+  // 实际上更好的判定是「点过聊天页 / 发过一条消息」，但目前没记录，先用 channels 数量作为可选完成判据
+  // 改为：把第 4 步定义为「尝试聊天」—— 不强校验，CTA 触发跳转即可（用户点了就当完成）
+  const hasChatTried = (() => {
+    try { return localStorage.getItem('clawpanel_onboarding_chat_clicked') === '1' } catch { return false }
+  })()
+  return [
+    { id: 'gateway', titleKey: 'onboardingStep1Title', descKey: 'onboardingStep1Desc', ctaKey: 'onboardingStep1Cta', route: '/services', done: gwRunning },
+    { id: 'model', titleKey: 'onboardingStep2Title', descKey: 'onboardingStep2Desc', ctaKey: 'onboardingStep2Cta', route: '/models', done: hasModel },
+    { id: 'agent', titleKey: 'onboardingStep3Title', descKey: 'onboardingStep3Desc', ctaKey: 'onboardingStep3Cta', route: '/agents', done: hasCustomAgent },
+    { id: 'chat', titleKey: 'onboardingStep4Title', descKey: 'onboardingStep4Desc', ctaKey: 'onboardingStep4Cta', route: '/chat', done: hasChatTried, markOnClick: 'clawpanel_onboarding_chat_clicked' },
+  ]
+}
+
+function renderOnboarding(page, ctx) {
+  const mount = page.querySelector('#onboarding-mount')
+  if (!mount) return
+  if (isOnboardingHidden()) { mount.innerHTML = ''; return }
+
+  const steps = getOnboardingSteps(ctx)
+  const allDone = steps.every(s => s.done)
+  // 全部完成时显示一条庆祝条 + 关闭按钮
+  if (allDone) {
+    mount.innerHTML = `
+      <div class="onboarding-card onboarding-done-card">
+        <div class="onboarding-done-text">${escapeHtml(t('dashboard.onboardingAllDone'))}</div>
+        <button class="btn btn-sm btn-secondary" data-onboarding-action="close">${escapeHtml(t('dashboard.onboardingClose'))}</button>
+      </div>
+    `
+    mount.querySelector('[data-onboarding-action="close"]')?.addEventListener('click', () => {
+      hideOnboarding()
+      mount.innerHTML = ''
+    })
+    return
+  }
+
+  // 渲染 4 步进度卡片
+  const stepsHtml = steps.map((s, idx) => {
+    const num = idx + 1
+    const cls = s.done ? 'onboarding-step done' : 'onboarding-step'
+    const badge = s.done
+      ? `<span class="onboarding-step-badge done">✓ ${escapeHtml(t('dashboard.onboardingDone'))}</span>`
+      : `<span class="onboarding-step-badge todo">${num}</span>`
+    const cta = s.done
+      ? ''
+      : `<button class="btn btn-sm btn-primary" data-onboarding-step="${s.id}">${escapeHtml(t(`dashboard.${s.ctaKey}`))} →</button>`
+    return `
+      <div class="${cls}">
+        ${badge}
+        <div class="onboarding-step-body">
+          <div class="onboarding-step-title">${escapeHtml(t(`dashboard.${s.titleKey}`))}</div>
+          <div class="onboarding-step-desc">${escapeHtml(t(`dashboard.${s.descKey}`))}</div>
+        </div>
+        <div class="onboarding-step-action">${cta}</div>
+      </div>
+    `
+  }).join('')
+
+  mount.innerHTML = `
+    <div class="onboarding-card">
+      <div class="onboarding-header">
+        <div>
+          <div class="onboarding-title">${escapeHtml(t('dashboard.onboardingTitle'))}</div>
+          <div class="onboarding-desc">${escapeHtml(t('dashboard.onboardingDesc'))}</div>
+        </div>
+        <button class="btn btn-xs btn-ghost" data-onboarding-action="close" title="${escapeHtml(t('dashboard.onboardingClose'))}">×</button>
+      </div>
+      <div class="onboarding-steps">
+        ${stepsHtml}
+      </div>
+    </div>
+  `
+
+  mount.querySelector('[data-onboarding-action="close"]')?.addEventListener('click', () => {
+    hideOnboarding()
+    mount.innerHTML = ''
+  })
+
+  steps.forEach(s => {
+    if (s.done) return
+    const btn = mount.querySelector(`[data-onboarding-step="${s.id}"]`)
+    if (!btn) return
+    btn.addEventListener('click', () => {
+      if (s.markOnClick) {
+        try { localStorage.setItem(s.markOnClick, '1') } catch {}
+      }
+      navigate(s.route)
+    })
   })
 }
 

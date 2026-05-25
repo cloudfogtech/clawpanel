@@ -76,6 +76,7 @@ export default {
       items: [
         { route: '/h/dashboard', label: t('sidebar.dashboard'), icon: 'dashboard' },
         { route: '/h/chat', label: t('sidebar.chat'), icon: 'chat' },
+        { route: '/h/group-chat', label: t('engine.hermesGroupChatTitle'), icon: 'agents' },
         { route: '/h/sessions', label: t('sidebar.sessions'), icon: 'inbox' },
         { route: '/h/logs', label: t('sidebar.logs'), icon: 'logs' },
         { route: '/h/usage', label: t('sidebar.usage'), icon: 'bar-chart' },
@@ -86,6 +87,12 @@ export default {
         { route: '/h/skills', label: t('sidebar.skills'), icon: 'skills' },
         { route: '/h/memory', label: t('sidebar.memory'), icon: 'memory' },
         { route: '/h/cron', label: t('sidebar.cron'), icon: 'clock' },
+        { route: '/h/profiles', label: t('engine.hermesProfilesTitle'), icon: 'agents' },
+        { route: '/h/gateways', label: t('engine.hermesGatewaysTitle'), icon: 'gateway' },
+        { route: '/h/kanban', label: t('engine.hermesKanbanTitle'), icon: 'inbox' },
+        { route: '/h/oauth', label: t('engine.hermesOAuthTitle'), icon: 'memory' },
+        { route: '/h/files', label: t('engine.hermesFilesTitle'), icon: 'folder' },
+        { route: '/h/lazy-deps', label: t('hermesLazyDeps.title'), icon: 'package' },
         { route: '/h/extensions', label: t('sidebar.extensions'), icon: 'package' },
       ]
     }, {
@@ -93,6 +100,7 @@ export default {
       items: [
         { route: '/assistant', label: t('sidebar.assistant'), icon: 'assistant' },
         { route: '/settings', label: t('sidebar.settings'), icon: 'settings' },
+        { route: '/glossary', label: t('sidebar.glossary'), icon: 'about' },
         { route: '/about', label: t('sidebar.about'), icon: 'about' },
       ]
     }]
@@ -104,6 +112,9 @@ export default {
       { path: '/h/setup', loader: () => import('./pages/setup.js') },
       { path: '/h/dashboard', loader: () => import('./pages/dashboard.js') },
       { path: '/h/chat', loader: () => import('./pages/chat.js') },
+      { path: '/h/group-chat', loader: () => import('./pages/group-chat.js') },
+      { path: '/h/oauth', loader: () => import('./pages/oauth.js') },
+      { path: '/h/files', loader: () => import('./pages/files.js') },
       { path: '/h/sessions', loader: () => import('./pages/sessions.js') },
       { path: '/h/logs', loader: () => import('./pages/logs.js') },
       { path: '/h/usage', loader: () => import('./pages/usage.js') },
@@ -111,14 +122,21 @@ export default {
       { path: '/h/memory', loader: () => import('./pages/memory.js') },
       { path: '/h/cron', loader: () => import('./pages/cron.js') },
       { path: '/h/extensions', loader: () => import('./pages/extensions.js') },
+      { path: '/h/gateways', loader: () => import('./pages/gateways.js') },
+      { path: '/h/profiles', loader: () => import('./pages/profiles.js') },
+      { path: '/h/kanban', loader: () => import('./pages/kanban.js') },
+      { path: '/h/lazy-deps', loader: () => import('./pages/lazy-deps.js') },
       { path: '/h/services', loader: () => import('./pages/services.js') },
       { path: '/h/config', loader: () => import('./pages/config.js') },
+      // Batch 1 §A: /h/channels 当前是 placeholder（487 字节 stub）— 暂不挂 nav
+      // 完整实现见 Batch 3，待 Hermes 渠道完整支持时启用 sidebar 入口
       { path: '/h/channels', loader: () => import('./pages/channels.js') },
       { path: '/h/env', loader: () => import('./pages/env-editor.js') },
       // 共用页面（引擎无关）
       { path: '/assistant', loader: () => import('../../pages/assistant.js') },
       { path: '/settings', loader: () => import('../../pages/settings.js') },
       { path: '/about', loader: () => import('../../pages/about.js') },
+      { path: '/glossary', loader: () => import('../../pages/glossary.js') },
     ]
   },
 
@@ -130,12 +148,12 @@ export default {
   isGatewayForeign() { return false },
 
   onStateChange(fn) {
-    _listeners.push(fn)
-    return () => { _listeners = _listeners.filter(cb => cb !== fn) }
+    _stateListeners.push(fn)
+    return () => { _stateListeners = _stateListeners.filter(cb => cb !== fn) }
   },
   onReadyChange(fn) {
-    _listeners.push(fn)
-    return () => { _listeners = _listeners.filter(cb => cb !== fn) }
+    _readyListeners.push(fn)
+    return () => { _readyListeners = _readyListeners.filter(cb => cb !== fn) }
   },
 
   isFeatureAvailable() { return true },

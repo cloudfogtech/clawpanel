@@ -4,6 +4,7 @@ import { toast } from '../../../components/toast.js'
 import { showConfirm } from '../../../components/modal.js'
 import { icon } from '../../../lib/icons.js'
 import { getChatStore, getSourceLabel } from '../lib/chat-store.js'
+import { humanizeError } from '../../../lib/humanize-error.js'
 
 function escHtml(value) {
   return String(value ?? '')
@@ -163,7 +164,7 @@ export function render() {
       selected = new Set([...selected].filter(key => rows.some(s => sessionKey(s) === key)))
       selectedKey = selectedKey && rows.some(s => sessionKey(s) === selectedKey) ? selectedKey : (visible[0] ? sessionKey(visible[0]) : null)
     } catch (err) {
-      toast(String(err?.message || err), 'error')
+      toast(humanizeError(err, t('engine.sessionsLoadFailed') || 'Load sessions failed'), 'error')
     } finally {
       loading = false
       draw()
@@ -184,7 +185,7 @@ export function render() {
       session.source = session.source || detail?.source || ''
       session.messageCount = session.messageCount || session.messages.length
     } catch (err) {
-      toast(t('engine.sessionsDetailLoadFailed') + ': ' + (err?.message || err), 'error')
+      toast(humanizeError(err, t('engine.sessionsDetailLoadFailed')), 'error')
     } finally {
       detailLoadingKey = null
       if (redraw) draw()
@@ -249,6 +250,7 @@ export function render() {
           <div class="hm-session-detail-actions">
             <button class="hm-sessions-btn" id="hm-session-open-chat">${icon('message-circle', 14)}${escHtml(t('engine.sessionsOpenChat'))}</button>
             ${canPin ? `<button class="hm-sessions-btn" id="hm-session-pin">${icon(store.state.pinned.has(session.id) ? 'crown' : 'target', 14)}${escHtml(store.state.pinned.has(session.id) ? t('engine.sessionsUnpin') : t('engine.sessionsPin'))}</button>` : ''}
+            <button class="hm-sessions-btn" id="hm-session-export" data-session-id="${escAttr(session.id)}">${icon('download', 14)}${escHtml(t('engine.sessionsExport'))}</button>
             <button class="hm-sessions-btn is-danger" id="hm-session-delete" data-session-key="${escAttr(key)}">${icon('trash', 14)}${escHtml(t('engine.chatDeleteSession'))}</button>
           </div>
         </div>
@@ -341,7 +343,7 @@ export function render() {
       await store.switchSession(session.id)
       window.location.hash = '#/h/chat'
     } catch (err) {
-      toast(String(err?.message || err), 'error')
+      toast(humanizeError(err, t('engine.sessionsSwitchFailed') || 'Switch failed'), 'error')
     } finally {
       busy = false
       draw()
@@ -363,7 +365,7 @@ export function render() {
       if (session.profile === store.state.activeProfile) await store.loadSessions()
       toast(t('engine.chatSessionDeleted'), 'success')
     } catch (err) {
-      toast(t('engine.chatDeleteFailed') + ': ' + (err?.message || err), 'error')
+      toast(humanizeError(err, t('engine.chatDeleteFailed')), 'error')
     }
     draw()
   }
@@ -453,6 +455,31 @@ export function render() {
     })
     el.querySelector('#hm-session-delete')?.addEventListener('click', async () => {
       await deleteOne(currentSession())
+    })
+
+    // Batch 1 §E: 会话导出
+    el.querySelector('#hm-session-export')?.addEventListener('click', async (e) => {
+      const sid = e.currentTarget.dataset.sessionId
+      if (!sid) return
+      const btn = e.currentTarget
+      btn.disabled = true
+      try {
+        const data = await api.hermesSessionExport(sid)
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `hermes-session-${sid}.json`
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+        toast(t('engine.sessionsExportSuccess'), 'success')
+      } catch (err) {
+        toast(humanizeError(err, t('engine.sessionsExportFailed')), 'error')
+      } finally {
+        btn.disabled = false
+      }
     })
   }
 

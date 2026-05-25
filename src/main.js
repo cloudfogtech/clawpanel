@@ -18,7 +18,9 @@ import { tryShowEngagement } from './components/engagement.js'
 import { toast } from './components/toast.js'
 import { initI18n, t } from './lib/i18n.js'
 import { initFeatureGates } from './lib/feature-gates.js'
-import { registerEngine, initEngineManager, getActiveEngine, getActiveEngineId, onEngineChange } from './lib/engine-manager.js'
+import { onKernelChange } from './lib/kernel.js'
+import { showFloorBlocker, hideFloorBlocker } from './components/floor-blocker.js'
+import { registerEngine, initEngineManager, getActiveEngine, getActiveEngineId, needsInitialEngineChoice, isEngineSetupDeferred, adoptActiveEngineSelection, onEngineChange } from './lib/engine-manager.js'
 import openclawEngine from './engines/openclaw/index.js'
 import hermesEngine from './engines/hermes/index.js'
 import xintianEngine from './engines/xintian/index.js'
@@ -108,7 +110,7 @@ function showBackendDownOverlay() {
         <div style="color:var(--text-tertiary);margin-bottom:4px"># ${t('common.devMode')}</div>
         npm run dev<br>
         <div style="color:var(--text-tertiary);margin-top:8px;margin-bottom:4px"># ${t('common.prodMode')}</div>
-        npm run preview
+        npm run serve
       </div>
       <button class="login-btn" id="btn-backend-retry" style="margin-top:8px">
         <span id="backend-retry-text">${t('common.checkAgain')}</span>
@@ -321,9 +323,44 @@ async function boot() {
   registerEngine(openclawEngine)
   registerEngine(hermesEngine)
   registerEngine(xintianEngine)
+  registerRoute('/engine-select', () => import('./pages/engine-select.js'))
 
   // 初始化引擎管理器：读取 clawpanel.json 的 engineMode，注册对应路由
   await initEngineManager()
+
+  // 用户尚未做过明确的引擎选择（无 engineSetupChoice）→ 立即把默认路由
+  // 指向 /engine-select，避免初始化期间先闪到 /dashboard 或 /setup 再被
+  // 后续逻辑弹回选择页。引擎就绪后会在下方自动 adopt 并跳到 dashboard。
+  if (needsInitialEngineChoice() || isEngineSetupDeferred()) {
+    setDefaultRoute('/engine-select')
+  }
+
+  // 订阅内核版本变化：低于硬地板时弹出全屏拦截，恢复后自动隐藏；
+  // 同时刷新 sidebar 以反映 "内核可升级" 提示卡片状态。
+  // 触发时机：Gateway 握手成功 / 重连后版本变化 / 引擎切换
+  let _readonlyModeActive = false
+  onKernelChange((snap) => {
+    if (!snap?.version) {
+      // 还未拿到版本，保持当前状态不变
+      return
+    }
+    if (!snap.aboveFloor && !_readonlyModeActive) {
+      console.warn(`[kernel] 检测到内核版本 ${snap.version} 低于 ${snap.engine} 硬地板 ${snap.floor}`)
+      showFloorBlocker({
+        currentVersion: snap.version,
+        floor: snap.floor,
+        target: snap.target,
+        onIgnore: () => { _readonlyModeActive = true },
+      })
+    } else if (snap.aboveFloor) {
+      hideFloorBlocker()
+      _readonlyModeActive = false
+    }
+    // sidebar 卡片显隐依赖 snapshot，状态变化时刷新一次
+    if (sidebar) {
+      try { renderSidebar(sidebar) } catch (e) { console.warn('[main] kernel-change renderSidebar 失败', e) }
+    }
+  })
 
   renderSidebar(sidebar)
   initRouter(content)
@@ -432,7 +469,21 @@ async function boot() {
     // 监听引擎状态变化（如 setup 完成后 ready 变为 true），自动刷新侧边栏
     bindEngineListeners(engine)
 
-    if (!engine.isReady()) {
+    if (needsInitialEngineChoice() && engine.isReady()) {
+      await adoptActiveEngineSelection({ choice: 'auto-detected' })
+      renderSidebar(sidebar)
+    }
+
+    if (needsInitialEngineChoice() && !engine.isReady()) {
+      setDefaultRoute('/engine-select')
+      navigate('/engine-select')
+    } else if (isEngineSetupDeferred() && !engine.isReady()) {
+      setDefaultRoute('/engine-select')
+      const currentHash = window.location.hash.slice(1) || ''
+      if (!currentHash || currentHash === engine.getSetupRoute()) {
+        navigate('/engine-select')
+      }
+    } else if (!engine.isReady()) {
       setDefaultRoute(engine.getSetupRoute())
       navigate(engine.getSetupRoute())
     } else {
@@ -568,14 +619,14 @@ async function autoConnectWebSocket() {
     // TCP 端口就绪探测：等待 Gateway 端口可达后再发起 WS 连接（仅 Tauri 桌面端）
     if (isTauriRuntime()) {
       const probeStart = Date.now()
-      const probeTimeout = 20000
+      const probeTimeout = 3000
       let portReady = false
       while (Date.now() - probeStart < probeTimeout) {
         try {
           portReady = await api.probeGatewayPort()
           if (portReady) break
         } catch {}
-        await new Promise(r => setTimeout(r, 2000))
+        await new Promise(r => setTimeout(r, 300))
       }
       if (!portReady) {
         console.warn(`[main] Gateway 端口 ${port} 在 ${probeTimeout / 1000}s 内未就绪，仍尝试连接`)

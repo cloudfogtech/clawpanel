@@ -7,6 +7,163 @@
 
 ## [未发布]
 
+## [0.16.5] - 2026-05-22
+
+### 修复 (Fixes)
+
+- **兼容已有 OpenClaw 安装** — Windows 桌面端自动发现范围扩展到 npm 全局目录、standalone 目录、常见 OpenClaw / Node 安装目录、`where openclaw` 结果，并支持 `openclaw.exe` / `openclaw.js` 入口，避免 Gateway 已运行但重启时报 “openclaw CLI 未安装”
+- **已有安装导入引导** — Dashboard 启动 / 重启 Gateway 遇到 CLI 未绑定时，会打开已有 OpenClaw 安装绑定弹窗，不再只显示失败提示
+- **Web 模式候选路径补齐** — Web 后端 CLI 发现同步补充 `openclaw.exe` 候选，保持桌面端与 Web 端行为一致
+
+### 测试与验证 (Testing)
+
+- **回归验证** — 已通过 `npm run build`、`node --test tests\*.test.js`、`cargo fmt --check`、`cargo check`、`cargo clippy --all-targets -- -D warnings`、`git diff --check`
+
+## [0.16.4] - 2026-05-22
+
+### 修复 (Fixes)
+
+- **引擎选择页后端健康检查** — Web 模式启动时要求 `/__api/health` 返回 JSON 且 `ok: true`，避免静态站点 fallback 到 `index.html` 时被误判为后端在线，导致首次保存引擎选择失败
+- **保存失败提示可诊断** — 引擎选择写入失败时显示结构化错误详情，不再只重复展示“保存引擎选择失败”
+- **离线提示命令修正** — 后端离线引导中的生产启动命令改为项目实际支持的 `npm run serve`
+
+### 测试与验证 (Testing)
+
+- **回归验证** — 已通过 `npm run build`、`git diff --check`，并用 Playwright 验证引擎选择页正常保存与后端异常提示
+
+## [0.16.3] - 2026-05-22
+
+### 修复 (Fixes)
+
+- **Windows Gateway 启动路径兼容** — 启动 Gateway 可见终端时不再手工给 `cmd /c start` 的窗口标题嵌套引号，降低 Windows `start` 在路径含空格 / `Gateway` 片段时误把 `Gateway\` 当作可执行文件的风险
+- **绑定 CLI 路径更稳健** — 用户绑定到 OpenClaw 安装目录时，会解析到目录下的 `openclaw.cmd` / `openclaw.exe`，不再把目录本身写入 Gateway 启动脚本执行
+- **内核升级弹窗多语言修复** — 新增运行时 `kernel` 模块语言包并注册聚合入口，修复升级弹窗、侧边栏内核升级提示、内核徽章等位置显示 `kernel.upgrade.title` / `kernel.upgrade.starting` 原始 key 的问题
+
+### 测试与验证 (Testing)
+
+- **回归验证** — 已通过 Rust fmt / check / clippy、模块化 i18n key 解析检查和 `npm run build`
+
+## [0.16.2] - 2026-05-21
+
+### 修复 (Fixes)
+
+- **Dashboard 加载串行化** — 避免首屏加载、手动刷新与 Gateway 状态刷新并发执行时重复触发配置自愈写入，降低配置覆盖风险
+- **默认模型自愈保留合法配置块** — Dashboard 修复无效主模型 / Fallback 链时，不再丢弃仍存在于 providers 中、但不在当前主备链上的 `agents.defaults.models` 条目
+- **模型导入错误提示修复** — 导入 Codex / Claude Code / Gemini CLI 配置扫描失败时，显示结构化错误详情，不再出现 `[object Object]`
+- **汉化内核推荐版本判断修复** — `isLatest` 对 `-zh.N` 后缀版本按推荐版本语义比较，避免 `2026.5.18-zh.1` / `-zh.2` 等小版本提示异常
+
+### 测试与验证 (Testing)
+
+- **回归验证** — 已通过 `node --test tests/*.test.js` 和 `npm run build`
+
+## [0.16.1] - 2026-05-21
+
+### 修复 (Fixes)
+
+- **兼容 OpenClaw 最新 hello payload** — 支持从新版 `hello.server.version` 读取 Gateway 版本，同时保留旧版 `hello.serverVersion` 兼容，避免 2026.5.18+ 内核连接成功后 Dashboard 版本显示和特性门控为空
+- **推荐 OpenClaw 内核更新** — 推荐目标更新到官方 `2026.5.19` 与汉化版 `2026.5.18-zh.1`
+
+### 测试与验证 (Testing)
+
+- **协议核对** — 已确认 OpenClaw `2026.5.18` / `2026.5.19` 仍为 Gateway WebSocket 协议 v4，无需实现 v5
+- **回归验证** — 已通过 `node --test tests/kernel.test.js` 和 `npm run build`
+
+## [0.16.0] - 2026-05-16
+
+### 新功能 (Features)
+
+- **Gateway 握手协议版本可见化** — 服务页与聊天调试页新增 `Proto v4` 徽标，显示当前 WebSocket 握手协议版本（v3 / v4），鼠标悬停说明这与设备签名 payload v3 schema 不是同一个版本号
+
+### 改进 (Improvements)
+
+- **晴辰助手识别 Hermes Agent 引擎** — 助手 system prompt 按当前活跃引擎分发，Hermes 模式下覆盖 Gateway 8642 / Dashboard 9119 双进程、Profile 多工作区、lazy_deps 按需依赖、`~/.hermes` 路径与 Top-5 排障清单，不再向用户混入 `openclaw` CLI 命令
+- **Hermes Profile 管理自动拉起 Dashboard** — 进入 Profile 页自动 probe + 启动 9119 Dashboard，不再向用户暴露「连接被拒 (10061)」原始网络错误
+- **隐藏桌面端无意义的 Docker 管理入口** — 服务页 Docker 多实例管理仅对 Web 部署模式有意义，桌面 Tauri 模式下不再渲染该面板，去除「未启用 / ENOENT」噪音；Web 模式保留全部功能
+- **Fallback 模型链 Clear All 按钮** — 模型配置页支持一键清空整条 Fallback 链
+- **页面 Header 横向排版** — Hermes Profile / 可选依赖 / 文件管理器 / 多 Gateway / 群聊 / 看板 / OAuth 等页面的标题与右侧按钮统一左右对齐，按钮不再挤在描述行下方
+- **目录结构优化** — 调整代码组织，提升可维护性
+
+### 修复 (Fixes)
+
+- **Windows Gateway 终端窗口可见** — 改用 `cmd /c start` 创建独立控制台，绕开 Rust `Stdio::inherit` 让 `CREATE_NEW_CONSOLE` 失效的 Win32 行为；停止流程改用 netstat PID 跟踪，杀进程更精确
+- **可选依赖管理保留 Rust 端原始安装提示** — 加载失败时显示「Hermes venv 未找到，请先安装 Hermes」等可操作提示，不再被 humanize-error 的通用模板「请确认目标资源是否仍存在」遮盖；同时修掉之前的 `[object Object]` 显示问题
+- **Fallback 链不再被自动塞满** — `applyDefaultModel` 不再把所有非主模型自动写入 `fallbacks`，避免一次保存膨胀到 17+ 项导致候选池清空和 Add 按钮看似无反应；空 fallback 链是合法配置
+- **CI 三平台恢复绿灯** — `commands/config.rs` 中 `push_client_candidate` / `scan_json_client_file` 加 `#[allow(clippy::too_many_arguments)]` 局部豁免，解除自 `e1eda2d` 起的 lint debt
+
+### 测试与验证 (Testing)
+
+- **发布前检查** — npm 前端构建、Rust fmt / check / clippy 三平台 CI 全绿（run 25955001087）
+- **Playwright 回归** — 验证 Docker 管理桌面端隐藏 / Web 模式保留、lazy-deps 显示安装提示、Hermes 三页 header 横向布局、握手协议徽标渲染等核心改动
+
+## [0.15.3] - 2026-05-13
+
+### 修复 (Fixes)
+
+- **退出/关机阶段不再启动外部清理进程** — 移除应用退出事件中启动 `taskkill.exe` 的兜底逻辑，避免 Windows 关机清理阶段新进程初始化失败导致 `0xc0000142` 弹窗
+
+## [0.15.2] - 2026-05-13
+
+### 修复 (Fixes)
+
+- **退出时不再通过 cmd.exe 中转调用 taskkill** — 应用退出/系统关机时直接调用 `taskkill.exe` 关闭 Gateway 终端窗口，避免关机阶段 `cmd.exe` 初始化 DLL 失败导致系统事件日志报 `0xc0000142` 错误
+
+## [0.15.1] - 2026-05-10
+
+### 新功能 (Features)
+
+- **首次引擎选择页** — 新增启动选择流程，支持选择 OpenClaw、Hermes Agent、双引擎或稍后配置，避免首次启动直接进入不匹配的安装向导
+- **Hermes Agent Provider 预设增强** — 扩展 Provider 注册表与配置合并能力，前端、Web 后端和 Tauri 后端保持一致
+
+### 改进 (Improvements)
+
+- **Hermes Agent 流式对话兼容层** — 优先使用新的流式响应通道，失败时自动回退，并保持现有前端事件格式不变
+- **Hermes Dashboard 生命周期管理** — 状态检测和停止操作优先使用 Hermes Agent 原生能力，失败后再回退到 ClawPanel 记录的进程信息，降低误报和误杀风险
+- **Hermes Agent 安装体验** — 安装、升级和依赖补齐流程增加日志清理，避免用户界面暴露底层安装细节
+- **多引擎初始化体验** — 引擎选择状态会持久化，切换引擎时清理旧请求缓存，减少跨引擎页面状态串扰
+- **推荐内核版本策略** — 推荐版本更新到 `2026.5.7` 与 `2026.5.7-zh.1`
+
+### 修复 (Fixes)
+
+- **Hermes Dashboard 依赖提示** — 缺少 Web 依赖时改为引导使用内置安装按钮，减少手动命令操作
+- **Hermes Agent 页面信息边界** — 清理 Dashboard、Setup、Chat、Skills、Memory、Logs、Cron、Extensions 等页面中的非必要实现细节展示
+- **助手内置技能提示** — Hermes Agent 安装与升级建议改为使用 ClawPanel 内置向导，避免暴露底层安装命令
+
+### 测试与验证 (Testing)
+
+- **发布前检查** — 已通过 JS 语法检查、Rust 格式检查、Rust 编译检查和前端生产构建
+
+## [0.15.0] - 2026-05-08
+
+### 新功能 (Features)
+
+- **内核版本兼容层** — 新增 `kernel.js` / `feature-catalog.js` / `api-compat.js`，统一管理 OpenClaw/Hermes 内核版本、特性门控、最低版本地板和新旧 RPC 返回结构兼容
+- **内核升级提示** — 侧边栏新增可升级提示卡，低版本内核可直接触发一键升级流程；低于硬地板版本时显示阻断式引导，避免旧内核继续进入不兼容页面
+- **CLI 冲突检测与隔离** — 新增 PATH 中外部 OpenClaw CLI 扫描、隔离、恢复能力，支持识别 Cherry Studio / Cursor / npm 全局安装等残留来源，降低错绑旧 CLI 的风险
+- **Hermes 实时聊天桥接增强** — Web 模式补齐 Hermes Gateway `/v1/runs` 流式转发、API Key 注入、取消与错误事件处理，使浏览器模式与桌面模式聊天链路保持一致
+
+### 改进 (Improvements)
+
+- **OpenClaw 2026.5.6 适配** — 推荐版本更新到官方 `2026.5.6` 与汉化版 `2026.5.6-zh.1`，特性目录覆盖 sessions 分页、模型探测、memory deep status、doctor 修复、渠道进度等 5.x 能力
+- **多版本内核兼容 UX** — Dashboard、服务页、Agents、Models、侧边栏和 WebSocket 连接流程统一接入内核快照，老内核自动降级，新内核显示更丰富状态
+- **Gateway 重启体验** — 模型保存后先探测 Gateway 是否运行，运行中才防抖排队重启；未运行时只提示配置已保存，避免无意义 doctor/restart 卡顿
+- **Hermes 安装依赖补齐** — `uv tool install` 统一追加 `croniter`，并默认安装 `hermes-agent[web]`，减少定时任务和 Web 面板运行时缺依赖
+- **MiniMax 预设补全** — MiniMax 服务商预设恢复 OpenAI-compatible 入口，并补齐 M2.7/M2.5 及 highspeed 模型快捷项
+- **热更新兼容底座** — 本次版本包含新增 Tauri 命令，热更新清单最低兼容版本提升到 `0.15.0`，避免旧桌面端加载不兼容前端
+
+### 修复 (Fixes)
+
+- **Hermes Gateway 本机自动拉起** — 自定义 Gateway URL 为 `127.0.0.1`、`localhost`、`::1` 等 loopback 地址时不再误判为远程 Gateway，桌面端和 Web 模式都会自动启动本机 Gateway
+- **Hermes `/v1/runs` 连接失败诊断** — 启动 run 前自动确保本机 Gateway ready，请求失败时附带健康检查和日志尾部，便于定位 10061/连接拒绝等问题
+- **Standalone 版本显示未知** — About 页和仪表盘优先读取 standalone 安装目录的 `VERSION` / `package.json`，正确识别官方版或汉化版，不再把一键安装包显示为未知版本或误判来源
+- **仪表盘版本缓存自愈** — 检测到空版本、unknown 来源或不完整版本信息时自动清理 `get_version_info` 缓存并重新拉取，避免旧缓存长期显示未知
+- **版本检测不再被运行态拖垮** — `openclaw status --json` 后移为 fallback 并增加短超时，避免 Gateway 未运行时拖慢 About 页和仪表盘
+- **服务配置错误引导** — 启停服务遇到配置 schema 错误时弹出 `doctor --fix` 一键修复入口，而不是只显示技术错误 toast
+
+### 测试与验证 (Testing)
+
+- **本地 CI 链路补齐** — 新增/修复 kernel、Docker tasking、Gateway guardian policy、模型预设测试；本地通过 45 个 JS 测试和 16 个 Rust 单元测试
+- **发布前检查增强** — Release 工作流文档增加人工确认门禁，要求版本号、提交、tag、push 前完成 Web/桌面/Hermes/OpenClaw 回归确认
+
 ## [0.14.0] - 2026-04-25
 
 ### 新功能 (Features)

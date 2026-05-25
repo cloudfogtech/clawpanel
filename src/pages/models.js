@@ -4,11 +4,13 @@
  */
 import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
+import { humanizeError } from '../lib/humanize-error.js'
 import { showModal, showConfirm } from '../components/modal.js'
 import { icon, statusIcon } from '../lib/icons.js'
 import { API_TYPES, PROVIDER_PRESETS, QTCOOL, MODEL_PRESETS, fetchQtcoolModels } from '../lib/model-presets.js'
 import { t } from '../lib/i18n.js'
 import { scheduleGatewayRestart, fireRestartNow, cancelPendingRestart, onRestartState } from '../lib/gateway-restart-queue.js'
+import { termHelpHtml, attachTermTooltips } from '../lib/term-tooltip.js'
 
 // HTML 转义，防止错误信息中的特殊字符破坏页面或被注入
 function escapeHtml(str) {
@@ -27,6 +29,7 @@ export async function render() {
     </div>
     <div class="config-actions">
       <button class="btn btn-primary btn-sm" id="btn-add-provider">${t('models.addProvider')}</button>
+      <button class="btn btn-secondary btn-sm" id="btn-import-client">${t('models.importClientConfigs')}</button>
       <button class="btn btn-secondary btn-sm" id="btn-undo" disabled>${t('models.undo')}</button>
     </div>
     <div class="form-hint" style="margin-bottom:var(--space-md)">
@@ -86,10 +89,13 @@ async function loadConfig(page, state) {
     const before = JSON.stringify(state.config?.models?.providers || {})
     normalizeProviderUrls(state.config)
     const after = JSON.stringify(state.config?.models?.providers || {})
-    if (before !== after) {
-      console.log('[models] 自动修复了服务商 baseUrl,正在保存...')
+    const oldPrimary = getCurrentPrimary(state.config)
+    const normalizedModel = normalizeDefaultModelSelection(state.config)
+    if (before !== after || normalizedModel.changed) {
+      console.log('[models] 自动修复了模型配置,正在保存...')
       await api.writeOpenclawConfig(state.config)
-      toast(t('models.autoFixUrl'), 'info')
+      if (oldPrimary !== normalizedModel.primary) toast(t('models.primaryAutoSwitch', { model: normalizedModel.primary || t('models.notConfigured') }), 'info')
+      else if (before !== after) toast(t('models.autoFixUrl'), 'info')
     }
     renderDefaultBar(page, state)
     renderProviders(page, state)
@@ -124,14 +130,18 @@ function getCurrentPrimary(config) {
   return config?.agents?.defaults?.model?.primary || ''
 }
 
-function ensureDefaultModelConfig(state) {
-  if (!state.config.agents) state.config.agents = {}
-  if (!state.config.agents.defaults) state.config.agents.defaults = {}
-  if (!state.config.agents.defaults.model) state.config.agents.defaults.model = {}
-  if (!Array.isArray(state.config.agents.defaults.model.fallbacks)) {
-    state.config.agents.defaults.model.fallbacks = []
+function ensureConfigDefaultModelConfig(config) {
+  if (!config.agents) config.agents = {}
+  if (!config.agents.defaults) config.agents.defaults = {}
+  if (!config.agents.defaults.model) config.agents.defaults.model = {}
+  if (!Array.isArray(config.agents.defaults.model.fallbacks)) {
+    config.agents.defaults.model.fallbacks = []
   }
-  return state.config.agents.defaults.model
+  return config.agents.defaults.model
+}
+
+function ensureDefaultModelConfig(state) {
+  return ensureConfigDefaultModelConfig(state.config)
 }
 
 function collectAllModels(config) {
@@ -146,6 +156,68 @@ function collectAllModels(config) {
   return result
 }
 
+function normalizeDefaultModelMap(config, validModels, primary, fallbacks) {
+  const defaults = config?.agents?.defaults
+  if (!defaults) return false
+  const current = defaults.models && typeof defaults.models === 'object' && !Array.isArray(defaults.models) ? defaults.models : {}
+  const next = {}
+  if (primary) next[primary] = current[primary] && typeof current[primary] === 'object' && !Array.isArray(current[primary]) ? current[primary] : {}
+  for (const f of fallbacks || []) {
+    if (validModels.has(f) && !next[f]) next[f] = current[f] && typeof current[f] === 'object' && !Array.isArray(current[f]) ? current[f] : {}
+  }
+  for (const [key, value] of Object.entries(current)) {
+    if (validModels.has(key) && !next[key]) next[key] = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  }
+  const changed = JSON.stringify(current) !== JSON.stringify(next)
+  defaults.models = next
+  return changed
+}
+
+function dedupeValidFallbacks(fallbacks, validModels, primary) {
+  const seen = new Set()
+  if (primary) seen.add(primary)
+  return (Array.isArray(fallbacks) ? fallbacks : [])
+    .filter(f => validModels.has(f))
+    .filter(f => {
+      if (seen.has(f)) return false
+      seen.add(f)
+      return true
+    })
+}
+
+function normalizeDefaultModelSelection(config) {
+  const allModels = collectAllModels(config)
+  const validModels = new Set(allModels.map(m => m.full))
+  const modelConfig = ensureConfigDefaultModelConfig(config)
+  let changed = false
+  if (!allModels.length) {
+    if (modelConfig.primary) {
+      modelConfig.primary = ''
+      changed = true
+    }
+    if (modelConfig.fallbacks.length) {
+      modelConfig.fallbacks = []
+      changed = true
+    }
+    changed = normalizeDefaultModelMap(config, validModels, '', []) || changed
+    return { changed, primary: '' }
+  }
+  let primary = modelConfig.primary || ''
+  if (!validModels.has(primary)) {
+    const fallbackPrimary = modelConfig.fallbacks.find(f => validModels.has(f))
+    primary = fallbackPrimary || allModels[0].full
+    modelConfig.primary = primary
+    changed = true
+  }
+  const nextFallbacks = dedupeValidFallbacks(modelConfig.fallbacks, validModels, primary)
+  if (JSON.stringify(nextFallbacks) !== JSON.stringify(modelConfig.fallbacks)) {
+    modelConfig.fallbacks = nextFallbacks
+    changed = true
+  }
+  changed = normalizeDefaultModelMap(config, validModels, primary, modelConfig.fallbacks) || changed
+  return { changed, primary }
+}
+
 function getApiTypeLabel(apiType) {
   return API_TYPES.find(at => at.value === apiType)?.label || apiType || t('common.unknown')
 }
@@ -155,25 +227,28 @@ function renderDefaultBar(page, state) {
   const bar = page.querySelector('#default-model-bar')
   const primary = getCurrentPrimary(state.config)
   const fallbacks = state.config?.agents?.defaults?.model?.fallbacks || []
+  const visibleFallbacks = fallbacks.slice(0, 8)
+  const overflowFallbackCount = Math.max(0, fallbacks.length - visibleFallbacks.length)
   const collapsed = !state.showFallbackEditor
   const chevron = collapsed ? '▸' : '▾'
 
   bar.innerHTML = `
     <div class="config-section" style="margin-bottom:var(--space-lg); transition: all 0.3s ease;">
-      <div class="config-section-title" id="system-model-title" style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; user-select:none;">
-        <div style="display:flex; align-items:center; gap:8px">
-          <span style="display:inline-block;width:16px;font-size:12px;color:var(--text-tertiary)">${chevron}</span>
+      <div class="config-section-title" id="system-model-title" style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; cursor:pointer; user-select:none;">
+        <div style="display:flex; align-items:flex-start; gap:8px; min-width:0; flex:1">
+          <span style="display:inline-block;width:16px;font-size:12px;color:var(--text-tertiary);flex-shrink:0">${chevron}</span>
           <span>${t('models.systemModelTitle')}</span>
-          <div style="display:flex; gap:8px; margin-left: 12px; align-items: baseline; flex: 1; min-width: 0; overflow: hidden;">
-            <span style="color:var(--success); font-family:var(--font-mono); font-size: 0.9em; font-weight: 500; white-space: nowrap;">${primary || t('models.notConfigured')}</span>
-            <span style="font-size: 11px; color: var(--text-tertiary); font-weight: normal; white-space: nowrap;">${t('models.nFallbacks', { count: fallbacks.length })}</span>
+          <div style="display:flex; gap:8px; margin-left:12px; align-items:baseline; flex-wrap:wrap; min-width:0">
+            <span style="color:var(--success); font-family:var(--font-mono); font-size:0.9em; font-weight:500; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(primary || '')}">${primary || t('models.notConfigured')}</span>
+            <span style="font-size:11px; color:var(--text-tertiary); font-weight:normal; white-space:nowrap;">${t('models.nFallbacks', { count: fallbacks.length })}</span>
           </div>
         </div>
       </div>
 
       ${collapsed && fallbacks.length > 0 ? `
-      <div style="margin-top: 12px; display: flex; flex-wrap: nowrap; overflow: hidden; gap: 6px; align-items: center; padding-left: 24px;">
-        ${fallbacks.map(f => `<span style="background: var(--bg-tertiary); border: 1px solid var(--border-color); padding: 2px 8px; border-radius: 12px; font-size: 11px; font-family: var(--font-mono); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;" title="${f}">${f}</span>`).join('<span style="color: var(--text-tertiary); font-size: 10px; flex-shrink: 0;">→</span>')}
+      <div style="margin-top:12px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding-left:24px; max-height:56px; overflow:hidden;">
+        ${visibleFallbacks.map(f => `<span style="background:var(--bg-tertiary); border:1px solid var(--border-color); padding:2px 8px; border-radius:12px; font-size:11px; font-family:var(--font-mono); color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:220px;" title="${escapeHtml(f)}">${escapeHtml(f)}</span>`).join('<span style="color:var(--text-tertiary); font-size:10px; flex-shrink:0;">→</span>')}
+        ${overflowFallbackCount ? `<span style="background:var(--bg-tertiary); border:1px solid var(--border-color); padding:2px 8px; border-radius:12px; font-size:11px; color:var(--text-tertiary)">+${overflowFallbackCount}</span>` : ''}
       </div>
       ` : ''}
 
@@ -220,19 +295,22 @@ function renderFallbackWaterfall(state) {
 
   return `
     <div class="fallback-editor-panel" style="background: var(--bg-secondary); padding: 12px; border-radius: var(--radius-md);">
-      <div style="margin-bottom: 12px; font-size: 11px; color: var(--text-secondary); background: var(--bg-info-subtle); padding: 6px 10px; border-radius: 4px; border-left: 3px solid var(--primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+      <div style="margin-bottom: 12px; font-size: 11px; color: var(--text-secondary); background: var(--bg-info-subtle); padding: 6px 10px; border-radius: 4px; border-left: 3px solid var(--primary); line-height:1.6;">
         ${t('models.bestPracticeHint')}
       </div>
 
-      <div style="display: grid; grid-template-columns: 1fr 1.2fr; gap: 24px;">
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">
         <div style="background: var(--bg-tertiary); padding: 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color);">
-          <div style="font-size: var(--font-size-xs); font-weight: bold; margin-bottom: 8px; color: var(--text-tertiary);">${t('models.activeChainTitle')}</div>
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom: 8px;">
+            <div style="font-size: var(--font-size-xs); font-weight: bold; color: var(--text-tertiary);">${t('models.activeChainTitle')}</div>
+            ${currentFallbacks.length > 0 ? `<button class="btn btn-xs btn-secondary btn-clear-all-fb" style="padding:1px 6px; font-size:10px;">${t('models.clearAll')}</button>` : ''}
+          </div>
           <div id="active-fallback-list" style="display: flex; flex-direction: column; gap: 4px; min-height: 50px;">
             ${currentFallbacks.map((f, i) => `
               <div class="fallback-chain-item" data-id="${f}" style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-primary); padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border-color);">
                 <div style="display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1;">
                   <span class="fallback-drag-handle" style="color:var(--text-tertiary);cursor:grab;user-select:none;font-size:14px;padding:2px; flex-shrink: 0;">⋮⋮</span>
-                  <span style="font-family: var(--font-mono); font-size: var(--font-size-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${i + 1}. ${f}</span>
+                  <span style="font-family: var(--font-mono); font-size: var(--font-size-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(f)}">${i + 1}. ${escapeHtml(f)}</span>
                 </div>
                 <div style="display: flex; gap: 4px; flex-shrink: 0;">
                   <button class="btn btn-xs btn-secondary btn-set-primary-from-fb" data-id="${f}" style="padding: 1px 4px; font-size: 10px;">${t('models.setAsPrimary')}</button>
@@ -261,7 +339,7 @@ function renderFallbackWaterfall(state) {
                     <div class="candidate-provider-list" style="display: ${collapsed ? 'none' : 'flex'}; flex-direction: column; gap: 4px; padding: 4px 0 4px 12px;">
                       ${mIds.map(mId => `
                         <div class="candidate-item" style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-primary); padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border-color); opacity: 0.9;">
-                          <span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${mId}</span>
+                          <span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(mId)}">${escapeHtml(mId)}</span>
                           <button class="btn btn-xs btn-primary btn-add-fb" data-full="${pKey}/${mId}" style="padding: 1px 6px; font-size: 10px;">${t('models.add')}</button>
                         </div>
                       `).join('')}
@@ -322,6 +400,22 @@ function bindWaterfallActions(page, state) {
       autoSave(state)
     }
   })
+
+  // 清空全部备选
+  const clearAllBtn = container.querySelector('.btn-clear-all-fb')
+  if (clearAllBtn) {
+    clearAllBtn.onclick = async () => {
+      const yes = await showConfirm(t('models.confirmClearAll'))
+      if (!yes) return
+      const modelConfig = ensureDefaultModelConfig(state)
+      if (!modelConfig.fallbacks.length) return
+      pushUndo(state)
+      modelConfig.fallbacks = []
+      renderDefaultBar(page, state)
+      updateUndoBtn(page, state)
+      autoSave(state)
+    }
+  }
 
   // 折叠候选服务商
   container.querySelectorAll('.candidate-provider-header').forEach(header => {
@@ -507,9 +601,9 @@ function renderProviders(page, state) {
     const chevron = collapsed ? '▸' : '▾'
     return `
       <div class="config-section" data-provider="${key}">
-        <div class="config-section-title" style="display:flex;justify-content:space-between;align-items:center">
-          <span style="cursor:pointer;user-select:none" data-action="toggle-provider"><span style="display:inline-block;width:16px;font-size:12px;color:var(--text-tertiary)">${chevron}</span>${key} <span style="font-size:var(--font-size-xs);color:var(--text-tertiary);font-weight:400">${getApiTypeLabel(p.api)} · ${t('models.nModels', { count: models.length })}</span></span>
-          <div style="display:flex;gap:8px">
+        <div class="config-section-title" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+          <span style="cursor:pointer;user-select:none;min-width:0;overflow:hidden;text-overflow:ellipsis" data-action="toggle-provider"><span style="display:inline-block;width:16px;font-size:12px;color:var(--text-tertiary)">${chevron}</span>${key} <span style="font-size:var(--font-size-xs);color:var(--text-tertiary);font-weight:400">${getApiTypeLabel(p.api)} · ${t('models.nModels', { count: models.length })}</span></span>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
             <button class="btn btn-sm btn-secondary" data-action="edit-provider">${t('models.editProvider')}</button>
             <button class="btn btn-sm btn-secondary" data-action="add-model">${t('models.addModel')}</button>
             <button class="btn btn-sm btn-secondary" data-action="fetch-models">${t('models.fetchList')}</button>
@@ -518,11 +612,11 @@ function renderProviders(page, state) {
         </div>
         <div class="provider-body" style="${collapsed ? 'display:none' : ''}">
         ${models.length >= 2 ? `
-        <div style="display:flex;gap:6px;margin-bottom:var(--space-sm);align-items:center">
+        <div style="display:flex;gap:6px;margin-bottom:var(--space-sm);align-items:center;flex-wrap:wrap">
           <button class="btn btn-sm btn-secondary" data-action="batch-test">${t('models.batchTest')}</button>
           <button class="btn btn-sm btn-secondary" data-action="select-all">${t('models.selectAll')}</button>
           <button class="btn btn-sm btn-danger" data-action="batch-delete">${t('models.batchDelete')}</button>
-          <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+          <div style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
             <span style="font-size:var(--font-size-xs);color:var(--text-tertiary)">${t('models.sort')}</span>
             <select class="form-input" data-action="sort-models" style="padding:4px 8px;font-size:var(--font-size-xs);width:auto">
               <option value="default">${t('models.sortDefault')}</option>
@@ -578,19 +672,19 @@ function renderModelCards(providerKey, models, primary, search) {
     if (testTime) meta.push(testTime)
     return `
       <div class="model-card" data-model-id="${id}" data-full="${full}"
-           style="background:${bgColor};border:1px solid ${borderColor};padding:10px 14px;border-radius:var(--radius-md);margin-bottom:8px;display:flex;align-items:center;gap:10px">
+           style="background:${bgColor};border:1px solid ${borderColor};padding:10px 14px;border-radius:var(--radius-md);margin-bottom:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span class="drag-handle" style="color:var(--text-tertiary);cursor:grab;user-select:none;font-size:16px;padding:4px;touch-action:none">⋮⋮</span>
         <input type="checkbox" class="model-checkbox" data-model-id="${id}" style="flex-shrink:0;cursor:pointer">
-        <div style="flex:1;min-width:0">
-          <div style="display:flex;align-items:center;gap:8px">
-            <span style="font-family:var(--font-mono);font-size:var(--font-size-sm)">${id}</span>
+        <div style="flex:1 1 260px;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
+            <span style="font-family:var(--font-mono);font-size:var(--font-size-sm);min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(id)}">${escapeHtml(id)}</span>
             ${isPrimary ? `<span style="font-size:var(--font-size-xs);background:var(--success);color:var(--text-inverse);padding:1px 6px;border-radius:var(--radius-sm)">${t('models.primaryModel')}</span>` : ''}
             ${m.reasoning ? `<span style="font-size:var(--font-size-xs);background:var(--accent-muted);color:var(--accent);padding:1px 6px;border-radius:var(--radius-sm)">${t('models.reasoning')}</span>` : ''}
             ${latencyTag}
           </div>
-          <div style="font-size:var(--font-size-xs);color:var(--text-tertiary);margin-top:2px">${meta.join(' · ') || ''}</div>
+          <div style="font-size:var(--font-size-xs);color:var(--text-tertiary);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(meta.join(' · '))}">${escapeHtml(meta.join(' · ')) || ''}</div>
         </div>
-        <div style="display:flex;gap:6px;flex-shrink:0">
+        <div style="display:flex;gap:6px;flex:0 1 auto;flex-wrap:wrap;justify-content:flex-end;margin-left:auto">
           <button class="btn btn-sm btn-secondary" data-action="test-model">${t('models.testBtn')}</button>
           ${!isPrimary ? `<button class="btn btn-sm btn-secondary" data-action="set-primary">${t('models.setPrimary')}</button>` : ''}
           <button class="btn btn-sm btn-secondary" data-action="edit-model">${t('models.editModel')}</button>
@@ -702,9 +796,9 @@ async function saveConfigOnly(state) {
     const primary = getCurrentPrimary(state.config)
     if (primary) applyDefaultModel(state)
     normalizeProviderUrls(state.config)
-    await api.writeOpenclawConfig(state.config)
+    await api.writeOpenclawConfig(state.config, { noReload: true })
   } catch (e) {
-    toast(t('models.saveFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('models.saveFailed')), 'error')
   }
 }
 
@@ -713,13 +807,24 @@ async function doAutoSave(state) {
     const primary = getCurrentPrimary(state.config)
     if (primary) applyDefaultModel(state)
     normalizeProviderUrls(state.config)
-    await api.writeOpenclawConfig(state.config)
+    await api.writeOpenclawConfig(state.config, { noReload: true })
 
-    // 配置已写入。使用 3s 防抖 + 单飞行锁排队重启，避免快速连续编辑触发多次重启。
-    showRestartPendingToast()
-    scheduleGatewayRestart({ reason: 'models-page' })
+    // ⚠ 只有 Gateway 已经在运行时才触发 restart 让配置生效。
+    // 如果 Gateway 没启动（首次安装 / 用户手动停了），盲目调 restart_gateway 会：
+    //   1) HTTP 重载失败（端口没人）→ fallback 到 restart_service 强制启动
+    //   2) Gateway 启动失败 → 触发后端 Guardian 自动跑 doctor --fix → 卡 30s
+    //   3) 用户看到的全是错误 toast，但**配置实际已经写入文件了**
+    // 改成：先 probe，运行才 schedule restart；没运行就静默告诉用户"已保存"。
+    const gwRunning = await api.probeGatewayPort().catch(() => false)
+    if (gwRunning) {
+      // 配置已写入。使用 3s 防抖 + 单飞行锁排队重启，避免快速连续编辑触发多次重启。
+      showRestartPendingToast()
+      scheduleGatewayRestart({ reason: 'models-page' })
+    } else {
+      toast(t('models.configSavedGwNotRunning'), 'info', { duration: 4000 })
+    }
   } catch (e) {
-    toast(t('models.autoSaveFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('models.autoSaveFailed')), 'error')
   }
 }
 
@@ -1033,22 +1138,9 @@ function rotateFallbackChain(state, oldPrimary, newPrimary) {
 // 应用默认模型:primary + 其余自动成为备选
 // 确保 primary 指向的模型仍然存在,不存在则自动切到第一个可用模型
 function ensureValidPrimary(state) {
-  const primary = getCurrentPrimary(state.config)
-  const allModels = collectAllModels(state.config)
-  if (allModels.length === 0) {
-    // 所有模型都没了,清空 primary
-    if (state.config.agents?.defaults?.model) {
-      state.config.agents.defaults.model.primary = ''
-    }
-    return
-  }
-  const exists = allModels.some(m => m.full === primary)
-  if (!exists) {
-    // primary 指向已删除的模型,自动切到第一个
-    const newPrimary = allModels[0].full
-    setPrimary(state, newPrimary)
-    toast(t('models.primaryAutoSwitch', { model: newPrimary }), 'info')
-  }
+  const current = getCurrentPrimary(state.config)
+  const normalized = normalizeDefaultModelSelection(state.config)
+  if (normalized.changed && current !== normalized.primary) toast(t('models.primaryAutoSwitch', { model: normalized.primary || t('models.notConfigured') }), 'info')
 }
 
 function applyDefaultModel(state) {
@@ -1058,20 +1150,14 @@ function applyDefaultModel(state) {
   const defaults = state.config.agents.defaults
   if (!defaults.model) defaults.model = {}
   defaults.model.primary = primary
+  if (!Array.isArray(defaults.model.fallbacks)) defaults.model.fallbacks = []
+  if (!defaults.models || typeof defaults.models !== 'object' || Array.isArray(defaults.models)) defaults.models = {}
 
-  // fallbacks / models 仅在为空时初始化(首次安装友好),不再每次保存都覆盖
-  // 避免用户精心维护的精简 fallback 链被重写,且随模型增多不断膨胀 (fixes #190)
-  if (!defaults.model.fallbacks || defaults.model.fallbacks.length === 0) {
-    const allModels = collectAllModels(state.config)
-    defaults.model.fallbacks = allModels.filter(m => m.full !== primary).map(m => m.full)
-  }
-  if (!defaults.models || Object.keys(defaults.models).length === 0) {
-    const allModels = collectAllModels(state.config)
-    const modelsMap = {}
-    modelsMap[primary] = {}
-    for (const m of allModels) { if (m.full !== primary) modelsMap[m.full] = {} }
-    defaults.models = modelsMap
-  }
+  // 注意:不再在 fallbacks/models 为空时自动塞入"全部可用模型"。
+  // 旧逻辑会导致用户清空备选链或新增主模型后,一次保存就把所有候选自动加进 fallbacks/models,
+  // 用户点"加入"时模型已经全部在备选链里 → 候选池空 → "加入"按钮显示"无可用候选模型",
+  // 看起来就像"加入按钮没效果"。空备选链是合法状态:此时 Gateway 主模型失败直接报错,不做隐式 fallback。
+  normalizeDefaultModelSelection(state.config)
 
   // 注意:不再强制同步到各 agent 的 model.primary
   // 子 Agent 的模型覆盖是 OpenClaw 正常功能(用户可通过对话为不同 Agent 设置不同模型)
@@ -1081,6 +1167,7 @@ function applyDefaultModel(state) {
 // 顶部按钮事件
 function bindTopActions(page, state) {
   page.querySelector('#btn-add-provider').onclick = () => addProvider(page, state)
+  page.querySelector('#btn-import-client').onclick = () => importClientConfigs(page, state)
   page.querySelector('#btn-undo').onclick = () => undo(page, state)
 
   // 晴辰云:获取模型列表 → 弹窗让用户选择要添加的模型
@@ -1198,6 +1285,121 @@ function bindTopActions(page, state) {
   }
 }
 
+function uniqueProviderKey(providers, desired) {
+  const base = (desired || 'imported').replace(/[^a-zA-Z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'imported'
+  if (!providers[base]) return base
+  let i = 2
+  while (providers[`${base}-${i}`]) i++
+  return `${base}-${i}`
+}
+
+function candidateModels(candidate) {
+  const ids = Array.isArray(candidate.models) ? candidate.models.filter(Boolean) : []
+  return [...new Set(ids)].map(id => ({ id, name: id }))
+}
+
+async function importClientConfigs(page, state) {
+  if (!state.config) { toast(t('models.configNotReady'), 'warning'); return }
+  const btn = page.querySelector('#btn-import-client')
+  const oldText = btn?.textContent
+  if (btn) { btn.disabled = true; btn.textContent = t('models.importScanning') }
+  let candidates = []
+  try {
+    const result = await api.scanModelClientConfigs()
+    candidates = Array.isArray(result?.candidates) ? result.candidates : []
+  } catch (e) {
+    toast(humanizeError(e, t('models.importScanFailed')), 'error')
+    return
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = oldText || t('models.importClientConfigs') }
+  }
+  if (!candidates.length) {
+    toast(t('models.importNoneFound'), 'info')
+    return
+  }
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `
+    <div class="modal" style="max-height:85vh;overflow-y:auto;max-width:760px">
+      <div class="modal-title">${t('models.importClientTitle')}</div>
+      <div class="form-hint" style="margin-bottom:12px;line-height:1.7">${t('models.importClientHint')}</div>
+      <div style="display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow:auto;padding-right:4px">
+        ${candidates.map((c, idx) => {
+          const models = candidateModels(c)
+          const status = c.apiKeyStatus === 'found' ? t('models.importKeyFound') : (c.apiKeyStatus === 'missing' ? t('models.importKeyMissing') : t('models.importKeyNone'))
+          const disabled = !c.importable || !models.length
+          const checked = !disabled && c.apiKeyStatus !== 'missing'
+          return `
+            <label style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border-color);border-radius:var(--radius-md);background:var(--bg-tertiary);opacity:${disabled ? '0.65' : '1'}">
+              <input type="checkbox" data-index="${idx}" ${disabled ? 'disabled' : ''} ${checked ? 'checked' : ''} style="margin-top:4px;accent-color:var(--primary)">
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                  <strong style="color:var(--text-primary)">${escapeHtml(c.displayName || c.providerKey || c.source)}</strong>
+                  <span style="font-size:11px;color:var(--text-tertiary)">${escapeHtml(c.source || '')}</span>
+                </div>
+                <div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-top:4px">
+                  ${t('models.providerName')}: <code>${escapeHtml(c.providerKey || '')}</code>
+                  · ${t('models.apiType')}: <code>${escapeHtml(getApiTypeLabel(c.api))}</code>
+                  · ${t('models.apiKey')}: <code>${escapeHtml(c.apiKey || '-')}</code> <span style="color:${c.apiKeyStatus === 'found' ? 'var(--success)' : 'var(--warning, #d97706)'}">${status}</span>
+                </div>
+                <div style="font-size:12px;color:var(--text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(c.baseUrl || '')}">${escapeHtml(c.baseUrl || '')}</div>
+                <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
+                  ${models.map(m => `<span style="font-size:11px;font-family:var(--font-mono);background:var(--bg-primary);border:1px solid var(--border-color);border-radius:12px;padding:2px 7px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(m.id)}">${escapeHtml(m.id)}</span>`).join('')}
+                </div>
+                ${c.warning ? `<div class="form-hint" style="margin-top:6px;color:var(--warning, #d97706)">${escapeHtml(c.warning)}</div>` : ''}
+                ${c.authHint ? `<div class="form-hint" style="margin-top:6px">${t('models.importAuthHint')}: <code>${escapeHtml(c.authHint)}</code></div>` : ''}
+                ${!models.length ? `<div class="form-hint" style="margin-top:6px;color:var(--warning, #d97706)">${t('models.importNoModels')}</div>` : ''}
+              </div>
+            </label>
+          `
+        }).join('')}
+      </div>
+      <div class="modal-actions" style="margin-top:16px">
+        <button class="btn btn-primary" data-action="import">${t('models.importSelected')}</button>
+        <button class="btn btn-secondary" data-action="cancel">${t('common.cancel')}</button>
+      </div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove() })
+  overlay.querySelector('[data-action="cancel"]').onclick = () => overlay.remove()
+  overlay.querySelector('[data-action="import"]').onclick = () => {
+    const selected = [...overlay.querySelectorAll('input[type="checkbox"]:checked')]
+      .map(input => candidates[Number(input.dataset.index)])
+      .filter(Boolean)
+    if (!selected.length) { toast(t('models.importNoneSelected'), 'warning'); return }
+    pushUndo(state)
+    if (!state.config.models) state.config.models = { mode: 'replace', providers: {} }
+    if (!state.config.models.providers) state.config.models.providers = {}
+    const providers = state.config.models.providers
+    let imported = 0
+    let firstFull = ''
+    for (const candidate of selected) {
+      const models = candidateModels(candidate)
+      if (!models.length) continue
+      const key = uniqueProviderKey(providers, candidate.providerKey || candidate.id)
+      providers[key] = {
+        baseUrl: candidate.baseUrl || '',
+        apiKey: candidate.apiKey || '',
+        api: candidate.api || 'openai-completions',
+        models,
+      }
+      if (!firstFull && candidate.apiKeyStatus !== 'missing') firstFull = `${key}/${models[0].id}`
+      imported++
+    }
+    if (!imported) { toast(t('models.importNoImportable'), 'warning'); return }
+    if (!getCurrentPrimary(state.config) && firstFull) {
+      ensureDefaultModelConfig(state).primary = firstFull
+    }
+    overlay.remove()
+    renderProviders(page, state)
+    renderDefaultBar(page, state)
+    updateUndoBtn(page, state)
+    autoSave(state)
+    toast(t('models.importDone', { count: imported }), 'success')
+  }
+}
+
 // 添加服务商(带预设快捷选择)
 function addProvider(page, state) {
   // 构建预设按钮 HTML
@@ -1246,6 +1448,7 @@ function addProvider(page, state) {
   `
 
   document.body.appendChild(overlay)
+  attachTermTooltips(overlay)
 
   // 预设按钮点击自动填充
   overlay.querySelectorAll('.preset-btn').forEach(btn => {
@@ -1304,11 +1507,13 @@ function addProvider(page, state) {
 // 编辑服务商
 function editProvider(page, state, providerKey) {
   const p = state.config.models.providers[providerKey]
+  // showModal 不返回 overlay，需要异步扫 document.body 给 ⓘ 按钮绑定 click（attachTermTooltips 内部已去重）
+  setTimeout(() => attachTermTooltips(document.body), 0)
   showModal({
     title: t('models.editProviderTitle', { name: providerKey }),
     fields: [
       { name: 'baseUrl', label: t('models.baseUrl'), value: p.baseUrl || '', hint: t('models.baseUrlHint') },
-      { name: 'apiKey', label: t('models.apiKey'), value: p.apiKey || '', hint: t('models.apiKeyEditHint') },
+      { name: 'apiKey', label: t('models.apiKey') + termHelpHtml('apikey'), value: p.apiKey || '', hint: t('models.apiKeyEditHint') },
       {
         name: 'api', label: t('models.apiType'), type: 'select', value: p.api || 'openai-completions',
         options: API_TYPES,
@@ -1508,7 +1713,16 @@ async function handleBatchDelete(section, page, state, providerKey) {
   const checked = [...section.querySelectorAll('.model-checkbox:checked')]
   if (!checked.length) { toast(t('models.batchSelectHint'), 'warning'); return }
   const ids = checked.map(cb => cb.dataset.modelId)
-  const yes = await showConfirm(t('models.confirmBatchDelete', { count: ids.length, ids: ids.join(', ') }))
+  const yes = await showConfirm({
+    title: t('models.batchDeleteTitle', { count: ids.length }),
+    message: t('models.confirmBatchDelete', { count: ids.length, ids: ids.join(', ') }),
+    impact: [
+      t('models.batchDeleteImpact'),
+      t('models.batchDeleteImpactConfig'),
+    ],
+    confirmText: t('models.batchDeleteBtn'),
+    cancelText: t('models.batchDeleteCancel'),
+  })
   if (!yes) return
   pushUndo(state)
   const provider = state.config.models.providers[providerKey]
@@ -1604,7 +1818,7 @@ async function handleBatchTest(section, state, providerKey) {
   }
 
   const aborted = ctrl.abort
-  autoSave(state)
+  saveConfigOnly(state)
   if (aborted) {
     toast(t('models.batchTestAborted', { ok, fail, skip: ids.length - ok - fail }), 'warning')
   } else {

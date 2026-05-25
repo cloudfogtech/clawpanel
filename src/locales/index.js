@@ -36,13 +36,39 @@ import routeMap from './modules/routeMap.js'
 import extensions from './modules/extensions.js'
 import engine from './modules/engine.js'
 import ciaoBug from './modules/ciaoBug.js'
+import cliConflict from './modules/cliConflict.js'
+import glossary from './modules/glossary.js'
+import hermesLazyDeps from './modules/hermesLazyDeps.js'
+import notifications from './modules/notifications.js'
+import kernel from './modules/kernel.js'
 
 const MODULES = {
   common, sidebar, instance, dashboard, services, settings,
   models, agents, agentDetail, gateway, security, communication, channels,
   memory, dreaming, cron, usage, skills, chat, chatDebug, setup, about,
   ext, logs, assistant, toast, modal, engagement, diagnose, routeMap, extensions,
-  engine, ciaoBug,
+  engine, ciaoBug, cliConflict, glossary, hermesLazyDeps, notifications, kernel,
+}
+
+/** 判断是否是 _() 调用产生的翻译对象（有 'zh-CN' 字符串字段） */
+function _isTranslationObject(v) {
+  return v && typeof v === 'object' && typeof v['zh-CN'] === 'string'
+}
+
+/** 递归 materialize：把翻译对象转成当前语言的字符串，嵌套对象继续递归 */
+function _materialize(entries, lang) {
+  const out = {}
+  for (const [key, val] of Object.entries(entries)) {
+    if (_isTranslationObject(val)) {
+      out[key] = val[lang] || val['zh-CN'] || key
+    } else if (val && typeof val === 'object' && !Array.isArray(val)) {
+      // 嵌套字典（如 common.errorHint.{generic,network,...}）— 递归
+      out[key] = _materialize(val, lang)
+    } else {
+      out[key] = val
+    }
+  }
+  return out
 }
 
 /** 构建所有语言字典 { 'zh-CN': { common: {...}, sidebar: {...}, ... }, ... } */
@@ -51,10 +77,7 @@ export function buildLocales() {
   for (const lang of SUPPORTED_LANGS) {
     result[lang] = {}
     for (const [mod, entries] of Object.entries(MODULES)) {
-      result[lang][mod] = {}
-      for (const [key, translations] of Object.entries(entries)) {
-        result[lang][mod][key] = translations[lang] || translations['zh-CN'] || key
-      }
+      result[lang][mod] = _materialize(entries, lang)
     }
   }
   return result

@@ -148,20 +148,36 @@ fn base_version(v: &str) -> String {
     base.to_string()
 }
 
+fn has_version_suffix(v: &str) -> bool {
+    v.contains('-')
+}
+
 /// 判断 CLI 报告的版本是否与推荐版匹配（考虑汉化版 -zh.x 后缀差异）
 fn versions_match(cli_version: &str, recommended: &str) -> bool {
     if cli_version == recommended {
         return true;
     }
     // CLI 报告 "2026.3.13"，推荐版 "2026.3.13-zh.1" → 基础版本相同即视为匹配
-    base_version(cli_version) == base_version(recommended)
+    if base_version(cli_version) != base_version(recommended) {
+        return false;
+    }
+    if has_version_suffix(cli_version) {
+        return false;
+    }
+    true
 }
 
 /// 判断推荐版是否真的比当前版本更新（忽略 -zh.x 后缀）
 fn recommended_is_newer(recommended: &str, current: &str) -> bool {
     let r = parse_version(&base_version(recommended));
     let c = parse_version(&base_version(current));
-    r > c
+    if r != c {
+        return r > c;
+    }
+    if has_version_suffix(recommended) && has_version_suffix(current) {
+        return parse_version(recommended) > parse_version(current);
+    }
+    false
 }
 
 fn load_version_policy() -> VersionPolicy {
@@ -1891,22 +1907,6 @@ pub fn write_mcp_config(config: Value) -> Result<(), String> {
 /// macOS: 优先从 npm 包的 package.json 读取（含完整后缀），fallback 到 CLI
 /// Windows/Linux: 优先读文件系统，fallback 到 CLI
 async fn get_local_version() -> Option<String> {
-    // Fix #219: 优先从运行中的 openclaw 实例获取版本，避免多实例共存时读取到非活跃安装的版本
-    if let Ok(output) = crate::utils::openclaw_command_async()
-        .args(["status", "--json"])
-        .output()
-        .await
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(ver) = crate::commands::skills::extract_json_pub(&stdout)
-                .and_then(|v| v.get("runtimeVersion")?.as_str().map(String::from))
-            {
-                return Some(ver);
-            }
-        }
-    }
-
     #[cfg(target_os = "macos")]
     {
         if let Some(cli_path) = crate::utils::resolve_openclaw_cli_path() {
@@ -2031,7 +2031,9 @@ async fn get_local_version() -> Option<String> {
         // 2. standalone 目录
         for sa_dir in all_standalone_dirs() {
             if sa_dir.join("openclaw").exists() || sa_dir.join("VERSION").exists() {
-                return Some("unknown".to_string());
+                if let Some(ver) = read_version_from_installation(&sa_dir.join("openclaw")) {
+                    return Some(ver);
+                }
             }
         }
         // 3. symlink -> package.json
@@ -2049,6 +2051,21 @@ async fn get_local_version() -> Option<String> {
                         return Some(ver);
                     }
                 }
+            }
+        }
+    }
+
+    let mut status_cmd = crate::utils::openclaw_command_async();
+    status_cmd.args(["status", "--json"]);
+    if let Ok(Ok(output)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), status_cmd.output()).await
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(ver) = crate::commands::skills::extract_json_pub(&stdout)
+                .and_then(|v| v.get("runtimeVersion")?.as_str().map(String::from))
+            {
+                return Some(ver);
             }
         }
     }
@@ -2121,6 +2138,57 @@ fn detect_source_from_cmd_shim(cmd_path: &std::path::Path) -> Option<String> {
     None
 }
 
+fn detect_standalone_source_from_dir(dir: &std::path::Path) -> Option<String> {
+    let version_file = dir.join("VERSION");
+    if let Ok(content) = std::fs::read_to_string(&version_file) {
+        let mut edition = String::new();
+        let mut package = String::new();
+        for line in content.lines() {
+            if let Some(value) = line.strip_prefix("edition=") {
+                edition = value.trim().to_ascii_lowercase();
+            } else if let Some(value) = line.strip_prefix("package=") {
+                package = value.trim().to_ascii_lowercase();
+            }
+        }
+        if package.contains("openclaw-zh") || package.contains("@qingchencloud") {
+            return Some("chinese".into());
+        }
+        if package == "openclaw" {
+            return Some("official".into());
+        }
+        if matches!(edition.as_str(), "zh" | "zh-cn" | "chinese" | "cn") {
+            return Some("chinese".into());
+        }
+        if matches!(edition.as_str(), "en" | "official") {
+            return Some("official".into());
+        }
+    }
+    if dir
+        .join("node_modules")
+        .join("@qingchencloud")
+        .join("openclaw-zh")
+        .join("package.json")
+        .exists()
+    {
+        return Some("chinese".into());
+    }
+    if dir
+        .join("node_modules")
+        .join("openclaw")
+        .join("package.json")
+        .exists()
+    {
+        return Some("official".into());
+    }
+    None
+}
+
+fn detect_standalone_source_from_cli_path(cli_path: &std::path::Path) -> Option<String> {
+    cli_path
+        .parent()
+        .and_then(detect_standalone_source_from_dir)
+}
+
 /// 检测当前安装的是官方版还是汉化版
 /// macOS: 优先检查 symlink 指向的实际路径
 /// Windows: 读取 .cmd shim 内容判断实际关联的包
@@ -2134,7 +2202,11 @@ fn detect_installed_source() -> String {
                 .ok()
                 .unwrap_or_else(|| PathBuf::from(&cli_path));
             let source = crate::utils::classify_cli_source(&resolved.to_string_lossy());
-            if source == "npm-zh" || source == "standalone" {
+            if source == "standalone" {
+                return detect_standalone_source_from_cli_path(&resolved)
+                    .unwrap_or_else(|| "chinese".into());
+            }
+            if source == "npm-zh" {
                 return "chinese".into();
             }
             if source == "npm-official" || source == "npm-global" {
@@ -2152,7 +2224,8 @@ fn detect_installed_source() -> String {
         }
         for sa_dir in all_standalone_dirs() {
             if sa_dir.join("openclaw").exists() || sa_dir.join("VERSION").exists() {
-                return "chinese".into();
+                return detect_standalone_source_from_dir(&sa_dir)
+                    .unwrap_or_else(|| "chinese".into());
             }
         }
         "unknown".into()
@@ -2167,7 +2240,11 @@ fn detect_installed_source() -> String {
         if let Some(cli_path) = crate::utils::resolve_openclaw_cli_path() {
             let source = crate::utils::classify_cli_source(&cli_path);
             // 路径本身能确定的情况（standalone 目录、npm-zh 路径含 openclaw-zh）
-            if source == "npm-zh" || source == "standalone" {
+            if source == "standalone" {
+                return detect_standalone_source_from_cli_path(std::path::Path::new(&cli_path))
+                    .unwrap_or_else(|| "chinese".into());
+            }
+            if source == "npm-zh" {
                 return "chinese".into();
             }
             // npm-official / npm-global / unknown: 路径不含包名，读 .cmd 内容判断
@@ -2183,6 +2260,12 @@ fn detect_installed_source() -> String {
                 return s;
             }
         }
+        for sa_dir in all_standalone_dirs() {
+            if sa_dir.join("openclaw.cmd").exists() || sa_dir.join("VERSION").exists() {
+                return detect_standalone_source_from_dir(&sa_dir)
+                    .unwrap_or_else(|| "chinese".into());
+            }
+        }
         // 确实无法判断
         "unknown".into()
     }
@@ -2195,7 +2278,11 @@ fn detect_installed_source() -> String {
                 .ok()
                 .unwrap_or_else(|| PathBuf::from(&cli_path));
             let source = crate::utils::classify_cli_source(&resolved.to_string_lossy());
-            if source == "npm-zh" || source == "standalone" {
+            if source == "standalone" {
+                return detect_standalone_source_from_cli_path(&resolved)
+                    .unwrap_or_else(|| "chinese".into());
+            }
+            if source == "npm-zh" {
                 return "chinese".into();
             }
             if source == "npm-official" || source == "npm-global" {
@@ -2218,7 +2305,8 @@ fn detect_installed_source() -> String {
         // 3. standalone 目录检测
         for sa_dir in all_standalone_dirs() {
             if sa_dir.join("openclaw").exists() || sa_dir.join("VERSION").exists() {
-                return "chinese".into();
+                return detect_standalone_source_from_dir(&sa_dir)
+                    .unwrap_or_else(|| "chinese".into());
             }
         }
         // 4. npm list 兜底
@@ -2408,11 +2496,36 @@ fn scan_all_installations(
             try_add(prefix_path.join("openclaw"));
         }
         if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
+            let localappdata_path = std::path::PathBuf::from(&localappdata);
             try_add(
-                std::path::PathBuf::from(&localappdata)
+                localappdata_path
+                    .join("Programs")
+                    .join("OpenClaw")
+                    .join("openclaw.exe"),
+            );
+            try_add(localappdata_path.join("OpenClaw").join("openclaw.cmd"));
+            try_add(localappdata_path.join("OpenClaw").join("openclaw.exe"));
+            try_add(
+                localappdata_path
                     .join("Programs")
                     .join("nodejs")
                     .join("openclaw.cmd"),
+            );
+            try_add(
+                localappdata_path
+                    .join("Programs")
+                    .join("nodejs")
+                    .join("openclaw.exe"),
+            );
+            try_add(
+                localappdata_path
+                    .join("Programs")
+                    .join("nodejs")
+                    .join("node_modules")
+                    .join("@qingchencloud")
+                    .join("openclaw-zh")
+                    .join("bin")
+                    .join("openclaw.js"),
             );
         }
         if let Ok(program_files) = std::env::var("ProgramFiles") {
@@ -2519,6 +2632,15 @@ fn scan_all_installations(
         #[cfg(target_os = "windows")]
         {
             try_add(base.join("openclaw.cmd"));
+            try_add(base.join("openclaw.exe"));
+            try_add(base.join("openclaw"));
+            try_add(
+                base.join("node_modules")
+                    .join("@qingchencloud")
+                    .join("openclaw-zh")
+                    .join("bin")
+                    .join("openclaw.js"),
+            );
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -5200,6 +5322,372 @@ fn model_env_values() -> HashMap<String, String> {
         }
     }
     values
+}
+
+fn home_path(parts: &[&str]) -> Option<PathBuf> {
+    let mut path = dirs::home_dir()?;
+    for part in parts {
+        path.push(part);
+    }
+    Some(path)
+}
+
+fn strip_config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    for ch in raw.trim().chars() {
+        if ch == '"' || ch == '\'' {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            out.push(ch);
+            continue;
+        }
+        if ch == '#' && quote.is_none() {
+            break;
+        }
+        out.push(ch);
+    }
+    let value = out.trim().trim_end_matches(',').trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn parse_simple_config_blocks(raw: &str) -> HashMap<String, HashMap<String, String>> {
+    let mut blocks: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut current = String::from("");
+    blocks.entry(current.clone()).or_default();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current = trimmed.trim_matches(&['[', ']'][..]).trim().to_string();
+            blocks.entry(current.clone()).or_default();
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        blocks
+            .entry(current.clone())
+            .or_default()
+            .insert(key.trim().to_string(), strip_config_value(value));
+    }
+    blocks
+}
+
+fn first_env_ref(keys: &[&str]) -> (String, String) {
+    for key in keys {
+        if std::env::var(key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return (format!("${{{key}}}"), "found".into());
+        }
+    }
+    if let Some(key) = keys.first() {
+        (format!("${{{key}}}"), "missing".into())
+    } else {
+        (String::new(), "none".into())
+    }
+}
+
+fn find_json_string(value: &Value, keys: &[&str], depth: usize) -> Option<String> {
+    if depth > 5 {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(v) = map.get(*key).and_then(|v| v.as_str()) {
+                    if !v.trim().is_empty() {
+                        return Some(v.trim().to_string());
+                    }
+                }
+            }
+            for v in map.values() {
+                if let Some(found) = find_json_string(v, keys, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        Value::Array(list) => {
+            for v in list {
+                if let Some(found) = find_json_string(v, keys, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+// 客户端配置导入需要把所有渲染必需的字段一次性塞进 Value，分组成 struct 反而会
+// 让调用站全部要先建一个临时结构体，可读性更差。这里显式 allow，仅作用于这个函数。
+#[allow(clippy::too_many_arguments)]
+fn push_client_candidate(
+    out: &mut Vec<Value>,
+    id: &str,
+    source: &str,
+    source_path: &str,
+    provider_key: &str,
+    display_name: &str,
+    base_url: &str,
+    api: &str,
+    api_key: &str,
+    api_key_status: &str,
+    models: Vec<String>,
+    importable: bool,
+    auth_hint: &str,
+    warning: &str,
+) {
+    out.push(json!({
+        "id": id,
+        "source": source,
+        "sourcePath": source_path,
+        "providerKey": provider_key,
+        "displayName": display_name,
+        "baseUrl": base_url,
+        "api": api,
+        "apiKey": api_key,
+        "apiKeyStatus": api_key_status,
+        "models": models,
+        "importable": importable,
+        "authHint": auth_hint,
+        "warning": warning,
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_json_client_file(
+    out: &mut Vec<Value>,
+    id: &str,
+    source: &str,
+    parts: &[&str],
+    provider_key: &str,
+    display_name: &str,
+    base_url: &str,
+    api: &str,
+    env_keys: &[&str],
+    default_model: &str,
+) {
+    let Some(path) = home_path(parts) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let model = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| find_json_string(&value, &["model", "defaultModel", "modelName"], 0))
+        .unwrap_or_else(|| default_model.to_string());
+    let (api_key, status) = first_env_ref(env_keys);
+    let warning = if status == "missing" {
+        "未在当前进程环境中检测到对应 API Key 环境变量，导入后需要在 OpenClaw env 或 .env 中补齐。"
+    } else {
+        ""
+    };
+    push_client_candidate(
+        out,
+        id,
+        source,
+        &path.to_string_lossy(),
+        provider_key,
+        display_name,
+        base_url,
+        api,
+        &api_key,
+        &status,
+        vec![model],
+        true,
+        "",
+        warning,
+    );
+}
+
+#[tauri::command]
+pub fn scan_model_client_configs() -> Result<Value, String> {
+    let mut candidates = Vec::new();
+    if let Some(path) = home_path(&[".codex", "config.toml"]) {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            let blocks = parse_simple_config_blocks(&raw);
+            let root = blocks.get("").cloned().unwrap_or_default();
+            let provider_id = root
+                .get("model_provider")
+                .cloned()
+                .unwrap_or_else(|| "openai".into());
+            let section = blocks
+                .get(&format!("model_providers.{provider_id}"))
+                .cloned()
+                .unwrap_or_default();
+            let model = root
+                .get("model")
+                .cloned()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "gpt-5.1-codex-mini".into());
+            let base_url = section.get("base_url").cloned().unwrap_or_else(|| {
+                if provider_id.contains("codex") {
+                    "https://chatgpt.com/backend-api/codex".into()
+                } else {
+                    "https://api.openai.com/v1".into()
+                }
+            });
+            let wire_api = section.get("wire_api").cloned().unwrap_or_default();
+            let explicit_env_key = section
+                .get("env_key")
+                .cloned()
+                .filter(|v| is_valid_env_key(v));
+            let env_key = explicit_env_key.or_else(|| {
+                if provider_id == "openai" {
+                    Some("OPENAI_API_KEY".into())
+                } else {
+                    None
+                }
+            });
+            let is_external_codex =
+                provider_id.contains("codex") || base_url.contains("chatgpt.com/backend-api/codex");
+            let api = if is_external_codex {
+                "openai-codex-responses"
+            } else if wire_api.contains("responses") {
+                "openai-responses"
+            } else {
+                "openai-completions"
+            };
+            let (api_key, status) = if let Some(key) = env_key.as_deref() {
+                if std::env::var(key)
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    (format!("${{{key}}}"), "found")
+                } else {
+                    (format!("${{{key}}}"), "missing")
+                }
+            } else {
+                (String::new(), "none")
+            };
+            let provider_key = if provider_id == "openai" {
+                "codex-openai".to_string()
+            } else {
+                format!("codex-{provider_id}")
+            };
+            let warning = if is_external_codex {
+                "ChatGPT/Codex OAuth 令牌不会导入到 OpenClaw。请优先使用 Hermes 的 openai-codex 登录。"
+            } else if status == "none" {
+                "Codex 配置没有声明可安全引用的 env_key，无法自动导入 API Key。请在 Codex 配置中添加 env_key，或在 OpenClaw 中手动配置服务商密钥。"
+            } else if status == "missing" {
+                "未在当前进程环境中检测到 Codex 配置引用的 API Key 环境变量，导入后需要在 OpenClaw env 或 .env 中补齐。"
+            } else {
+                ""
+            };
+            push_client_candidate(
+                &mut candidates,
+                "codex-cli",
+                "Codex CLI",
+                &path.to_string_lossy(),
+                &provider_key,
+                &format!("Codex CLI / {provider_id}"),
+                &base_url,
+                api,
+                &api_key,
+                status,
+                vec![model],
+                !is_external_codex && status != "none",
+                if is_external_codex {
+                    "hermes auth login openai-codex"
+                } else {
+                    ""
+                },
+                warning,
+            );
+        }
+    }
+    scan_json_client_file(
+        &mut candidates,
+        "claude-code",
+        "Claude Code",
+        &[".claude", "settings.json"],
+        "anthropic",
+        "Anthropic / Claude Code",
+        "https://api.anthropic.com/v1",
+        "anthropic-messages",
+        &["ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"],
+        "claude-sonnet-4-5-20250514",
+    );
+    scan_json_client_file(
+        &mut candidates,
+        "gemini-cli",
+        "Gemini CLI",
+        &[".gemini", "settings.json"],
+        "google",
+        "Google Gemini CLI",
+        "https://generativelanguage.googleapis.com/v1beta",
+        "google-generative-ai",
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "gemini-2.5-pro",
+    );
+    for (env_key, provider_key, display_name, base_url, api, model) in [
+        (
+            "OPENAI_API_KEY",
+            "openai-env",
+            "OpenAI 环境变量",
+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            "openai-completions",
+            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()),
+        ),
+        (
+            "ANTHROPIC_API_KEY",
+            "anthropic-env",
+            "Anthropic 环境变量",
+            "https://api.anthropic.com/v1".into(),
+            "anthropic-messages",
+            std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-5-20250514".into()),
+        ),
+        (
+            "GEMINI_API_KEY",
+            "gemini-env",
+            "Gemini 环境变量",
+            "https://generativelanguage.googleapis.com/v1beta".into(),
+            "google-generative-ai",
+            std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-pro".into()),
+        ),
+    ] {
+        if std::env::var(env_key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            push_client_candidate(
+                &mut candidates,
+                provider_key,
+                "Environment",
+                env_key,
+                provider_key,
+                display_name,
+                &base_url,
+                api,
+                &format!("${{{env_key}}}"),
+                "found",
+                vec![model],
+                true,
+                "",
+                "",
+            );
+        }
+    }
+    Ok(json!({ "candidates": candidates }))
 }
 
 fn resolve_model_api_key(api_key: &str) -> Result<String, String> {

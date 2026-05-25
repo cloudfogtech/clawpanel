@@ -4,6 +4,7 @@
  */
 import { t } from '../../../lib/i18n.js'
 import { api } from '../../../lib/tauri-api.js'
+import { humanizeError } from '../../../lib/humanize-error.js'
 
 function esc(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -108,7 +109,7 @@ export function render() {
         jobs = Array.isArray(data) ? data : []
         errorMsg = ''
       } catch (_) {
-        errorMsg = String(e.message || e)
+        errorMsg = humanizeError(e, t('engine.cronLoadFailed') || 'Load cron jobs failed')
         jobs = []
       }
     }
@@ -121,7 +122,6 @@ export function render() {
   /**
    * Derive a semantic job state label.
    * Priority: running > paused > disabled > scheduled
-   * Mirrors the logic used by hermes-web-ui's JobCard.vue.
    */
   function jobStateOf(j) {
     if (j.state === 'running') return 'running'
@@ -393,8 +393,18 @@ export function render() {
     el.querySelectorAll('.hm-cron-del').forEach(btn => {
       btn.addEventListener('click', async () => {
         const job = jobs.find(j => (j.id || j.name) === btn.dataset.id)
-        const msg = t('engine.cronConfirmDelete').replace('{name}', job?.name || btn.dataset.id)
-        if (!confirm(msg)) return
+        const name = job?.name || btn.dataset.id
+        const ok = await showConfirm({
+          title: t('engine.cronDeleteTitle', { name }),
+          message: t('engine.cronConfirmDelete', { name }),
+          impact: [
+            t('engine.cronDeleteImpactStop'),
+            t('engine.cronDeleteImpactHistory'),
+          ],
+          confirmText: t('engine.cronDeleteBtn'),
+          cancelText: t('engine.cronDeleteCancel'),
+        })
+        if (!ok) return
         btn.disabled = true
         try { await gw(`/api/jobs/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' }) } catch (_) {}
         await loadJobs(); draw()
@@ -553,7 +563,7 @@ export function render() {
         if (repeat !== undefined) payload.repeat = repeat
 
         if (isEdit) {
-          // PATCH does not accept `name`; keep it out to match hermes-web-ui contract.
+          // PATCH does not accept `name`.
           const patch = { schedule: payload.schedule, prompt, deliver }
           if (repeat !== undefined) patch.repeat = repeat
           await gw(`/api/jobs/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) })
@@ -563,7 +573,7 @@ export function render() {
         editingJob = null
         await loadJobs()
       } catch (e) {
-        errorMsg = String(e.message || e)
+        errorMsg = humanizeError(e, t('engine.cronSaveFailed') || 'Save cron job failed')
       }
       busy = false; draw()
     })

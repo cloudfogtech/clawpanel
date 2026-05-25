@@ -87,6 +87,7 @@ jobs:
         with:
           workspaces: src-tauri -> target
           key: ${{ matrix.platform.name }}
+          save-if: false
 
       - name: 安装 Linux 系统依赖
         if: runner.os == 'Linux'

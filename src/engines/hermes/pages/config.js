@@ -4,6 +4,7 @@
 import { t } from '../../../lib/i18n.js'
 import { api } from '../../../lib/tauri-api.js'
 import { toast } from '../../../components/toast.js'
+import { humanizeError } from '../../../lib/humanize-error.js'
 
 export function render() {
   const el = document.createElement('div')
@@ -26,13 +27,13 @@ export function render() {
     el.innerHTML = `
       <div class="hm-hero">
         <div class="hm-hero-title">
-          <div class="hm-hero-eyebrow">HERMES AGENT · CONFIG</div>
+          <div class="hm-hero-eyebrow">${t('engine.hermesConfigEyebrow')}</div>
           <h1 class="hm-hero-h1">${t('engine.hermesConfigTitle')}</h1>
           <div class="hm-hero-sub">~/.hermes/config.yaml</div>
         </div>
         <div class="hm-hero-actions">
-          <button class="hm-btn hm-btn--ghost hm-btn--sm" id="hm-config-reload" ${loading || saving ? 'disabled' : ''}>重新加载</button>
-          <button class="hm-btn hm-btn--cta hm-btn--sm" id="hm-config-save" ${loading || saving ? 'disabled' : ''}>保存配置</button>
+          <button class="hm-btn hm-btn--ghost hm-btn--sm" id="hm-config-reload" ${loading || saving ? 'disabled' : ''}>${t('engine.hermesConfigReload')}</button>
+          <button class="hm-btn hm-btn--cta hm-btn--sm" id="hm-config-save" ${loading || saving ? 'disabled' : ''}>${t('engine.hermesConfigSave')}</button>
         </div>
       </div>
 
@@ -40,7 +41,7 @@ export function render() {
         <div class="hm-panel-header">
           <div class="hm-panel-title">config.yaml</div>
           <div class="hm-panel-actions">
-            <span class="hm-muted">${saving ? 'saving…' : loading ? 'loading…' : 'raw yaml editor'}</span>
+            <span class="hm-muted">${saving ? t('engine.hermesConfigStatusSaving') : loading ? t('engine.hermesConfigStatusLoading') : t('engine.hermesConfigStatusReady')}</span>
           </div>
         </div>
         <div class="hm-panel-body" style="padding:0">
@@ -61,7 +62,7 @@ export function render() {
       const data = await api.hermesConfigRawRead()
       yaml = data?.yaml || ''
     } catch (err) {
-      error = String(err?.message || err).replace(/^Error:\s*/, '')
+      error = humanizeError(err, t('engine.hermesConfigLoadFailed') || 'Load config failed')
     } finally {
       loading = false
       draw()
@@ -76,9 +77,9 @@ export function render() {
     draw()
     try {
       await api.hermesConfigRawWrite(yaml)
-      toast('配置已保存，建议重启 Hermes Gateway 生效', 'success')
+      toast(t('engine.hermesConfigSaveSuccess'), 'success')
     } catch (err) {
-      error = String(err?.message || err).replace(/^Error:\s*/, '')
+      error = humanizeError(err, t('engine.hermesConfigSaveFailed') || 'Save failed')
       toast(error, 'error')
     } finally {
       saving = false

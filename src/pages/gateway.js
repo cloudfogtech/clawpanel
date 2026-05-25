@@ -3,8 +3,10 @@
  */
 import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
+import { humanizeError } from '../lib/humanize-error.js'
 import { tryShowEngagement } from '../components/engagement.js'
 import { t } from '../lib/i18n.js'
+import { termHelpHtml, attachTermTooltips } from '../lib/term-tooltip.js'
 
 // 兼容新版 SecretRef：token 可能是 string 或 { $env: "VAR" } / { $ref: "x/y" }
 function _tokenDisplayStr(token) {
@@ -71,7 +73,7 @@ async function loadConfig(page, state) {
     renderConfig(page, state)
   } catch (e) {
     el.innerHTML = '<div style="color:var(--error);padding:20px">' + t('gateway.loadFailed') + ': ' + e + '</div>'
-    toast(t('gateway.loadFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('gateway.loadFailed')), 'error')
   }
 }
 
@@ -153,7 +155,7 @@ function renderConfig(page, state) {
         </div>
       </div>
       <div class="form-group" id="gw-auth-token-group" style="${gw.auth?.mode === 'password' ? 'display:none' : ''}">
-        <label class="form-label">${t('gateway.tokenLabel')}</label>
+        <label class="form-label">${t('gateway.tokenLabel')}${termHelpHtml('apikey')}</label>
         <div style="display:flex;gap:8px">
           <input class="form-input" id="gw-token" type="password" value="${_tokenDisplayStr(gw.auth?.token || gw.authToken)}" placeholder="${t('gateway.tokenPlaceholder')}" style="flex:1" ${_isSecretRef(gw.auth?.token) ? 'readonly' : ''}>
           <button class="btn btn-sm btn-secondary" id="btn-toggle-token">${t('gateway.show')}</button>
@@ -241,6 +243,7 @@ function renderConfig(page, state) {
   `
 
   bindConfigEvents(el)
+  attachTermTooltips(el)
 }
 
 function bindConfigEvents(el) {
@@ -295,6 +298,15 @@ function bindConfigEvents(el) {
 
 async function saveConfig(page, state) {
   const port = parseInt(page.querySelector('#gw-port')?.value) || 18789
+
+  // P1-6: 用内核 config.schema.lookup 即时校验 port（无 schema 时降级放行）
+  const portCheck = await validateField('gateway.port', port)
+  if (!portCheck.ok) {
+    toast(portCheck.message, 'error')
+    page.querySelector('#gw-port')?.focus()
+    return
+  }
+
   const bindRadio = page.querySelector('input[name="gw-bind"]:checked')
   const bind = bindRadio?.value || 'loopback'
   const mode = 'local'
@@ -337,9 +349,9 @@ async function saveConfig(page, state) {
       toast(t('gateway.reloaded'), 'success')
       setTimeout(tryShowEngagement, 3000)
     } catch (e) {
-      toast(t('gateway.savedButReloadFailed') + ': ' + e, 'warning')
+      toast(humanizeError(e, t('gateway.savedButReloadFailed')), 'warning')
     }
   } catch (e) {
-    toast(t('gateway.saveFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('gateway.saveFailed')), 'error')
   }
 }

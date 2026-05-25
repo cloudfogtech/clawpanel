@@ -218,6 +218,21 @@
   font-size: var(--font-size-md);
 }
 
+.service-name .proto-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border-radius: 4px;
+  background: var(--accent-muted);
+  color: var(--accent);
+  border: 1px solid var(--accent-muted);
+  vertical-align: middle;
+  cursor: help;
+}
+
 .service-desc {
   font-size: var(--font-size-xs);
   color: var(--text-tertiary);
@@ -2656,3 +2671,480 @@
    编辑改版后 memory.js 用 .hm-mem-overview + .hm-mem-panel 自然堆叠（见
    engines/hermes/style/hermes.css）。原来 .hm-memory-* 那一坨规则已无任何
    JS / CSS 引用，已在此处删除。 */
+
+/* === 通用页面级内联错误（profiles / kanban / oauth 等加载失败时显示） === */
+.page-inline-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin: 16px 0;
+  padding: 16px 18px;
+  border: 1px solid var(--border-primary);
+  border-left: 3px solid var(--error, #ef4444);
+  border-radius: 12px;
+  background: var(--bg-glass);
+  color: var(--text-primary);
+}
+.page-inline-error-icon {
+  font-size: 20px;
+  line-height: 1;
+  margin-top: 2px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--error, #ef4444);
+}
+.page-inline-error-icon svg {
+  width: 20px;
+  height: 20px;
+}
+.page-inline-error-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.page-inline-error-message {
+  color: var(--error, #ef4444);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+.page-inline-error-hint {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.page-inline-error-details {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.page-inline-error-details summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+  list-style: none;
+}
+.page-inline-error-details summary::before {
+  content: '▶';
+  display: inline-block;
+  font-size: 9px;
+  margin-right: 6px;
+  transition: transform 0.18s ease;
+}
+.page-inline-error-details[open] summary::before {
+  transform: rotate(90deg);
+}
+.page-inline-error-details pre {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--bg-tertiary, rgba(0,0,0,0.04));
+  border-radius: 6px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+}
+
+/* === Engine Select · Monolith 对角线全屏 ===
+   左上三角 OpenClaw（石墨黑）vs 右下三角 Hermes（象牙白）。
+   用 position: fixed 跳出 #content 范围，覆盖整个 viewport（含 sidebar）。 */
+
+.engine-select-page.es-monolith {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  margin: 0;
+  padding: 0;
+  max-width: none;
+  overflow: hidden;
+  background: #f5f3ee; /* 兜底色 */
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  animation: es-fadein 0.5s ease;
+}
+@keyframes es-fadein { from { opacity: 0 } to { opacity: 1 } }
+
+.es-stage { position: absolute; inset: 0 }
+
+/* —— 两个三角形 —— */
+.es-panel {
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+  transition: filter 0.6s ease, clip-path 0.8s cubic-bezier(0.7, 0, 0.3, 1);
+}
+.es-panel-openclaw {
+  clip-path: polygon(0 0, 0 100%, 100% 0);
+  background: #0c0d12;
+}
+/* 微妙网格纹（OpenClaw 侧） */
+.es-panel-openclaw::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 60px 60px;
+  background-position: -1px -1px;
+  pointer-events: none;
+}
+
+.es-panel-hermes {
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+  background: #f5f3ee;
+}
+.es-panel-hermes::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(0, 0, 0, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.04) 1px, transparent 1px);
+  background-size: 60px 60px;
+  background-position: -1px -1px;
+  pointer-events: none;
+}
+
+/* —— 角落极光发光 —— */
+.es-glow {
+  position: absolute;
+  pointer-events: none;
+  transition: opacity 0.5s ease;
+}
+.es-glow-openclaw {
+  top: -10%;
+  left: -10%;
+  width: 50%;
+  height: 50%;
+  background: radial-gradient(circle, rgba(110, 100, 255, 0.4) 0%, transparent 60%);
+  filter: blur(40px);
+  clip-path: polygon(0 0, 100% 0, 0 100%);
+}
+.es-glow-hermes {
+  bottom: -10%;
+  right: -10%;
+  width: 50%;
+  height: 50%;
+  background: radial-gradient(circle, rgba(220, 130, 60, 0.28) 0%, transparent 60%);
+  filter: blur(40px);
+  clip-path: polygon(100% 100%, 0 100%, 100% 0);
+}
+
+/* —— 中线（极细发光） —— */
+.es-divider {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(45deg, transparent calc(50% - 0.5px), rgba(180, 180, 180, 0.6) 50%, transparent calc(50% + 0.5px));
+  pointer-events: none;
+  transition: opacity 0.5s ease;
+}
+
+/* —— 顶部 banner + 角标 —— */
+.es-top-banner {
+  position: absolute;
+  top: 32px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: rgba(180, 180, 180, 0.78);
+  font-size: 11px;
+  letter-spacing: 0.4em;
+  text-transform: uppercase;
+  z-index: 5;
+  pointer-events: none;
+  font-weight: 500;
+  transition: opacity 0.5s ease;
+}
+.es-corner-mark {
+  position: absolute;
+  font-size: 11px;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 5;
+  font-weight: 500;
+  transition: opacity 0.5s ease;
+}
+.es-corner-tl { top: 32px; left: 36px; color: rgba(255, 255, 255, 0.45) }
+.es-corner-br { bottom: 32px; right: 36px; color: rgba(0, 0, 0, 0.45) }
+
+/* —— 内容定位（重心放在三角形质心） —— */
+.es-content {
+  position: absolute;
+  pointer-events: none;
+  z-index: 3;
+  transition: transform 0.7s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.5s, filter 0.5s;
+}
+.es-content-openclaw {
+  top: 11%;
+  left: 6.5%;
+  color: #fafafa;
+  text-align: left;
+  max-width: 44vw;
+}
+.es-content-hermes {
+  bottom: 11%;
+  right: 6.5%;
+  color: #18171a;
+  text-align: right;
+  max-width: 44vw;
+}
+
+/* —— hover 联动（用 [data-hover] attribute 替代 :has()） —— */
+.es-stage[data-hover='openclaw'] .es-panel-hermes { filter: brightness(0.94) saturate(0.85) }
+.es-stage[data-hover='hermes'] .es-panel-openclaw { filter: brightness(0.6) }
+.es-stage[data-hover='openclaw'] .es-content-hermes,
+.es-stage[data-hover='hermes'] .es-content-openclaw {
+  opacity: 0.25;
+  filter: blur(2px);
+}
+.es-stage[data-hover='openclaw'] .es-content-openclaw { transform: translateX(8px) }
+.es-stage[data-hover='hermes'] .es-content-hermes { transform: translateX(-8px) }
+
+/* —— 顶部 logo + 序号 —— */
+.es-product-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 28px;
+}
+.es-content-hermes .es-product-row { flex-direction: row-reverse }
+
+.es-product-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  display: grid;
+  place-items: center;
+}
+.es-content-hermes .es-product-icon {
+  background: rgba(0, 0, 0, 0.05);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+}
+.es-product-icon svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.6 }
+
+.es-product-tag {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+
+/* —— 巨字标题 —— */
+.es-title {
+  font-size: clamp(80px, 13vw, 200px);
+  font-weight: 200;
+  letter-spacing: -0.055em;
+  line-height: 0.92;
+  margin-bottom: 28px;
+}
+
+/* —— 副标题 —— */
+.es-tagline {
+  font-size: clamp(20px, 1.8vw, 28px);
+  line-height: 1.4;
+  font-weight: 300;
+  max-width: 540px;
+  margin-bottom: 32px;
+  opacity: 0.78;
+  letter-spacing: -0.01em;
+}
+.es-content-hermes .es-tagline { margin-left: auto }
+
+/* —— 特性列表 —— */
+.es-feature-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 44px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.6;
+  list-style: none;
+  padding: 0;
+}
+.es-content-hermes .es-feature-list { align-items: flex-end }
+.es-feature-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  opacity: 0.7;
+}
+.es-content-hermes .es-feature-list li { flex-direction: row-reverse }
+.es-feature-list li::before {
+  content: '';
+  width: 16px;
+  height: 1px;
+  background: currentColor;
+  opacity: 0.4;
+}
+
+/* —— CTA 按钮 —— */
+.es-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 28px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  pointer-events: none;
+  transition: all 0.35s ease;
+  font-family: inherit;
+}
+.es-content-openclaw .es-cta {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+.es-content-hermes .es-cta {
+  background: rgba(0, 0, 0, 0.06);
+  color: #18171a;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  flex-direction: row-reverse;
+}
+.es-stage[data-hover='openclaw'] .es-content-openclaw .es-cta {
+  background: #fff;
+  color: #0a0a0a;
+  border-color: #fff;
+}
+.es-stage[data-hover='hermes'] .es-content-hermes .es-cta {
+  background: #0a0a0a;
+  color: #fff;
+  border-color: #0a0a0a;
+}
+.es-cta-arrow {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  transition: transform 0.3s;
+  font-weight: 400;
+}
+.es-stage[data-hover='openclaw'] .es-content-openclaw .es-cta-arrow { transform: translateX(4px) }
+.es-stage[data-hover='hermes'] .es-content-hermes .es-cta-arrow { transform: translateX(-4px) }
+
+/* —— 底部次级链接（两个都要 / 稍后再说） —— */
+.es-secondary {
+  position: absolute;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  z-index: 4;
+  padding: 8px 18px;
+  border-radius: 999px;
+  background: rgba(150, 150, 150, 0.08);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  border: 1px solid rgba(180, 180, 180, 0.18);
+  transition: opacity 0.5s ease;
+}
+.es-secondary-link {
+  background: transparent;
+  border: 0;
+  font-family: inherit;
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+  color: rgba(150, 150, 150, 0.85);
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 6px;
+  transition: color 0.2s ease, background 0.2s ease;
+}
+.es-secondary-link:hover {
+  color: rgba(20, 20, 20, 0.95);
+  background: rgba(180, 180, 180, 0.18);
+}
+.es-secondary-link.loading {
+  opacity: 0.5;
+  cursor: wait;
+}
+.es-secondary-sep {
+  color: rgba(150, 150, 150, 0.5);
+  font-size: 11px;
+  user-select: none;
+}
+
+/* —— 选中态：三角形扩满（数据属性触发） —— */
+.es-stage[data-expanding='openclaw'] .es-panel-openclaw,
+.es-stage[data-expanding='hermes'] .es-panel-hermes {
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%);
+  z-index: 5;
+}
+.es-stage[data-expanding='openclaw'] .es-panel-hermes,
+.es-stage[data-expanding='hermes'] .es-panel-openclaw {
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+.es-stage[data-expanding] .es-content,
+.es-stage[data-expanding] .es-divider,
+.es-stage[data-expanding] .es-top-banner,
+.es-stage[data-expanding] .es-corner-mark,
+.es-stage[data-expanding] .es-secondary {
+  opacity: 0;
+}
+
+/* —— 全屏 reveal（attach 到 body，跨路由切换存活） —— */
+.es-reveal {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 9000;
+  pointer-events: none;
+  background: #0c0d12;
+  transition: width 0.9s cubic-bezier(0.65, 0, 0.35, 1), height 0.9s cubic-bezier(0.65, 0, 0.35, 1), opacity 0.6s ease;
+}
+.es-reveal[data-engine='openclaw'] { background: #0c0d12 }
+.es-reveal[data-engine='hermes'] { background: #f5f3ee }
+.es-reveal.es-reveal-active { width: 260vmax; height: 260vmax }
+.es-reveal.es-reveal-fadeout { opacity: 0 }
+
+/* —— 移动端响应式 —— */
+@media (max-width: 760px) {
+  .es-content-openclaw { top: 8%; left: 5% }
+  .es-content-hermes { bottom: 8%; right: 5% }
+  .es-title { font-size: clamp(56px, 14vw, 120px) }
+  .es-tagline { font-size: 16px; margin-bottom: 20px }
+  .es-feature-list { gap: 8px; font-size: 12.5px; margin-bottom: 28px }
+  .es-cta { padding: 12px 22px; font-size: 12px }
+  .es-corner-tl, .es-corner-br { font-size: 10px; letter-spacing: 0.24em }
+  .es-corner-tl { top: 16px; left: 18px }
+  .es-corner-br { bottom: 16px; right: 18px }
+  .es-top-banner { top: 18px; font-size: 10px; letter-spacing: 0.32em }
+  .es-secondary { bottom: 16px }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .engine-select-page.es-monolith,
+  .es-panel,
+  .es-content,
+  .es-cta,
+  .es-glow,
+  .es-divider,
+  .es-reveal,
+  .es-top-banner,
+  .es-corner-mark,
+  .es-secondary {
+    transition: none !important;
+    animation: none !important;
+  }
+}

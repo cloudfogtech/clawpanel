@@ -1,8 +1,7 @@
 /**
  * Hermes Chat Store — reactive state for sessions, messages and streaming.
  *
- * Mirrors the shape of `hermes-web-ui`'s Pinia `chat` store in a dependency-
- * free, vanilla JS pub/sub style. A single instance is exported (`chatStore`);
+ * Dependency-free vanilla JS pub/sub store. A single instance is exported (`chatStore`);
  * the page subscribes via `chatStore.subscribe(listener)` and receives a
  * notification on every mutation.
  *
@@ -21,7 +20,7 @@
  *   - File attachment uploads (kept out of scope for Phase 4).
  *   - Full tmux-like run resume (Tauri events are in-process and reliable).
  */
-import { api } from '../../../lib/tauri-api.js'
+import { api, isTauriRuntime, safeTauriListen } from '../../../lib/tauri-api.js'
 
 // ---------- constants ----------
 
@@ -29,6 +28,8 @@ const STORAGE_PROFILE = 'hermes_chat_profile_v1'
 const STORAGE_SESSIONS_PREFIX = 'hermes_chat_sessions_v2_'
 const STORAGE_ACTIVE_PREFIX = 'hermes_chat_active_v2_'
 const STORAGE_PINNED_PREFIX = 'hermes_chat_pinned_'
+// Batch 2 §I: 流恢复 — 持久化 run_id 用于切页/刷新后恢复
+const STORAGE_ACTIVE_RUN = 'hermes_chat_active_run_v1'
 const STORAGE_COLLAPSED_PREFIX = 'hermes_chat_collapsed_groups_'
 const STORAGE_MSGS_PREFIX = 'hermes_chat_msgs_v2_'
 const LIVE_BADGE_WINDOW_MS = 5 * 60 * 1000  // 5 min
@@ -104,7 +105,7 @@ function parseEpochMs(value) {
 
 /**
  * Convert Hermes CLI-exported messages (mixed roles + tool_calls) into the
- * flat display list we render. Matches `hermes-web-ui`'s `mapHermesMessages`.
+ * flat display list we render.
  */
 function mapHermesMessages(msgs) {
   if (!Array.isArray(msgs)) return []
@@ -208,16 +209,7 @@ function mapSessionSummary(s) {
 }
 
 // ---------- Tauri event bridge ----------
-
-let _listenFn = null
-async function tauriListen(event, cb) {
-  if (!_listenFn) {
-    const mod = await import('@tauri-apps/api/event')
-    _listenFn = mod.listen
-  }
-  return _listenFn(event, cb)
-}
-
+//
 // ---------- store implementation ----------
 
 function createStore() {
@@ -237,6 +229,12 @@ function createStore() {
 
     // Live tool calls for the current run (shown in the streaming indicator).
     liveTools: [],             // [{ id, name, status, preview, args, result }]
+
+    // Batch 1 §C/§D/§C-bis: run-level 状态
+    currentRunId: null,        // 当前 run 的 id（来自 hermes-run-started 事件）
+    pendingApproval: null,     // 待批准工具调用 { tool, args, request_id, choices, run_id }
+    hasReasoning: false,       // 本轮有推理链可读（reasoning.available 触发）
+    aborting: false,           // 用户点 Stop 后等 run.cancelled 期间
 
     // UI prefs (persisted).
     pinned: new Set(loadJson(STORAGE_PINNED_PREFIX + profileKey(safeGet(STORAGE_PROFILE) || 'default')) || []),
@@ -633,10 +631,11 @@ function createStore() {
   // ---------- streaming ----------
 
   const unlisteners = []
+  let streamAbortController = null
   async function attachStreamListeners(runSessionId) {
     detachStreamListeners()
     const runSession = () => state.sessions.find(x => x.id === runSessionId) || null
-    const u1 = await tauriListen('hermes-run-delta', (e) => {
+    const u1 = await safeTauriListen('hermes-run-delta', (e) => {
       const delta = e?.payload?.delta || ''
       if (!delta) return
       const s = runSession()
@@ -650,7 +649,7 @@ function createStore() {
       msg.content += delta
       notify()
     })
-    const u2 = await tauriListen('hermes-run-tool', (e) => {
+    const u2 = await safeTauriListen('hermes-run-tool', (e) => {
       const evt = e?.payload || {}
       const evtType = evt.event || ''
       const toolName = evt.tool || evt.tool_name || evt.name || 'tool'
@@ -694,7 +693,7 @@ function createStore() {
       }
       notify()
     })
-    const u3 = await tauriListen('hermes-run-done', () => {
+    const u3 = await safeTauriListen('hermes-run-done', () => {
       const s = runSession()
       if (!s) { cleanupAfterRun(); return }
 
@@ -731,7 +730,7 @@ function createStore() {
       persistSessions()
       cleanupAfterRun()
     })
-    const u4 = await tauriListen('hermes-run-error', (e) => {
+    const u4 = await safeTauriListen('hermes-run-error', (e) => {
       const err = e?.payload?.error || 'unknown error'
       const s = runSession()
       if (s) {
@@ -745,7 +744,60 @@ function createStore() {
       }
       cleanupAfterRun()
     })
-    unlisteners.push(u1, u2, u3, u4)
+    // Batch 1 §C/§D/§C-bis: 监听新事件
+    const u5 = await safeTauriListen('hermes-run-started', (e) => {
+      const rid = e?.payload?.run_id
+      if (rid) state.currentRunId = rid
+      notify()
+    })
+    const u6 = await safeTauriListen('hermes-run-approval-request', (e) => {
+      const evt = e?.payload || {}
+      state.pendingApproval = {
+        runId: evt.run_id || state.currentRunId,
+        tool: evt.tool || evt.tool_name || 'tool',
+        args: evt.args || evt.arguments || evt.parameters || evt.input || null,
+        requestId: evt.request_id || evt.id || null,
+        choices: Array.isArray(evt.choices) && evt.choices.length ? evt.choices : ['once', 'session', 'always', 'deny'],
+        rawEvent: evt,
+      }
+      notify()
+    })
+    const u7 = await safeTauriListen('hermes-run-approval-responded', () => {
+      state.pendingApproval = null
+      notify()
+    })
+    const u8 = await safeTauriListen('hermes-run-cancelled', () => {
+      // 用户主动中断或服务端取消 — 把 pending assistant 标记为 (stopped) 并清状态
+      const s = runSession()
+      if (s) {
+        const msg = s.messages.find(m => m.id === state.pendingAssistantId)
+        if (msg) {
+          delete msg.isStreaming
+          if (!msg.content.trim()) msg.content = '_(stopped)_'
+          else if (!msg.content.endsWith('(stopped)')) msg.content = msg.content.trimEnd() + ' _(stopped)_'
+        }
+        // 提交已知工具调用
+        for (const t of state.liveTools) {
+          if (t.status === 'done' || t.status === 'error') {
+            s.messages.push({
+              id: uid(), role: 'tool', content: '', timestamp: Date.now(),
+              toolName: t.name, toolPreview: t.preview || undefined,
+              toolArgs: stringifyMaybe(t.args), toolResult: stringifyMaybe(t.result),
+              toolStatus: t.error ? 'error' : 'done',
+            })
+          }
+        }
+        s.updatedAt = Date.now()
+        persistSessionMessages(s.id)
+        persistSessions()
+      }
+      cleanupAfterRun()
+    })
+    const u9 = await safeTauriListen('hermes-run-reasoning', () => {
+      state.hasReasoning = true
+      notify()
+    })
+    unlisteners.push(u1, u2, u3, u4, u5, u6, u7, u8, u9)
   }
 
   function detachStreamListeners() {
@@ -755,11 +807,176 @@ function createStore() {
     unlisteners.length = 0
   }
 
+  function appendStreamDelta(runSessionId, delta) {
+    if (!delta) return
+    const s = state.sessions.find(x => x.id === runSessionId)
+    if (!s) return
+    let msg = s.messages.find(m => m.id === state.pendingAssistantId)
+    if (!msg) {
+      msg = { id: uid(), role: 'assistant', content: '', timestamp: Date.now(), isStreaming: true }
+      s.messages.push(msg)
+      state.pendingAssistantId = msg.id
+    }
+    msg.content += delta
+    notify()
+  }
+
+  function extractStreamValue(obj, keys) {
+    for (const k of keys) {
+      if (obj[k] != null && obj[k] !== '') return obj[k]
+    }
+    return null
+  }
+
+  function applyStreamToolEvent(evt) {
+    const evtType = evt.event || ''
+    const toolName = evt.tool || evt.tool_name || evt.name || 'tool'
+    const preview = evt.preview || evt.detail || evt.message || ''
+    if (evtType === 'tool.started') {
+      const input = extractStreamValue(evt, ['input', 'args', 'arguments', 'parameters', 'params', 'data'])
+      state.liveTools.push({
+        id: uid(),
+        name: toolName,
+        status: 'running',
+        preview,
+        args: input,
+        result: null,
+        error: null,
+      })
+    } else if (evtType === 'tool.completed') {
+      const t = state.liveTools.find(x => x.name === toolName && x.status === 'running')
+      if (t) {
+        t.status = evt.error ? 'error' : 'done'
+        t.preview = evt.error ? (typeof evt.error === 'string' ? evt.error : 'failed') : preview
+        t.result = extractStreamValue(evt, ['output', 'result', 'content', 'data', 'response'])
+        if (evt.error) t.error = typeof evt.error === 'string' ? evt.error : JSON.stringify(evt.error)
+        if (!t.args) t.args = extractStreamValue(evt, ['input', 'args', 'arguments', 'parameters', 'params'])
+      }
+    } else if (evtType === 'tool.error') {
+      const t = state.liveTools.find(x => x.name === toolName && x.status === 'running')
+      if (t) {
+        t.status = 'error'
+        t.preview = preview || 'failed'
+        t.error = evt.error || preview || 'unknown'
+      }
+    } else if (evtType === 'tool.progress') {
+      const t = state.liveTools.find(x => x.name === toolName && x.status === 'running')
+      if (t && preview) t.preview = preview
+    }
+    notify()
+  }
+
+  function completeStreamRun(runSessionId, output = '') {
+    const s = state.sessions.find(x => x.id === runSessionId)
+    if (!s) { cleanupAfterRun(); return }
+    if (state.liveTools.length) {
+      for (const t of state.liveTools) {
+        s.messages.push({
+          id: uid(),
+          role: 'tool',
+          content: '',
+          timestamp: Date.now(),
+          toolName: t.name,
+          toolPreview: t.preview || undefined,
+          toolArgs: stringifyMaybe(t.args),
+          toolResult: stringifyMaybe(t.result),
+          toolStatus: t.error ? 'error' : 'done',
+        })
+      }
+    }
+    let msg = s.messages.find(m => m.id === state.pendingAssistantId)
+    const finalOutput = typeof output === 'string' ? output : ''
+    if (!msg && finalOutput.trim()) {
+      msg = { id: uid(), role: 'assistant', content: finalOutput, timestamp: Date.now(), isStreaming: true }
+      s.messages.push(msg)
+      state.pendingAssistantId = msg.id
+    }
+    if (msg) {
+      delete msg.isStreaming
+      if (finalOutput.trim() && (!msg.content.trim() || finalOutput.startsWith(msg.content))) msg.content = finalOutput
+      if (!msg.content.trim()) msg.content = '(empty)'
+    }
+    s.updatedAt = Date.now()
+    s.lastActiveAt = Date.now()
+    updateSessionTitleFromFirstUser(s)
+    persistSessionMessages(s.id)
+    persistSessions()
+    cleanupAfterRun()
+  }
+
+  function failStreamRun(runSessionId, err) {
+    const s = state.sessions.find(x => x.id === runSessionId)
+    if (s) {
+      s.messages.push({
+        id: uid(),
+        role: 'system',
+        content: `⚠️ Agent run failed: ${err || 'unknown error'}`,
+        timestamp: Date.now(),
+      })
+      persistSessionMessages(s.id)
+    }
+    cleanupAfterRun()
+  }
+
+  function handleStreamEvent(runSessionId, evt) {
+    const eventType = evt?.event || ''
+    if (eventType === 'message.delta') {
+      appendStreamDelta(runSessionId, evt.delta || '')
+    } else if (eventType === 'tool.started' || eventType === 'tool.completed' || eventType === 'tool.progress' || eventType === 'tool.error') {
+      applyStreamToolEvent(evt)
+    } else if (eventType === 'run.completed') {
+      completeStreamRun(runSessionId, evt.output || '')
+    } else if (eventType === 'run.failed') {
+      failStreamRun(runSessionId, evt.error || 'unknown error')
+    }
+    // Batch 1 §C/§D/§C-bis: Web 模式同步处理新事件
+    else if (eventType === 'run.cancelled') {
+      const s = state.sessions.find(x => x.id === runSessionId)
+      if (s) {
+        const msg = s.messages.find(m => m.id === state.pendingAssistantId)
+        if (msg) {
+          delete msg.isStreaming
+          if (!msg.content.trim()) msg.content = '_(stopped)_'
+          else if (!msg.content.endsWith('(stopped)')) msg.content = msg.content.trimEnd() + ' _(stopped)_'
+        }
+        s.updatedAt = Date.now()
+        persistSessionMessages(s.id)
+      }
+      cleanupAfterRun()
+    }
+    else if (eventType === 'approval.request') {
+      state.pendingApproval = {
+        runId: evt.run_id || state.currentRunId,
+        tool: evt.tool || evt.tool_name || 'tool',
+        args: evt.args || evt.arguments || evt.parameters || evt.input || null,
+        requestId: evt.request_id || evt.id || null,
+        choices: Array.isArray(evt.choices) && evt.choices.length ? evt.choices : ['once', 'session', 'always', 'deny'],
+        rawEvent: evt,
+      }
+      notify()
+    }
+    else if (eventType === 'approval.responded') {
+      state.pendingApproval = null
+      notify()
+    }
+    else if (eventType === 'reasoning.available') {
+      state.hasReasoning = true
+      notify()
+    }
+  }
+
   function cleanupAfterRun() {
     state.streaming = false
     state.runningSessionId = null
     state.pendingAssistantId = null
     state.liveTools = []
+    // Batch 1 §C/§D/§C-bis + Batch 2 §I: 重置 run-level 字段 + 清持久化
+    state.currentRunId = null
+    state.pendingApproval = null
+    state.aborting = false
+    safeRemove(STORAGE_ACTIVE_RUN)
+    // hasReasoning 保留到下次 run 开始（让用户看完上一轮思考链）
+    streamAbortController = null
     detachStreamListeners()
     notify()
     // After streaming finishes the server has updated the session's
@@ -786,6 +1003,17 @@ function createStore() {
    */
   function stopStreaming() {
     if (!state.streaming) return
+    state.aborting = true
+    notify()
+    // Batch 1 §D: 走真实端点中断（用 run_id 不是 session_id）
+    if (state.currentRunId) {
+      api.hermesRunStop(state.currentRunId).catch(err => {
+        console.warn('[chat-store] hermes_run_stop failed:', err)
+      })
+    }
+    if (streamAbortController) {
+      try { streamAbortController.abort() } catch {}
+    }
     const s = state.sessions.find(x => x.id === state.runningSessionId) || activeSession()
     if (s) {
       const msg = s.messages.find(m => m.id === state.pendingAssistantId)
@@ -838,18 +1066,23 @@ function createStore() {
 
   async function sendMessage(content, opts = {}) {
     const text = (content || '').trim()
-    if (!text || state.streaming) return
+    const atts = Array.isArray(opts.attachments) ? opts.attachments : []
+    if ((!text && !atts.length) || state.streaming) return
     let s = activeSession()
     if (!s) {
       s = createLocalSession()
     }
 
     // Append user message.
+    // Batch 3 §K: 多模态附件（仅图片）— 保存 dataUrl 用于气泡内渲染
     s.messages.push({
       id: uid(),
       role: 'user',
       content: text,
       timestamp: Date.now(),
+      attachments: atts.length
+        ? atts.map(a => ({ kind: a.kind, mime: a.mime, name: a.name || '', dataUrl: `data:${a.mime};base64,${a.data_base64}` }))
+        : undefined,
     })
     updateSessionTitleFromFirstUser(s)
     s.updatedAt = Date.now()
@@ -869,9 +1102,22 @@ function createStore() {
         .slice(0, -1)
         .map(m => ({ role: m.role, content: m.content }))
 
-      await attachStreamListeners(s.id)
-      await api.hermesAgentRun(text, s.id, history.length ? history : null, opts.instructions || null)
+      if (isTauriRuntime()) {
+        await attachStreamListeners(s.id)
+        await api.hermesAgentRun(text, s.id, history.length ? history : null, opts.instructions || null, atts.length ? atts : null)
+      } else {
+        streamAbortController = new AbortController()
+        await api.hermesAgentRunStream(
+          text,
+          s.id,
+          history.length ? history : null,
+          opts.instructions || null,
+          (evt) => handleStreamEvent(s.id, evt),
+          { signal: streamAbortController.signal },
+        )
+      }
     } catch (e) {
+      if (e?.name === 'AbortError') return
       s.messages.push({
         id: uid(),
         role: 'system',
@@ -946,6 +1192,43 @@ function createStore() {
     groupedSessions,
     subscribe,
 
+    // Batch 2 §I: 流恢复 — 切页/刷新后看是否有 in-flight run，是的话重新挂监听
+    async recoverIfRunning() {
+      if (state.streaming) return  // 已经在监听
+      const raw = safeGet(STORAGE_ACTIVE_RUN)
+      if (!raw) return
+      let info
+      try { info = JSON.parse(raw) } catch { safeRemove(STORAGE_ACTIVE_RUN); return }
+      if (!info?.runId || !info?.sessionId) { safeRemove(STORAGE_ACTIVE_RUN); return }
+      // 跨 profile 的 run 不恢复（用户已切了 profile）
+      if (info.profile && info.profile !== state.activeProfile) { safeRemove(STORAGE_ACTIVE_RUN); return }
+      // 超过 1 小时的 run 视为过期
+      if (info.t && Date.now() - info.t > 60 * 60 * 1000) { safeRemove(STORAGE_ACTIVE_RUN); return }
+
+      try {
+        const st = await api.hermesRunStatus(info.runId)
+        const status = String(st?.status || '')
+        if (status === 'running' || status === 'stopping' || status === 'waiting_for_approval') {
+          // 还在跑 — 重新挂监听 + 标 streaming
+          state.runningSessionId = info.sessionId
+          state.currentRunId = info.runId
+          state.streaming = true
+          if (status === 'stopping') state.aborting = true
+          await attachStreamListeners(info.sessionId)
+          notify()
+        } else {
+          // 已结束 — 拉一下最新 messages（让用户看到完整结果）
+          safeRemove(STORAGE_ACTIVE_RUN)
+          if (info.sessionId === state.activeSessionId) {
+            await refreshActiveMessages().catch(() => {})
+          }
+        }
+      } catch {
+        // status 查询失败，假装没事
+        safeRemove(STORAGE_ACTIVE_RUN)
+      }
+    },
+
     // actions
     loadSessions,
     refreshActiveMessages,
@@ -958,6 +1241,22 @@ function createStore() {
     toggleCollapsed,
     sendMessage,
     stopStreaming,
+    // Batch 1 §C-bis: Approval Flow — 让 UI 调用回复批准
+    respondApproval(choice) {
+      const pending = state.pendingApproval
+      if (!pending || !pending.runId) return Promise.reject(new Error('no pending approval'))
+      const normalized = ['once', 'session', 'always', 'deny'].includes(choice) ? choice : 'once'
+      // 乐观清掉 — 等服务端 approval.responded 事件作权威清理
+      state.pendingApproval = null
+      notify()
+      return api.hermesRunApproval(pending.runId, normalized).catch(err => {
+        console.warn('[chat-store] hermes_run_approval failed:', err)
+        // 失败时恢复
+        state.pendingApproval = pending
+        notify()
+        throw err
+      })
+    },
     pushLocalAssistant,
     pushLocalUser,
     clearActive,

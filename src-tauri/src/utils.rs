@@ -1,6 +1,142 @@
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+#[cfg(target_os = "windows")]
+fn push_unique_candidate(
+    candidates: &mut Vec<std::path::PathBuf>,
+    seen: &mut std::collections::HashSet<String>,
+    path: std::path::PathBuf,
+) {
+    let key = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    if seen.insert(key) {
+        candidates.push(path);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn push_windows_cli_files(
+    candidates: &mut Vec<std::path::PathBuf>,
+    seen: &mut std::collections::HashSet<String>,
+    base: std::path::PathBuf,
+) {
+    push_unique_candidate(candidates, seen, base.join("openclaw.cmd"));
+    push_unique_candidate(candidates, seen, base.join("openclaw.exe"));
+    push_unique_candidate(candidates, seen, base.join("openclaw"));
+    push_unique_candidate(
+        candidates,
+        seen,
+        base.join("node_modules")
+            .join("@qingchencloud")
+            .join("openclaw-zh")
+            .join("bin")
+            .join("openclaw.js"),
+    );
+    push_unique_candidate(
+        candidates,
+        seen,
+        base.join("node_modules")
+            .join("openclaw")
+            .join("bin")
+            .join("openclaw.js"),
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn common_windows_cli_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // 先按 enhanced PATH 顺序找，保持与用户命令行优先级一致。
+    for dir in crate::commands::enhanced_path().split(';') {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            continue;
+        }
+        push_windows_cli_files(&mut candidates, &mut seen, std::path::PathBuf::from(dir));
+    }
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        push_windows_cli_files(
+            &mut candidates,
+            &mut seen,
+            std::path::PathBuf::from(appdata).join("npm"),
+        );
+    }
+    if let Some(prefix) = crate::commands::windows_npm_global_prefix() {
+        push_windows_cli_files(&mut candidates, &mut seen, std::path::PathBuf::from(prefix));
+    }
+    for sa_dir in crate::commands::config::all_standalone_dirs() {
+        push_windows_cli_files(&mut candidates, &mut seen, sa_dir);
+    }
+    if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
+        let localappdata = std::path::PathBuf::from(localappdata);
+        push_windows_cli_files(
+            &mut candidates,
+            &mut seen,
+            localappdata.join("Programs").join("OpenClaw"),
+        );
+        push_windows_cli_files(&mut candidates, &mut seen, localappdata.join("OpenClaw"));
+        push_windows_cli_files(
+            &mut candidates,
+            &mut seen,
+            localappdata.join("Programs").join("nodejs"),
+        );
+    }
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        let program_files = std::path::PathBuf::from(program_files);
+        push_windows_cli_files(&mut candidates, &mut seen, program_files.join("nodejs"));
+        push_windows_cli_files(&mut candidates, &mut seen, program_files.join("OpenClaw"));
+    }
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        push_windows_cli_files(
+            &mut candidates,
+            &mut seen,
+            std::path::PathBuf::from(program_files_x86).join("nodejs"),
+        );
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        push_windows_cli_files(
+            &mut candidates,
+            &mut seen,
+            std::path::PathBuf::from(profile).join(".openclaw-bin"),
+        );
+    }
+    for drive in ["C", "D", "E", "F", "G"] {
+        push_windows_cli_files(
+            &mut candidates,
+            &mut seen,
+            std::path::PathBuf::from(format!(r"{drive}:\OpenClaw")),
+        );
+        push_windows_cli_files(
+            &mut candidates,
+            &mut seen,
+            std::path::PathBuf::from(format!(r"{drive}:\AI\OpenClaw")),
+        );
+    }
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut where_cmd = std::process::Command::new("where");
+    where_cmd.arg("openclaw");
+    where_cmd.env("PATH", crate::commands::enhanced_path());
+    where_cmd.creation_flags(CREATE_NO_WINDOW);
+    if let Ok(output) = where_cmd.output() {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    push_unique_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        std::path::PathBuf::from(trimmed),
+                    );
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
 pub fn is_rejected_cli_path(cli_path: &str) -> bool {
     let lower = cli_path.replace('\\', "/").to_lowercase();
     lower.contains("/.cherrystudio/") || lower.contains("cherry-studio")
@@ -14,11 +150,7 @@ fn bound_cli_path() -> Option<std::path::PathBuf> {
         return None;
     }
     let p = std::path::PathBuf::from(raw);
-    if p.exists() && !is_rejected_cli_path(&p.to_string_lossy()) {
-        Some(p)
-    } else {
-        None
-    }
+    crate::commands::config::resolve_openclaw_cli_input_path(&p)
 }
 
 fn apply_openclaw_dir_env(cmd: &mut std::process::Command) {
@@ -45,7 +177,7 @@ fn configured_cli_candidates() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Windows: 在 PATH 中查找 openclaw.cmd 的完整路径
+/// Windows: 在 PATH 和常见安装目录中查找 openclaw CLI 的完整路径
 /// 避免通过 `cmd /c openclaw` 调用时 npm .cmd shim 中的引号导致
 /// "\"node\"" is not recognized 错误
 #[cfg(target_os = "windows")]
@@ -59,14 +191,9 @@ fn find_openclaw_cmd() -> Option<std::path::PathBuf> {
             return Some(candidate);
         }
     }
-    let path = crate::commands::enhanced_path();
-    for dir in path.split(';') {
-        let candidate = std::path::Path::new(dir).join("openclaw.cmd");
-        if candidate.exists() && !is_rejected_cli_path(&candidate.to_string_lossy()) {
-            return Some(candidate);
-        }
-    }
-    None
+    common_windows_cli_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists() && !is_rejected_cli_path(&candidate.to_string_lossy()))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -99,14 +226,7 @@ pub fn resolve_openclaw_cli_path() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let path = crate::commands::enhanced_path();
-        for dir in path.split(';') {
-            let candidate = std::path::Path::new(dir).join("openclaw.cmd");
-            if candidate.exists() && !is_rejected_cli_path(&candidate.to_string_lossy()) {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-        }
-        None
+        find_openclaw_cmd().map(|p| p.to_string_lossy().to_string())
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -165,7 +285,15 @@ pub fn openclaw_command() -> std::process::Command {
         // 优先：找到 openclaw.cmd 完整路径，用 cmd /c "完整路径" 避免引号问题
         if let Some(cmd_path) = find_openclaw_cmd() {
             let mut cmd = std::process::Command::new("cmd");
-            cmd.arg("/c").arg(cmd_path);
+            if cmd_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+            {
+                cmd.arg("/c").arg("node").arg(cmd_path);
+            } else {
+                cmd.arg("/c").arg(cmd_path);
+            }
             cmd.env("PATH", &enhanced);
             apply_openclaw_dir_env(&mut cmd);
             crate::commands::apply_proxy_env(&mut cmd);
@@ -201,7 +329,15 @@ pub fn openclaw_command_async() -> tokio::process::Command {
         // 优先：找到 openclaw.cmd 完整路径
         if let Some(cmd_path) = find_openclaw_cmd() {
             let mut cmd = tokio::process::Command::new("cmd");
-            cmd.arg("/c").arg(cmd_path);
+            if cmd_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+            {
+                cmd.arg("/c").arg("node").arg(cmd_path);
+            } else {
+                cmd.arg("/c").arg(cmd_path);
+            }
             cmd.env("PATH", &enhanced);
             apply_openclaw_dir_env_tokio(&mut cmd);
             crate::commands::apply_proxy_env_tokio(&mut cmd);

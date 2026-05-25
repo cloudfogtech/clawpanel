@@ -1,19 +1,19 @@
 /**
  * Hermes Agent — Memory editor (three-section: MEMORY / USER / SOUL)
  *
- * Mirrors the data contract used by the official `hermes-web-ui`:
+ * Data contract:
  *   GET  /api/hermes/memory            → { memory, user, soul, mtimes }
  *   POST /api/hermes/memory            → { section, content }
  *
- * ClawPanel calls the equivalent Rust/Web-stub commands (`hermes_memory_read_all`
- * + `hermes_memory_write`) so the page works on Tauri and Web modes.
+ * ClawPanel calls Rust/Web commands so the page works on Tauri and Web modes.
  *
  * All three files live in `~/.hermes/memories/` and are plain Markdown.
  */
 import { t } from '../../../lib/i18n.js'
 import { api } from '../../../lib/tauri-api.js'
 import { toast } from '../../../components/toast.js'
-import { showContentModal } from '../../../components/modal.js'
+import { showContentModal, showConfirm } from '../../../components/modal.js'
+import { humanizeError } from '../../../lib/humanize-error.js'
 
 function escHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -135,13 +135,20 @@ export function render() {
     const ta = overlay.querySelector('#hm-mem-modal-textarea')
     const cancelBtn = overlay.querySelector('[data-action="cancel"]')
     const saveBtn = overlay.querySelector('#hm-mem-modal-save')
-    const closeWithConfirm = () => {
+    const closeWithConfirm = async () => {
       if (!editing) {
         overlay.remove()
         return
       }
       const dirty = editing.buffer !== (data[editing.key] || '')
-      if (dirty && !confirm(t('engine.memoryUnsaved'))) return
+      if (dirty) {
+        const ok = await showConfirm({
+          message: t('engine.memoryUnsaved'),
+          confirmText: t('common.confirm') || 'OK',
+          variant: 'danger',
+        })
+        if (!ok) return
+      }
       editing = null
       overlay.remove()
     }
@@ -183,10 +190,17 @@ export function render() {
     })
   }
 
-  function cancelEdit() {
+  async function cancelEdit() {
     if (!editing) return
     const dirty = editing.buffer !== (data[editing.key] || '')
-    if (dirty && !confirm(t('engine.memoryUnsaved'))) return
+    if (dirty) {
+      const ok = await showConfirm({
+        message: t('engine.memoryUnsaved'),
+        confirmText: t('common.confirm') || 'OK',
+        variant: 'danger',
+      })
+      if (!ok) return
+    }
     editing = null
     document.querySelector('.hm-mem-modal-overlay')?.remove()
     draw()
@@ -213,7 +227,7 @@ export function render() {
         saveBtn.disabled = false
         saveBtn.textContent = t('engine.memorySave')
       }
-      toast(t('engine.memorySaveFailed') + ': ' + (e?.message || e), 'error')
+      toast(humanizeError(e, t('engine.memorySaveFailed')), 'error')
     }
     saving = false
     draw()

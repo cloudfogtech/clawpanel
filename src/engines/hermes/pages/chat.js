@@ -1,7 +1,7 @@
 /**
  * Hermes Chat — editorial luxury re-write (Phase 4).
  *
- * Layout matches the official `hermes-web-ui`'s ChatPanel:
+ * Layout:
  *   ┌────────────────┬──────────────────────────────────────────────┐
  *   │ SessionList    │ Header: title · source · new-chat button     │
  *   │ (groups +      ├──────────────────────────────────────────────┤
@@ -13,11 +13,13 @@
  *
  * State lives in `chat-store.js`; this module only does DOM + events.
  */
-import { t } from '../../../lib/i18n.js'
-import { api } from '../../../lib/tauri-api.js'
+import * as tts from '../../../lib/tts.js'
+import { humanizeError } from '../../../lib/humanize-error.js'
+import { api, invalidate } from '../../../lib/tauri-api.js'
 import { toast } from '../../../components/toast.js'
 import { showConfirm } from '../../../components/modal.js'
 import { getChatStore, getSourceLabel } from '../lib/chat-store.js'
+import { t } from '../../../lib/i18n.js'
 
 // ----------------------------------------------------------- helpers
 
@@ -97,7 +99,14 @@ function formatTime(ts) {
 }
 
 function sessionDisplayTitle(s) {
-  return s.title || t('engine.chatNewSession')
+  if (s.title) return s.title
+  // 没有标题时用 id 后 6 位区分（避免 20+ 个会话都显示"新对话"，让用户误以为是 mock 数据）
+  const sid = String(s.id || '')
+  if (sid && sid.length >= 6) {
+    const tail = sid.slice(-6)
+    return t('engine.chatUntitledSession', { id: tail })
+  }
+  return t('engine.chatNewSession')
 }
 
 /** Compact token formatter — `1234567 → "1.2M"`, `12345 → "12.3k"`, `42 → "42"`. */
@@ -277,6 +286,8 @@ export function render() {
   let showSlash = false
   let slashFilter = ''
   let gwOnline = false
+  // null = 仍在加载首次 check，先不显示 banner 防首屏闪烁
+  let hermesInstalled = null
   let currentModel = ''
   const mobileQuery = window.matchMedia('(max-width: 720px)')
 
@@ -286,6 +297,10 @@ export function render() {
   let inputValue = ''
   let inputFocused = false
   let inputCaret = 0                  // caret position restored after re-render
+  // Batch 3 §K: 多模态图片附件（仅 chat 这一帧暂存，发送后清掉）
+  let pendingAttachments = []         // [{ kind:'image', mime, name, data_base64 }]
+  const MAX_ATTACHMENTS = 5
+  const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  // 10 MB
   let lastActiveSessionId = store.state.activeSessionId
   let forceScrollBottom = true
 
@@ -305,11 +320,21 @@ export function render() {
   // --- initial session load + model meta ---
   store.loadSessions().then(() => draw())
   store.loadProfiles().then(() => draw()).catch(() => {})
+  // Batch 2 §I: 切页/刷新后看是否有 in-flight run，是的话重新挂监听
+  store.recoverIfRunning().catch(() => {})
+  // 强制刷新安装/Gateway 状态缓存，避免用户刚在仪表盘启动 Gateway 后
+  // 进聊天页看到 30s 过期的「未启动」误判。
+  invalidate('check_hermes')
   api.checkHermes().then(info => {
+    hermesInstalled = !!info?.installed
     gwOnline = !!info?.gatewayRunning
     currentModel = info?.model || ''
     draw()
-  }).catch(() => {})
+  }).catch(() => {
+    hermesInstalled = false
+    gwOnline = false
+    draw()
+  })
 
   // ----------------------------------------------------------- subscription
 
@@ -355,6 +380,7 @@ export function render() {
           <div class="hm-chat-session-meta">
             ${s.model ? `<span class="hm-chat-session-model">${escHtml(s.model)}</span>` : ''}
             <span class="hm-chat-session-time">${escHtml(formatTime(s.updatedAt || s.createdAt))}</span>
+            ${s.messageCount > 0 ? `<span class="hm-chat-session-msgs">${escHtml(t('engine.chatSessionMsgCount', { n: s.messageCount }))}</span>` : ''}
           </div>
         </div>
         ${selectionMode ? '' : `
@@ -637,8 +663,7 @@ export function render() {
     // up above when the user types `/`.
     //
     // Token usage strip — only when there's an active session with real
-    // usage. Mirrors hermes-web-ui's input-top-bar (sans context-length
-    // bar, which requires a server-side endpoint we don't have).
+    // usage.
     const totalIn = active?.inputTokens || 0
     const totalOut = active?.outputTokens || 0
     const totalCache = (active?.cacheReadTokens || 0) + (active?.cacheWriteTokens || 0)
@@ -667,7 +692,22 @@ export function render() {
                 <span class="hm-chat-usage-value">${escHtml(formatCost(cost))}</span>
               </span>` : ''}
           </div>` : ''}
+        ${pendingAttachments.length ? `
+          <div class="hm-chat-attach-preview">
+            ${pendingAttachments.map((a, i) => `
+              <div class="hm-chat-attach-chip">
+                <img src="data:${escAttr(a.mime)};base64,${escAttr(a.data_base64)}" alt="${escAttr(a.name)}">
+                <span class="hm-chat-attach-chip-name" title="${escAttr(a.name)}">${escHtml(a.name)}</span>
+                <button class="hm-chat-attach-chip-remove" data-attach-remove="${i}" title="${escHtml(t('engine.chatAttachRemove'))}">×</button>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
         <div class="hm-chat-input-wrap ${streaming ? 'is-streaming' : ''}">
+          <button class="hm-chat-attach-btn" id="hm-chat-attach" title="${escHtml(t('engine.chatAttach'))}" ${streaming ? 'disabled' : ''}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input type="file" id="hm-chat-attach-input" accept="image/*" multiple hidden>
           <textarea id="hm-chat-input" class="hm-chat-input"
                     placeholder="${escAttr(placeholder)}"
                     rows="1">${escHtml(inputValue)}</textarea>
@@ -677,8 +717,8 @@ export function render() {
                    ${ICONS.stop}
                  </button>`
               : `<button class="hm-chat-send-btn" id="hm-chat-send"
-                         ${!active || !inputValue.trim() ? 'disabled' : ''}
-                         title="${escHtml(t('engine.chatSend'))}">
+                         ${(!active || (!inputValue.trim() && !pendingAttachments.length) || hermesInstalled === false || !gwOnline) ? 'disabled' : ''}
+                         title="${escHtml(hermesInstalled === false ? t('engine.chatHealthInstallMissing') : !gwOnline ? t('engine.chatHealthGatewayDown') : t('engine.chatSend'))}">
                    ${ICONS.send}
                  </button>`}
           </div>
@@ -733,6 +773,31 @@ export function render() {
     `
   }
 
+  // 健康状态 banner：未装/未启动 → 在输入区上方显示一条警告 + 「去仪表盘」按钮。
+  // 首次 fetch 完成前返回空字符串，避免首屏闪烁。
+  function renderHealthBanner() {
+    if (hermesInstalled === null) return ''
+    if (hermesInstalled === false) {
+      return `
+        <div class="hm-chat-health-banner is-error">
+          <span class="hm-chat-health-icon" aria-hidden="true">${svgIcon('alert-triangle', { size: 14 })}</span>
+          <span class="hm-chat-health-msg">${escHtml(t('engine.chatHealthInstallMissing'))}</span>
+          <a class="hm-chat-health-action" href="#/h/dashboard">${escHtml(t('engine.chatHealthGoDashboard'))}</a>
+        </div>
+      `
+    }
+    if (!gwOnline) {
+      return `
+        <div class="hm-chat-health-banner is-warn">
+          <span class="hm-chat-health-icon" aria-hidden="true">${svgIcon('alert-triangle', { size: 14 })}</span>
+          <span class="hm-chat-health-msg">${escHtml(t('engine.chatHealthGatewayDown'))}</span>
+          <a class="hm-chat-health-action" href="#/h/dashboard">${escHtml(t('engine.chatHealthGoDashboard'))}</a>
+        </div>
+      `
+    }
+    return ''
+  }
+
   // ----------------------------------------------------------- draw
 
   function draw() {
@@ -751,6 +816,7 @@ export function render() {
         ${renderSidebar()}
         <section class="hm-chat-main">
           ${renderHeader()}
+          ${renderHealthBanner()}
           <div class="hm-chat-messages" id="hm-chat-messages">
             ${renderMessages()}
           </div>
@@ -952,7 +1018,7 @@ export function render() {
           await store.switchProfile(name)
           toast(t('engine.chatProfileSwitched').replace('{name}', name), 'success')
         } catch (err) {
-          toast((err?.message || String(err)), 'error')
+          toast(humanizeError(err, t('engine.chatProfileSwitchFailed') || 'Profile switch failed'), 'error')
         }
       })
     })
@@ -980,6 +1046,25 @@ export function render() {
           const msg = err?.message === 'RUNNING_SESSION' ? t('engine.chatDeleteRunningBlocked') : (err?.message || err)
           toast(t('engine.chatDeleteFailed') + ': ' + msg, 'error')
         }
+      })
+    })
+
+    // Batch 3 §P: TTS 朗读按钮
+    el.querySelectorAll('[data-tts-mid]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation()
+        const mid = btn.dataset.ttsMid
+        const s = store.activeSession()
+        const msg = s?.messages.find(m => m.id === mid)
+        if (!msg?.content) return
+        // 去掉 markdown 代码块和 url，简化朗读
+        const clean = String(msg.content)
+          .replace(/```[\s\S]*?```/g, ' [代码块] ')
+          .replace(/`([^`]+)`/g, '$1')
+          .replace(/!\[.*?\]\(.*?\)/g, '')
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+          .trim()
+        tts.toggle(clean).catch(() => toast(t('engine.chatSpeakFailed'), 'error'))
       })
     })
 
@@ -1085,6 +1170,73 @@ export function render() {
       toast(t('engine.chatStopped'), 'success')
     })
 
+    // Batch 1 §C-bis: Approval Flow 按钮点击
+    el.querySelectorAll('.hm-chat-approval-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const choice = btn.dataset.approvalChoice
+        if (!choice) return
+        btn.disabled = true
+        try {
+          await store.respondApproval(choice)
+        } catch (err) {
+          toast(t('engine.chatApprovalFailed'), 'error')
+        }
+      })
+    })
+
+    // Batch 3 §K: attach 按钮 / 文件 input / 拖拽 / 移除附件
+    const attachBtn = el.querySelector('#hm-chat-attach')
+    const attachInput = el.querySelector('#hm-chat-attach-input')
+    attachBtn?.addEventListener('click', () => attachInput?.click())
+    attachInput?.addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files || [])
+      for (const f of files) await addAttachmentFromFile(f)
+      e.target.value = ''  // reset 让用户能重选同一张图
+    })
+    // 移除附件
+    el.querySelectorAll('[data-attach-remove]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.attachRemove, 10)
+        if (Number.isFinite(idx) && idx >= 0 && idx < pendingAttachments.length) {
+          pendingAttachments.splice(idx, 1)
+          draw()
+        }
+      })
+    })
+    // 拖拽到输入区域
+    const dropZone = el.querySelector('.hm-chat-input-wrap')
+    if (dropZone && !dropZone.dataset.dragBound) {
+      dropZone.dataset.dragBound = '1'
+      dropZone.addEventListener('dragover', (e) => {
+        if (e.dataTransfer && Array.from(e.dataTransfer.items || []).some(it => it.kind === 'file')) {
+          e.preventDefault()
+          dropZone.classList.add('hm-chat-input-wrap--dragover')
+        }
+      })
+      dropZone.addEventListener('dragleave', () => dropZone.classList.remove('hm-chat-input-wrap--dragover'))
+      dropZone.addEventListener('drop', async (e) => {
+        e.preventDefault()
+        dropZone.classList.remove('hm-chat-input-wrap--dragover')
+        if (store.state.streaming) return
+        for (const f of e.dataTransfer.files || []) {
+          if (f.type.startsWith('image/')) await addAttachmentFromFile(f)
+        }
+      })
+      // 粘贴图片
+      dropZone.addEventListener('paste', async (e) => {
+        if (store.state.streaming) return
+        const items = e.clipboardData?.items || []
+        let handled = false
+        for (const it of items) {
+          if (it.kind === 'file' && it.type.startsWith('image/')) {
+            const f = it.getAsFile()
+            if (f) { await addAttachmentFromFile(f); handled = true }
+          }
+        }
+        if (handled) e.preventDefault()
+      })
+    }
+
     el.querySelectorAll('.hm-chat-slash-item').forEach(item => {
       item.addEventListener('click', () => {
         const cmd = item.dataset.cmd
@@ -1166,7 +1318,8 @@ export function render() {
 
   async function handleSend() {
     const text = inputValue.trim()
-    if (!text || store.state.streaming) return
+    // Batch 3 §K: 允许只发图片（text 为空但有 attachments）
+    if ((!text && !pendingAttachments.length) || store.state.streaming) return
 
     // Local slash commands short-circuit before going to the agent.
     if (text === '/clear') {
@@ -1224,9 +1377,55 @@ export function render() {
 
     // Normal user message → start agent run.
     forceScrollBottom = true
+    // Batch 3 §K: 在 resetInput 前先把 attachments 复制下来再清空
+    const sendAttachments = pendingAttachments.slice()
+    pendingAttachments = []
     resetInput()
     draw()
-    await store.sendMessage(text)
+    await store.sendMessage(text, { attachments: sendAttachments })
+  }
+
+  // Batch 3 §K: 把 File → base64（FileReader）
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => {
+        const result = r.result || ''
+        // dataURL 形如 "data:image/png;base64,xxxx" — 我们要纯 base64
+        const commaIdx = String(result).indexOf(',')
+        resolve(commaIdx >= 0 ? String(result).slice(commaIdx + 1) : String(result))
+      }
+      r.onerror = () => reject(r.error || new Error('FileReader failed'))
+      r.readAsDataURL(file)
+    })
+  }
+
+  async function addAttachmentFromFile(file) {
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      toast(t('engine.chatAttachOnlyImage'), 'error')
+      return
+    }
+    if (file.size > MAX_ATTACHMENT_SIZE) {
+      toast(t('engine.chatAttachTooBig'), 'error')
+      return
+    }
+    if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+      toast(t('engine.chatAttachTooMany'), 'error')
+      return
+    }
+    try {
+      const data_base64 = await fileToBase64(file)
+      pendingAttachments.push({
+        kind: 'image',
+        mime: file.type,
+        name: file.name || 'image',
+        data_base64,
+      })
+      draw()
+    } catch (err) {
+      toast(t('engine.chatAttachReadFailed'), 'error')
+    }
   }
 
   // ----------------------------------------------------------- search modal

@@ -1,7 +1,7 @@
 /**
  * Hermes Agent — Skills browser (editorial luxury re-write)
  *
- * Mirrors the official `hermes-web-ui` Skills view:
+ * Skill management endpoints:
  *   GET    /api/hermes/skills                       → { categories: [...] }
  *   PUT    /api/hermes/skills/toggle                → enable/disable
  *   GET    /api/hermes/skills/:cat/:skill/files     → attached files
@@ -15,14 +15,15 @@
  *   │                                │   an attached file
  *   └────────────────────────────────┴──────────────────────────┘
  *
- * Extras beyond the official UI:
+ * Extras:
  *   - Collapsible categories (persist in memory only)
- *   - File browser with breadcrumb + back button (Vue parity)
+ *   - File browser with breadcrumb + back button
  *   - Inline toggle switches use stable loading state per skill
  */
 import { t } from '../../../lib/i18n.js'
 import { api } from '../../../lib/tauri-api.js'
 import { toast } from '../../../components/toast.js'
+import { humanizeError } from '../../../lib/humanize-error.js'
 
 function escHtml(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -124,7 +125,7 @@ export function render() {
     } catch (e) {
       console.error('Failed to load skills:', e)
       categories = []
-      toast(t('engine.skillsLoadFailed') + ': ' + (e?.message || e), 'error')
+      toast(humanizeError(e, t('engine.skillsLoadFailed')), 'error')
     }
     loading = false
     draw()
@@ -247,7 +248,7 @@ export function render() {
         'success',
       )
     } catch (e) {
-      toast(t('engine.skillsToggleFailed') + ': ' + (e?.message || e), 'error')
+      toast(humanizeError(e, t('engine.skillsToggleFailed')), 'error')
     } finally {
       toggling.delete(skill.slug)
       draw()

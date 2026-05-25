@@ -4,9 +4,13 @@
  */
 import { api, invalidate } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
+import { humanizeError } from '../lib/humanize-error.js'
 import { showModal, showConfirm } from '../components/modal.js'
 import { CHANNEL_LABELS } from '../lib/channel-labels.js'
 import { t } from '../lib/i18n.js'
+import { listAgentsCompat } from '../lib/api-compat.js'
+import { hasFeature } from '../lib/kernel.js'
+import { termHelpHtml, attachTermTooltips } from '../lib/term-tooltip.js'
 
 export async function render() {
   const page = document.createElement('div')
@@ -56,7 +60,7 @@ async function loadAgents(page, state) {
   renderSkeleton(container)
   try {
     const [agents, config] = await Promise.all([
-      api.listAgents(),
+      listAgentsCompat(),
       api.readOpenclawConfig().catch(() => null),
     ])
     state.agents = agents
@@ -70,7 +74,7 @@ async function loadAgents(page, state) {
     }
   } catch (e) {
     container.innerHTML = '<div style="color:var(--error);padding:20px">' + t('agents.loadFailed') + ': ' + String(e).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>'
-    toast(t('agents.loadListFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('agents.loadListFailed')), 'error')
   }
 }
 
@@ -90,10 +94,40 @@ function renderBindingBadges(agentId, bindings) {
   }).join(' ')
 }
 
+/**
+ * 渲染 Agent Runtime 徽章。
+ *
+ * 上游 2026.5.2+ 会在 agents.list 返回 agentRuntime 元数据：
+ *   - { id: 'pi' }     → 默认 Pi runtime（最常用，蓝色徽章）
+ *   - { id: 'codex' }  → OpenAI Codex CLI runtime（紫色徽章）
+ *   - { id: '其他' }   → 显示原始 id（灰色徽章）
+ *
+ * 老内核不会调用本函数（被 hasFeature('agents.runtime') 门控）。
+ */
+function _renderRuntimeBadge(runtime) {
+  const id = (runtime && typeof runtime === 'object' ? runtime.id : runtime) || 'pi'
+  const map = {
+    pi: { label: 'Pi', cls: 'badge-info' },
+    codex: { label: 'Codex CLI', cls: 'badge-purple' },
+  }
+  const meta = map[id] || { label: id, cls: 'badge-neutral' }
+  return `<span class="badge ${meta.cls}" title="agentRuntime.id = ${id}">${meta.label}</span>`
+}
+
 function renderAgents(page, state) {
   const container = page.querySelector('#agents-list')
   if (!state.agents.length) {
-    container.innerHTML = `<div style="color:var(--text-tertiary);padding:20px;text-align:center">${t('agents.noAgents')}</div>`
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">🤖</div>
+        <div class="empty-title">${t('agents.noAgents')}</div>
+        <div class="empty-desc">${t('common.emptyGetStartedHint')}</div>
+        <div class="empty-cta"><button class="btn btn-primary" data-empty-cta="add-agent">${t('agents.addAgent')}</button></div>
+      </div>
+    `
+    container.querySelector('[data-empty-cta="add-agent"]')?.addEventListener('click', () => {
+      page.querySelector('#btn-add-agent')?.click()
+    })
     return
   }
 
@@ -127,6 +161,11 @@ function renderAgents(page, state) {
             <span class="agent-info-label">${t('agents.labelWorkspace')}</span>
             <span class="agent-info-value" style="font-family:var(--font-mono);font-size:var(--font-size-xs)">${a.workspace || t('agents.notSet')}</span>
           </div>
+          ${hasFeature('agents.runtime') ? `
+          <div class="agent-info-row">
+            <span class="agent-info-label">${t('agents.labelRuntime')}</span>
+            <span class="agent-info-value">${_renderRuntimeBadge(a.agentRuntime)}</span>
+          </div>` : ''}
           <div class="agent-info-row">
             <span class="agent-info-label">${t('agents.labelBindings')}</span>
             <span class="agent-info-value">${renderBindingBadges(a.id, state.bindings)}</span>
@@ -178,6 +217,7 @@ async function showAddAgentDialog(page, state) {
     return
   }
 
+  setTimeout(() => attachTermTooltips(document.body), 0)
   showModal({
     title: t('agents.addTitle'),
     fields: [
@@ -185,7 +225,7 @@ async function showAddAgentDialog(page, state) {
       { name: 'name', label: t('agents.agentName'), value: '', placeholder: t('agents.agentNamePlaceholder') },
       { name: 'emoji', label: t('agents.agentEmoji'), value: '', placeholder: t('agents.agentEmojiPlaceholder') },
       { name: 'model', label: t('agents.agentModel'), type: 'select', value: models[0]?.value || '', options: models },
-      { name: 'workspace', label: t('agents.agentWorkspace'), value: '', placeholder: t('agents.agentWorkspacePlaceholder') },
+      { name: 'workspace', label: t('agents.agentWorkspace') + termHelpHtml('workspace'), value: '', placeholder: t('agents.agentWorkspacePlaceholder') },
     ],
     onConfirm: async (result) => {
       const id = (result.id || '').trim()
@@ -214,7 +254,7 @@ async function showAddAgentDialog(page, state) {
         invalidate('list_agents')
         await loadAgents(page, state)
       } catch (e) {
-        toast(t('agents.createFailed') + ': ' + e, 'error')
+        toast(humanizeError(e, t('agents.createFailed')), 'error')
       }
     }
   })
@@ -295,14 +335,26 @@ async function showEditAgentDialog(page, state, id) {
         toast(t('agents.updated'), 'success')
       } catch (e) {
         console.error('[Agent编辑] 保存失败:', e)
-        toast(t('agents.updateFailed') + ': ' + e, 'error')
+        toast(humanizeError(e, t('agents.updateFailed')), 'error')
       }
     }
   })
 }
 
 async function deleteAgent(page, state, id) {
-  const yes = await showConfirm(t('agents.confirmDelete', { id }))
+  // 计算关联渠道绑定数（小白看清楚删了会丢什么）
+  const linkedBindings = (state.bindings || []).filter(b => (b.agentId || 'main') === id).length
+  const impact = [t('agents.deleteImpactConfig')]
+  if (linkedBindings > 0) {
+    impact.unshift(t('agents.deleteImpactBindings', { n: linkedBindings }))
+  }
+  const yes = await showConfirm({
+    title: t('agents.deleteConfirmTitle'),
+    message: t('agents.confirmDelete', { id }),
+    impact,
+    confirmText: t('agents.deleteConfirmBtn'),
+    cancelText: t('agents.deleteCancelBtn'),
+  })
   if (!yes) return
 
   try {
@@ -310,7 +362,7 @@ async function deleteAgent(page, state, id) {
     toast(t('agents.deleted'), 'success')
     await loadAgents(page, state)
   } catch (e) {
-    toast(t('agents.deleteFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('agents.deleteFailed')), 'error')
   }
 }
 
@@ -325,6 +377,6 @@ async function backupAgent(id) {
     } catch { /* fallback */ }
     toast(t('agents.backupDone', { file: zipPath.split('/').pop() }), 'success')
   } catch (e) {
-    toast(t('agents.backupFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('agents.backupFailed')), 'error')
   }
 }

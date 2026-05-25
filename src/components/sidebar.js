@@ -9,7 +9,12 @@ import { toast } from './toast.js'
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0'
 import { t, getLang, setLang, getAvailableLangs } from '../lib/i18n.js'
 import { isFeatureAvailable } from '../lib/feature-gates.js'
-import { getActiveEngine, getActiveEngineId, listEngines, switchEngine, onEngineChange } from '../lib/engine-manager.js'
+import { getKernelSnapshot } from '../lib/kernel.js'
+import { triggerKernelUpgrade } from '../lib/kernel-upgrade.js'
+import { getActiveEngine, getActiveEngineId, listEngines, needsInitialEngineChoice, isEngineSetupDeferred, switchEngine, onEngineChange } from '../lib/engine-manager.js'
+
+// 当用户点 "暂时不升级" 时，本地会话内不再显示升级提示
+const SS_DISMISSED_KERNEL_UPGRADE = 'clawpanel_kernel_upgrade_dismissed'
 
 function NAV_ITEMS_FULL() { return [
   {
@@ -78,6 +83,23 @@ function NAV_ITEMS_SETUP() { return [
   }
 ] }
 
+function NAV_ITEMS_ENGINE_SELECT() { return [
+  {
+    section: '',
+    items: [
+      { route: '/engine-select', label: t('engine.choiceNav'), icon: 'setup' },
+      { route: '/assistant', label: t('sidebar.assistant'), icon: 'assistant' },
+    ]
+  },
+  {
+    section: '',
+    items: [
+      { route: '/settings', label: t('sidebar.settings'), icon: 'settings' },
+      { route: '/about', label: t('sidebar.about'), icon: 'about' },
+    ]
+  }
+] }
+
 const ICONS = {
   setup: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>',
   dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
@@ -89,6 +111,7 @@ const ICONS = {
   gateway: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
   memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z"/><path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z"/></svg>',
   inbox: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/></svg>',
+  folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>',
   extensions: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>',
   package: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
   about: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
@@ -185,7 +208,9 @@ export function renderSidebar(el) {
 
   // 从当前引擎获取菜单（回退到原有逻辑）
   const engine = getActiveEngine()
-  const navItems = engine ? engine.getNavItems() : (isOpenclawReady() ? NAV_ITEMS_FULL() : NAV_ITEMS_SETUP())
+  const navItems = needsInitialEngineChoice() || isEngineSetupDeferred()
+    ? NAV_ITEMS_ENGINE_SELECT()
+    : (engine ? engine.getNavItems() : (isOpenclawReady() ? NAV_ITEMS_FULL() : NAV_ITEMS_SETUP()))
 
   for (const section of navItems) {
     html += `<div class="nav-section">
@@ -223,6 +248,9 @@ export function renderSidebar(el) {
       ${l.code === langCode ? `<span class="lang-option-check">${checkIcon}</span>` : ''}
     </div>
   `).join('')
+
+  // 内核可升级卡片（仅 openclaw 引擎、已连接、低于推荐版时显示）
+  html += _renderKernelUpgradeHint()
 
   html += `
     <div class="sidebar-footer">
@@ -280,6 +308,30 @@ export function renderSidebar(el) {
       const themeBtn = e.target.closest('#btn-theme-toggle')
       if (themeBtn) {
         toggleTheme(() => renderSidebar(el))
+        return
+      }
+      // 内核升级提示卡：dismiss 按钮 → 仅当前会话不再显示
+      const dismissBtn = e.target.closest('#btn-kernel-upgrade-dismiss')
+      if (dismissBtn) {
+        e.preventDefault()
+        e.stopPropagation()
+        try { sessionStorage.setItem(SS_DISMISSED_KERNEL_UPGRADE, '1') } catch {}
+        const card = el.querySelector('#kernel-upgrade-hint')
+        if (card) card.remove()
+        return
+      }
+      // 内核升级提示卡：主体点击 → 触发一键升级流程
+      const hintCard = e.target.closest('#kernel-upgrade-hint')
+      if (hintCard) {
+        triggerKernelUpgrade({
+          onDone: () => {
+            // 升级完成后清除会话内的 dismiss 标记并刷新 sidebar
+            try { sessionStorage.removeItem(SS_DISMISSED_KERNEL_UPGRADE) } catch {}
+            renderSidebar(el)
+          },
+        }).catch(err => {
+          console.error('[sidebar] 内核升级触发失败:', err)
+        })
         return
       }
       // 语言切换器：打开/关闭下拉
@@ -364,6 +416,46 @@ export function renderSidebar(el) {
 }
 
 function _escSidebar(s) { return String(s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;') }
+
+/**
+ * 渲染"内核可升级"卡片。
+ *
+ * 显示条件（同时满足）：
+ * - 当前引擎是 openclaw
+ * - 已成功握手 Gateway（snapshot 有 version）
+ * - 高于硬地板（< floor 由 floor-blocker 接管）
+ * - 低于推荐目标（!isLatest）
+ * - 用户未在本会话中点击过 "暂不升级"
+ *
+ * 不满足任何一条返回空串。
+ */
+function _renderKernelUpgradeHint() {
+  if (getActiveEngineId() !== 'openclaw') return ''
+  if (sessionStorage.getItem(SS_DISMISSED_KERNEL_UPGRADE) === '1') return ''
+
+  const snap = getKernelSnapshot()
+  if (!snap || !snap.version) return ''
+  if (!snap.aboveFloor) return ''   // floor-blocker 处理
+  if (snap.isLatest) return ''       // 已经是推荐目标
+
+  const arrowIcon = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>'
+  const sparkIcon = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L13.5 8.5 20 10l-6.5 1.5L12 18l-1.5-6.5L4 10l6.5-1.5z"/></svg>'
+
+  const fromLabel = snap.versionLabel || snap.version
+  const toLabel = snap.target || ''
+
+  return `
+    <div class="kernel-upgrade-hint" id="kernel-upgrade-hint" role="button" tabindex="0">
+      <div class="kernel-upgrade-hint-icon">${sparkIcon}</div>
+      <div class="kernel-upgrade-hint-body">
+        <div class="kernel-upgrade-hint-title">${_escSidebar(t('kernel.upgradeHint.title'))}</div>
+        <div class="kernel-upgrade-hint-meta">${_escSidebar(t('kernel.upgradeHint.subtitle', { from: fromLabel, to: toLabel }))}</div>
+      </div>
+      <div class="kernel-upgrade-hint-arrow">${arrowIcon}</div>
+      <button class="kernel-upgrade-hint-dismiss" id="btn-kernel-upgrade-dismiss" title="${_escSidebar(t('kernel.upgradeHint.dismissTooltip'))}" aria-label="${_escSidebar(t('kernel.upgradeHint.dismissTooltip'))}">×</button>
+    </div>
+  `
+}
 
 // === 移动端侧边栏 ===
 function _closeMobileSidebar() {

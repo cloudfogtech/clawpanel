@@ -2,14 +2,16 @@
  * 服务管理页面
  * 服务启停 + 更新检测 + 配置备份管理
  */
-import { api } from '../lib/tauri-api.js'
+import { api, isTauriRuntime } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
+import { humanizeError } from '../lib/humanize-error.js'
 import { showConfirm, showModal, showUpgradeModal } from '../components/modal.js'
 import { isMacPlatform, isInDocker, setUpgrading, setUserStopped, resetAutoRestart } from '../lib/app-state.js'
 import { isForeignGatewayError, isForeignGatewayService, maybeShowForeignGatewayBindingPrompt, showGatewayConflictGuidance } from '../lib/gateway-ownership.js'
 import { diagnoseInstallError } from '../lib/error-diagnosis.js'
 import { icon, statusIcon } from '../lib/icons.js'
 import { t } from '../lib/i18n.js'
+import { wsClient } from '../lib/ws-client.js'
 
 // HTML 转义，防止 XSS
 function escapeHtml(str) {
@@ -32,11 +34,12 @@ export async function render() {
     </div>
     <div id="version-bar"><div class="stat-card loading-placeholder" style="height:80px;margin-bottom:var(--space-lg)"></div></div>
     <div id="services-list"><div class="stat-card loading-placeholder" style="height:64px"></div></div>
+    ${isTauriRuntime() ? '' : `
     <div class="config-section" id="docker-manager-section">
       <div class="config-section-title">${t('services.dockerManager')}</div>
       <div class="form-hint" style="margin-bottom:var(--space-sm)">${t('services.dockerManagerHint')}</div>
       <div id="docker-manager-bar"><div class="stat-card loading-placeholder" style="height:96px"></div></div>
-    </div>
+    </div>`}
     <div class="config-section" id="config-editor-section" style="display:none">
       <div class="config-section-title">${t('services.configEditor')}</div>
       <div class="form-hint" style="margin-bottom:var(--space-sm)">${t('services.configEditorHint')}</div>
@@ -100,6 +103,7 @@ async function loadVersion(page) {
     const hasRecommended = !!info.recommended
     const aheadOfRecommended = !!info.current && hasRecommended && !!info.ahead_of_recommended
     const driftFromRecommended = !!info.current && hasRecommended && !info.is_recommended && !aheadOfRecommended
+    const canUpgradeLatest = !!info.latest_update_available && !!info.latest
     const isChinese = detectedSource === 'chinese'
     const sourceTag = isChinese ? t('services.chineseEdition') : t('services.officialEdition')
     const switchLabel = isChinese ? t('services.switchToOfficial') : t('services.switchToChinese')
@@ -117,8 +121,8 @@ async function loadVersion(page) {
               <span class="stat-card-label">${t('services.currentVersion')} · <span style="color:var(--accent)">${t('services.dockerDeploy')}</span></span>
             </div>
             <div class="stat-card-value">${ver}</div>
-            <div class="stat-card-meta">${info.latest_update_available ? t('services.latestUpstream', { version: info.latest }) + '（' + t('services.pullNewImage') + '）' : t('services.currentImageVer')}</div>
-            ${info.latest_update_available ? `<div style="margin-top:var(--space-sm)">
+            <div class="stat-card-meta">${canUpgradeLatest ? t('services.latestUpstream', { version: info.latest }) + '（' + t('services.pullNewImage') + '）' : t('services.currentImageVer')}</div>
+            ${canUpgradeLatest ? `<div style="margin-top:var(--space-sm)">
               <code style="font-size:var(--font-size-xs);background:var(--bg-tertiary);padding:4px 8px;border-radius:4px;user-select:all">${escapeHtml(`docker pull ${dockerImage}:latest`)}</code>
             </div>` : ''}
           </div>
@@ -136,10 +140,11 @@ async function loadVersion(page) {
               ${hasRecommended
                 ? (aheadOfRecommended ? t('services.aheadOfRecommended', { version: info.recommended }) : driftFromRecommended ? t('services.recommendedStable', { version: info.recommended }) : t('services.alignedRecommended', { version: info.recommended }))
                 : t('services.noRecommended')}
-              ${info.latest_update_available && info.latest ? ' · ' + t('services.latestUpstream', { version: info.latest }) : ''}
+              ${canUpgradeLatest ? ' · ' + t('services.latestUpstream', { version: info.latest }) : ''}
             </div>
             <div style="display:flex;gap:var(--space-sm);margin-top:var(--space-sm);flex-wrap:wrap">
               ${aheadOfRecommended ? `<button class="btn btn-primary btn-sm" data-action="upgrade">${t('services.rollbackToRecommended')}</button>` : driftFromRecommended ? `<button class="btn btn-primary btn-sm" data-action="upgrade">${t('services.switchToRecommended')}</button>` : ''}
+              ${canUpgradeLatest ? `<button class="btn btn-primary btn-sm" data-action="upgrade-latest" data-version="${escapeHtml(info.latest)}">${t('services.upgradeToLatest')}</button>` : ''}
               <button class="btn btn-secondary btn-sm" data-action="switch-source" data-source="${switchTarget}">${switchLabel}</button>
             </div>
             <div style="margin-top:8px;font-size:var(--font-size-xs);color:var(--text-tertiary);line-height:1.6">
@@ -190,6 +195,9 @@ async function hasDockerManagerBackend() {
 }
 
 async function loadDockerManager(page) {
+  // Docker 多实例管理仅在 Web 部署模式（serve.js / dev-api）下有意义。
+  // 桌面 Tauri 用户不需要管理多个 OpenClaw 容器，整段 UI 已在 render() 里跳过渲染。
+  if (isTauriRuntime()) return
   const bar = page.querySelector('#docker-manager-bar')
   if (!bar) return
   const backendReady = await hasDockerManagerBackend()
@@ -206,6 +214,24 @@ async function loadDockerManager(page) {
     const onlineNodes = overview.filter(node => node.online).length
     const totalContainers = overview.reduce((sum, node) => sum + (node.containers?.length || 0), 0)
     const runningContainers = overview.reduce((sum, node) => sum + (node.containers?.filter?.(ct => ct.state === 'running').length || 0), 0)
+    const onlyUnavailableLocal = overview.length === 1
+      && overview[0]?.id === 'local'
+      && !overview[0]?.online
+      && !(overview[0]?.containers || []).length
+    if (!overview.length || onlyUnavailableLocal) {
+      bar.innerHTML = `
+        <div class="stat-card" style="padding:16px">
+          <div class="stat-card-label">${t('services.dockerOptionalTitle')}</div>
+          <div class="stat-card-meta" style="line-height:1.7;margin-top:6px">${t('services.dockerOptionalDesc')}</div>
+          ${onlyUnavailableLocal ? `<div class="form-hint" style="margin-top:8px">${escapeHtml(overview[0]?.error || '')}</div>` : ''}
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+            <button class="btn btn-secondary btn-sm" data-action="docker-refresh">${t('services.dockerRefresh')}</button>
+            <button class="btn btn-primary btn-sm" data-action="docker-add-node">${t('services.dockerAddNode')}</button>
+          </div>
+        </div>
+      `
+      return
+    }
     bar.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:var(--space-sm);flex-wrap:wrap;margin-bottom:var(--space-md)">
         <div class="stat-card" style="padding:12px 16px;min-width:260px">
@@ -455,13 +481,16 @@ function renderServices(container, services) {
     const cliMissing = gw.cli_installed === false
     const foreignGateway = !cliMissing && isForeignGatewayService(gw)
     const foreignPidText = gw.pid ? ` (PID: ${gw.pid})` : ''
+    // 协议版本徽章（仅在 Gateway 跑起来并完成 WS 握手时显示）
+    const proto = wsClient.gatewayReady ? wsClient.negotiatedProtocol : null
+    const protoBadge = proto ? `<span class="proto-badge" title="${t('services.protocolBadgeTitle', { proto })}">${t('services.protocolBadge', { proto })}</span>` : ''
 
     html += `
     <div class="service-card" data-label="${gw.label}">
       <div class="service-info">
         <span class="status-dot ${cliMissing ? 'stopped' : foreignGateway ? 'warning' : gw.running ? 'running' : 'stopped'}"></span>
         <div>
-          <div class="service-name">${gw.label}</div>
+          <div class="service-name">${gw.label}${protoBadge}</div>
           <div class="service-desc">${cliMissing
             ? t('services.cliNotInstalled')
             : foreignGateway
@@ -593,6 +622,9 @@ function bindEvents(page) {
         case 'upgrade':
           await handleUpgrade(btn, page)
           break
+        case 'upgrade-latest':
+          await handleUpgradeLatest(btn, page)
+          break
         case 'switch-source':
           await handleSwitchSource(btn.dataset.source, page)
           break
@@ -684,6 +716,10 @@ async function handleServiceAction(action, label, page) {
   } catch (e) {
     if (isForeignGatewayError(e)) {
       await openGatewayConflict(page, e)
+    } else if (_looksLikeInvalidConfigError(e)) {
+      // 上游 5.x doctor 增强：配置 schema 错误 → 直接给一键修复入口，
+      // 而不是丢一个 toast 让小白对着 stderr 干瞪眼。
+      await _promptDoctorFix(page, actionLabel, e)
     } else {
       toast(t('services.actionCmdFailed', { action: actionLabel, error: e.message || e }), 'error')
     }
@@ -758,7 +794,13 @@ async function handleRestoreBackup(name, page) {
 }
 
 async function handleDeleteBackup(name, page) {
-  const yes = await showConfirm(t('services.deleteConfirm', { name }))
+  const yes = await showConfirm({
+    title: t('services.deleteBackupTitle', { name }),
+    message: t('services.deleteConfirm', { name }),
+    impact: [t('services.deleteBackupImpact')],
+    confirmText: t('services.deleteBackupBtn'),
+    cancelText: t('services.deleteBackupCancel'),
+  })
   if (!yes) return
   await api.deleteBackup(name)
   toast(t('services.backupDeleted'), 'success')
@@ -881,14 +923,14 @@ async function handleSaveConfig(page, restart) {
         await api.restartGateway()
         toast(t('services.gwRestarted'), 'success')
       } catch (e) {
-        toast(t('services.configSavedGwFailed') + ': ' + e, 'warning')
+        toast(humanizeError(e, t('services.configSavedGwFailed')), 'warning')
       }
       await loadServices(page)
     }
 
     await loadBackups(page)
   } catch (e) {
-    toast(t('common.saveFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('common.saveFailed')), 'error')
     status.innerHTML = `<span style="color:var(--error)">${t('common.saveFailed')}: ${e}</span>`
   }
 }
@@ -967,6 +1009,15 @@ async function handleUpgrade(btn, page) {
   await doUpgradeWithModal(detectedSource, page, recommended || null)
 }
 
+async function handleUpgradeLatest(btn, page) {
+  const sourceLabel = detectedSource === 'official' ? t('services.officialEdition') : t('services.chineseEdition')
+  const latest = btn.dataset.version || lastVersionInfo?.latest
+  if (!latest) return
+  const yes = await showConfirm(t('services.upgradeLatestConfirm', { source: sourceLabel, version: `（${latest}）` }))
+  if (!yes) return
+  await doUpgradeWithModal(detectedSource, page, latest)
+}
+
 async function handleSwitchSource(target, page) {
   const targetLabel = target === 'official' ? t('services.officialEdition') : t('services.chineseEdition')
   const recommended = target === 'official'
@@ -990,7 +1041,7 @@ async function handleClaimGateway(btn, page) {
     await refreshGatewayStatus()
     await loadServices(page)
   } catch (e) {
-    toast(t('services.claimFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('services.claimFailed')), 'error')
     btn.classList.remove('btn-loading')
     btn.textContent = t('services.claimGateway')
   }
@@ -1006,14 +1057,24 @@ async function handleInstallGateway(btn, page) {
     toast(t('services.gwInstalled'), 'success')
     await loadServices(page)
   } catch (e) {
-    toast(t('services.installFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('services.installFailed')), 'error')
     btn.classList.remove('btn-loading')
     btn.textContent = t('services.install')
   }
 }
 
 async function handleUninstallGateway(btn, page) {
-  const yes = await showConfirm(t('services.uninstallConfirm'))
+  const yes = await showConfirm({
+    title: t('services.uninstallTitle'),
+    message: t('services.uninstallConfirm'),
+    impact: [
+      t('services.uninstallImpactStop'),
+      t('services.uninstallImpactAutostart'),
+      t('services.uninstallImpactConfig'),
+    ],
+    confirmText: t('services.uninstallBtn'),
+    cancelText: t('services.uninstallCancelBtn'),
+  })
   if (!yes) return
   btn.classList.add('btn-loading')
   btn.textContent = t('services.uninstalling')
@@ -1022,8 +1083,71 @@ async function handleUninstallGateway(btn, page) {
     toast(t('services.gwUninstalled'), 'success')
     await loadServices(page)
   } catch (e) {
-    toast(t('services.uninstallFailed') + ': ' + e, 'error')
+    toast(humanizeError(e, t('services.uninstallFailed')), 'error')
     btn.classList.remove('btn-loading')
     btn.textContent = t('services.uninstall')
+  }
+}
+
+// === 配置错误一键修复（上游 5.x doctor --fix 自动迁移多种 schema 问题） ===
+
+/**
+ * 判断错误是不是来自 OpenClaw 的配置 schema 校验失败。
+ *
+ * 命中关键词（覆盖中英文上游 stderr 模式）：
+ *  - "invalid config" / "schema validation" / "schema error"
+ *  - "unknown field" / "unrecognized key" / "extra fields"
+ *  - "config validation" / "doctor --fix"
+ *  - 中文："配置无效" / "配置校验失败" / "未知字段"
+ */
+function _looksLikeInvalidConfigError(e) {
+  const msg = String(e?.message || e || '').toLowerCase()
+  if (!msg) return false
+  return (
+    /invalid\s+config/.test(msg) ||
+    /schema\s+(validation|error)/.test(msg) ||
+    /config\s+validation/.test(msg) ||
+    /(unknown|unrecognized)\s+(field|key)/.test(msg) ||
+    /extra\s+fields/.test(msg) ||
+    /doctor\s+--?fix/.test(msg) ||
+    msg.includes('配置无效') ||
+    msg.includes('配置校验失败') ||
+    msg.includes('未知字段')
+  )
+}
+
+/**
+ * 弹出"检测到配置问题，要不要跑 doctor --fix"的引导。
+ *
+ * 这个交互替代单纯的红色 toast：
+ *  - 让小白看到一个**可点击的修复路径**而不是无解的报错文本
+ *  - 修复成功后自动重新加载服务列表
+ *  - 修复失败再回退到原有的 toast 错误展示
+ */
+async function _promptDoctorFix(page, actionLabel, originalErr) {
+  const errMsg = String(originalErr?.message || originalErr || '')
+  const yes = await showConfirm(
+    t('services.invalidConfigPrompt', { action: actionLabel, error: errMsg }),
+    {
+      title: t('services.invalidConfigTitle'),
+      confirmText: t('services.runDoctorFix'),
+      cancelText: t('common.cancel'),
+      variant: 'primary',  // 修复是建设性操作，按钮用 primary 蓝色而非 danger 红色
+    }
+  )
+  if (!yes) {
+    toast(t('services.actionCmdFailed', { action: actionLabel, error: errMsg }), 'error')
+    return
+  }
+
+  toast(t('services.runningDoctorFix'), 'info')
+  try {
+    await api.doctorFix()
+    toast(t('services.doctorFixSuccess'), 'success')
+    // doctor 改了配置，缓存可能脏 → 强制刷新
+    invalidate('read_openclaw_config')
+    await loadServices(page)
+  } catch (e2) {
+    toast(t('services.doctorFixFailed') + ': ' + (e2?.message || e2), 'error')
   }
 }

@@ -67,6 +67,7 @@ export default {
         { route: '/gateway', label: t('sidebar.gateway'), icon: 'gateway' },
         { route: '/channels', label: t('sidebar.channels'), icon: 'channels' },
         { route: '/communication', label: t('sidebar.communication'), icon: 'settings' },
+        { route: '/notifications', label: t('sidebar.notifications'), icon: 'channels' },
         { route: '/security', label: t('sidebar.security'), icon: 'security' },
       ]
     }, {
@@ -88,6 +89,7 @@ export default {
       items: [
         { route: '/settings', label: t('sidebar.settings'), icon: 'settings' },
         { route: '/chat-debug', label: t('sidebar.checkRepair'), icon: 'diagnose' },
+        { route: '/glossary', label: t('sidebar.glossary'), icon: 'about' },
         { route: '/about', label: t('sidebar.about'), icon: 'about' },
       ]
     }]
@@ -116,10 +118,12 @@ export default {
       { path: '/cron', loader: () => import('../../pages/cron.js') },
       { path: '/usage', loader: () => import('../../pages/usage.js') },
       { path: '/communication', loader: () => import('../../pages/communication.js') },
+      { path: '/notifications', loader: () => import('../../pages/notifications.js') },
       { path: '/settings', loader: () => import('../../pages/settings.js') },
       { path: '/route-map', loader: () => import('../../pages/route-map.js') },
       { path: '/plugin-hub', loader: () => import('../../pages/plugin-hub.js') },
       { path: '/diagnose', loader: () => import('../../pages/chat-debug.js') },
+      { path: '/glossary', loader: () => import('../../pages/glossary.js') },
     ]
   },
 

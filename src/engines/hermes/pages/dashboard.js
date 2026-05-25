@@ -2,7 +2,7 @@
  * Hermes Agent 仪表盘
  */
 import { t } from '../../../lib/i18n.js'
-import { api } from '../../../lib/tauri-api.js'
+import { api, safeTauriListen } from '../../../lib/tauri-api.js'
 import {
   loadHermesProviders,
   inferProviderByBaseUrl,
@@ -19,16 +19,6 @@ const ICONS = {
 
 // Provider registry—异步加载，第一次 render 前填充
 let hermesProviders = []
-
-// Lazy Tauri event listen (avoid top-level await for vite build)
-let _listenFn = null
-async function tauriListen(event, cb) {
-  if (!_listenFn) {
-    const mod = await import('@tauri-apps/api/event')
-    _listenFn = mod.listen
-  }
-  return _listenFn(event, cb)
-}
 
 const HERMES_DASHBOARD_URL = 'http://127.0.0.1:9119/'
 
@@ -102,7 +92,7 @@ export function render() {
     { label: t('engine.cliVersion'),    desc: t('engine.cliVersionDesc'),   cmd: 'hermes version' },
     { label: t('engine.cliGwStart'),    desc: t('engine.cliGwStartDesc'),   cmd: 'hermes gateway run' },
     { label: t('engine.cliGwStop'),     desc: t('engine.cliGwStopDesc'),    cmd: 'hermes gateway stop' },
-    { label: t('engine.cliUpgrade'),    desc: t('engine.cliUpgradeDesc'),   cmd: 'uv tool install --reinstall "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git" --python 3.11' },
+    { label: t('engine.cliUpgrade'),    desc: t('engine.cliUpgradeDesc'),   cmd: 'uv tool install --reinstall hermes-agent --python 3.11' },
     { label: t('engine.cliUninstall'),  desc: t('engine.cliUninstallDesc'), cmd: 'uv tool uninstall hermes-agent' },
     { label: t('engine.cliConfig'),     desc: t('engine.cliConfigDesc'),    cmd: isWin ? `explorer ${configPath}` : `open ${configPath}` },
   ]
@@ -237,8 +227,7 @@ export function render() {
         </button>
       </div>
 
-      <!-- Model config panel (collapsible) -->
-      <div class="hm-panel">
+      <div class="hm-panel hm-panel--allow-overflow">
         <div class="hm-panel-header hm-panel-header--toggle hm-cfg-toggle ${modelConfigCollapsed ? '' : 'is-open'}">
           <div class="hm-panel-title">
             <svg class="hm-panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
@@ -534,34 +523,6 @@ export function render() {
           toast(t('engine.dashNativePanelStartPortBusy', { port }), 'warning', { duration: 6000 })
           return
         }
-        if (startResult.kind === 'posix_only_module') {
-          // Hermes Agent 上游 bug：pty_bridge.py / memory_tool.py 在 Windows 上 import fcntl 等 POSIX-only 模块
-          // 见 https://github.com/NousResearch/hermes-agent/issues/5246
-          // 没办法在前端绕过——只能告诉用户原因和替代方案
-          const { showContentModal } = await import('../../../components/modal.js')
-          const m = showContentModal({
-            title: t('engine.dashNativePanelWindowsTitle'),
-            width: 580,
-            content: `
-              <p style="margin:0 0 14px;line-height:1.6;color:var(--text-secondary)">
-                ${t('engine.dashNativePanelWindowsDesc')}
-              </p>
-              <ul style="margin:0 0 12px 20px;padding:0;line-height:1.7;color:var(--text-primary)">
-                <li>${t('engine.dashNativePanelWindowsAlt1')}</li>
-                <li>${t('engine.dashNativePanelWindowsAlt2')}</li>
-              </ul>
-              <pre style="margin:0;padding:10px 12px;background:var(--surface-2,#f5f5f4);border:1px solid var(--border,#e5e5e5);border-radius:6px;font-family:var(--hm-font-mono,monospace);font-size:11px;color:var(--text-tertiary,#888);max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-all">${(startResult.log_tail || '').split('\n').slice(-6).join('\n').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c])}</pre>
-            `,
-            buttons: [
-              { label: t('engine.dashNativePanelWindowsReportLink'), className: 'btn btn-secondary btn-sm', id: 'hm-dash-issue-link' },
-            ],
-          })
-          m.querySelector('#hm-dash-issue-link')?.addEventListener('click', async () => {
-            try { await openExternalUrl('https://github.com/NousResearch/hermes-agent/issues/5246') }
-            catch {}
-          })
-          return
-        }
         if (startResult.kind !== 'deps_missing') {
           // spawn_failed / 其他未知 → 显示日志尾部摘要
           const detail = (startResult.log_tail || '').split('\n').slice(-3).join('\n').trim()
@@ -578,22 +539,14 @@ export function render() {
             <p style="margin:0 0 10px;line-height:1.6;color:var(--text-secondary)">
               ${t('engine.dashNativePanelDepHint')}
             </p>
-            <pre style="margin:0 0 12px;padding:12px 14px;background:var(--surface-2,#f5f5f4);border:1px solid var(--border,#e5e5e5);border-radius:6px;font-family:var(--hm-font-mono,monospace);font-size:13px;color:var(--text-primary);user-select:all;white-space:pre-wrap;word-break:break-all"><code>uv tool install --force 'hermes-agent[web] @ git+https://github.com/NousResearch/hermes-agent.git'</code></pre>
             <p style="margin:0;font-size:12px;color:var(--text-tertiary,#999);line-height:1.6">
               ${t('engine.dashNativePanelDown', { port })}
             </p>
           `,
           buttons: [
-            { label: t('common.copy') || 'Copy', className: 'btn btn-secondary btn-sm', id: 'hm-dash-copy-cmd' },
             { label: t('common.retry') || 'Retry', className: 'btn btn-secondary btn-sm', id: 'hm-dash-retry' },
             { label: t('engine.dashNativePanelInstallWeb'), className: 'btn btn-primary btn-sm', id: 'hm-dash-install-web' },
           ],
-        })
-        overlay.querySelector('#hm-dash-copy-cmd')?.addEventListener('click', async () => {
-          try {
-            await navigator.clipboard.writeText(`uv tool install --force 'hermes-agent[web] @ git+https://github.com/NousResearch/hermes-agent.git'`)
-            toast(t('common.copied') || 'Copied', 'success')
-          } catch {}
         })
         overlay.querySelector('#hm-dash-retry')?.addEventListener('click', async () => {
           // 重试：先 probe，再 auto-start
@@ -895,7 +848,7 @@ export function render() {
   async function setupListeners() {
     try {
       // 监听 Guardian 推送的状态变化
-      const unlisten1 = await tauriListen('hermes-gateway-status', (evt) => {
+      const unlisten1 = await safeTauriListen('hermes-gateway-status', (evt) => {
         const data = evt.payload
         if (info) {
           const wasRunning = info.gatewayRunning
@@ -910,13 +863,13 @@ export function render() {
       unlisteners.push(unlisten1)
 
       // 监听 Guardian 日志（显示在消息区）
-      const unlisten2 = await tauriListen('hermes-guardian-log', (evt) => {
+      const unlisten2 = await safeTauriListen('hermes-guardian-log', (evt) => {
         showGwMsg(evt.payload || '', false)
       })
       unlisteners.push(unlisten2)
 
       // 监听 config.yaml 自愈事件（api_server guardian）
-      const unlisten3 = await tauriListen('hermes-config-patched', async (evt) => {
+      const unlisten3 = await safeTauriListen('hermes-config-patched', async (evt) => {
         const { toast } = await import('../../../components/toast.js')
         const msg = evt?.payload?.message || t('engine.dashConfigPatched')
         toast(msg, 'info', { duration: 6000 })

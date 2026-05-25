@@ -9,6 +9,27 @@ export function isTauriRuntime() {
   return !!window.__TAURI_INTERNALS__ || !!window.__TAURI__ || window.location?.hostname === 'tauri.localhost'
 }
 
+let _tauriListenFn = null
+
+/**
+ * 安全订阅 Tauri 事件。Web 模式下返回 noop unsubscriber，
+ * 避免动态 import `@tauri-apps/api/event` 时触碰
+ * `window.__TAURI_INTERNALS__.transformCallback` 引发
+ * "Cannot read properties of undefined" 报错（issue #256）。
+ *
+ * 用法：
+ *   const unlisten = await safeTauriListen('hermes-install-log', e => ...)
+ *   unlisten()  // 取消订阅
+ */
+export async function safeTauriListen(event, cb) {
+  if (!isTauriRuntime()) return () => {}
+  if (!_tauriListenFn) {
+    const mod = await import('@tauri-apps/api/event')
+    _tauriListenFn = mod.listen
+  }
+  return _tauriListenFn(event, cb)
+}
+
 // 仅在 Node.js 后端实现的命令（Tauri Rust 不处理），强制走 webInvoke
 const WEB_ONLY_CMDS = new Set([
   'instance_list', 'instance_add', 'instance_remove', 'instance_set_active',
@@ -146,6 +167,47 @@ async function webInvoke(cmd, args) {
   return resp.json()
 }
 
+async function webStreamInvoke(cmd, args, onEvent, options = {}) {
+  const resp = await fetch(`/__api/${cmd}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(args || {}),
+    signal: options.signal,
+  })
+  if (resp.status === 401) {
+    if (!isTauriRuntime() && window.__clawpanel_show_login) window.__clawpanel_show_login()
+    throw new Error(t('common.loginRequired'))
+  }
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }))
+    throw new Error(data.error || `HTTP ${resp.status}`)
+  }
+  if (!resp.body) throw new Error('Streaming response is not supported by this browser')
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        const event = JSON.parse(trimmed)
+        if (typeof onEvent === 'function') onEvent(event)
+      }
+    }
+    const tail = buffer.trim()
+    if (tail && typeof onEvent === 'function') onEvent(JSON.parse(tail))
+  } finally {
+    try { reader.releaseLock() } catch {}
+  }
+}
+
 // 后端连接状态
 let _backendOnline = null // null=未检测, true=在线, false=离线
 const _backendListeners = []
@@ -169,7 +231,13 @@ export async function checkBackendHealth() {
   if (isTauriRuntime()) { _setBackendOnline(true); return true }
   try {
     const resp = await fetch('/__api/health', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-    const ok = resp.ok
+    const ct = (resp.headers.get('content-type') || '').toLowerCase()
+    if (!resp.ok || !ct.includes('application/json')) {
+      _setBackendOnline(false)
+      return false
+    }
+    const data = await resp.json().catch(() => null)
+    const ok = !!data?.ok
     _setBackendOnline(ok)
     return ok
   } catch {
@@ -198,12 +266,19 @@ export const api = {
   guardianStatus: () => invoke('guardian_status'),
   checkCiaoWindowsHideBug: () => invoke('check_ciao_windowshide_bug'),
 
+  // CLI 冲突检测与隔离（PATH 中残留的非 standalone openclaw）
+  scanOpenclawPathConflicts: () => invoke('scan_openclaw_path_conflicts'),
+  quarantineOpenclawPath: (path) => invoke('quarantine_openclaw_path', { path }),
+  quarantineOpenclawPathsBulk: (paths) => invoke('quarantine_openclaw_paths_bulk', { paths }),
+  listQuarantinedOpenclaw: () => invoke('list_quarantined_openclaw'),
+  restoreQuarantinedOpenclaw: (quarantinedPath) => invoke('restore_quarantined_openclaw', { quarantinedPath }),
+
   // 配置（读缓存，写清缓存）
   getVersionInfo: () => cachedInvoke('get_version_info', {}, 30000),
   getStatusSummary: () => cachedInvoke('get_status_summary', {}, 60000),
   readOpenclawConfig: () => cachedInvoke('read_openclaw_config'),
   calibrateOpenclawConfig: (mode = 'inherit') => { invalidate('read_openclaw_config', 'check_installation', 'list_backups', 'get_services_status', 'get_status_summary'); return invoke('calibrate_openclaw_config', { mode }).then(r => { _debouncedReloadGateway(); return r }) },
-  writeOpenclawConfig: (config) => { invalidate('read_openclaw_config'); return invoke('write_openclaw_config', { config }).then(r => { _debouncedReloadGateway(); return r }) },
+  writeOpenclawConfig: (config, opts = {}) => { invalidate('read_openclaw_config'); return invoke('write_openclaw_config', { config }).then(r => { if (opts.noReload !== true) _debouncedReloadGateway(); return r }) },
   readMcpConfig: () => cachedInvoke('read_mcp_config'),
   writeMcpConfig: (config) => { invalidate('read_mcp_config'); return invoke('write_mcp_config', { config }) },
   reloadGateway: () => invoke('reload_gateway'),
@@ -228,6 +303,7 @@ export const api = {
   testModel: (baseUrl, apiKey, modelId, apiType = null) => invoke('test_model', { baseUrl, apiKey, modelId, apiType }),
   testModelVerbose: (baseUrl, apiKey, modelId, apiType = null) => invoke('test_model_verbose', { baseUrl, apiKey, modelId, apiType }),
   listRemoteModels: (baseUrl, apiKey, apiType = null) => invoke('list_remote_models', { baseUrl, apiKey, apiType }),
+  scanModelClientConfigs: () => invoke('scan_model_client_configs'),
 
   // Agent 管理
   listAgents: () => cachedInvoke('list_agents'),
@@ -402,9 +478,38 @@ export const api = {
   configureHermes: (provider, apiKey, model, baseUrl) => invoke('configure_hermes', { provider, apiKey, model: model || null, baseUrl: baseUrl || null }),
   hermesGatewayAction: (action) => invoke('hermes_gateway_action', { action }),
   hermesHealthCheck: () => invoke('hermes_health_check'),
+  hermesCapabilities: () => invoke('hermes_capabilities'),
   hermesApiProxy: (method, path, body, headers) => invoke('hermes_api_proxy', { method, path, body: body || null, headers: headers || null }),
-  hermesAgentRun: (input, sessionId, conversationHistory, instructions) => invoke('hermes_agent_run', { input, sessionId: sessionId || null, conversationHistory: conversationHistory || null, instructions: instructions || null }),
+  hermesAgentRun: (input, sessionId, conversationHistory, instructions, attachments) => invoke('hermes_agent_run', { input, sessionId: sessionId || null, conversationHistory: conversationHistory || null, instructions: instructions || null, attachments: attachments && attachments.length ? attachments : null }),
+  hermesAgentRunStream: (input, sessionId, conversationHistory, instructions, onEvent, options) => webStreamInvoke('hermes_agent_run_stream', { input, sessionId: sessionId || null, conversationHistory: conversationHistory || null, instructions: instructions || null }, onEvent, options),
+  // Batch 1 §D + §C-bis: 真正中断 + Approval Flow（用 run_id）
+  hermesRunStop: (runId) => invoke('hermes_run_stop', { runId }),
+  hermesRunApproval: (runId, choice) => invoke('hermes_run_approval', { runId, choice }),
+  // Batch 2 §I: 流恢复 — 查 run 状态
+  hermesRunStatus: (runId) => invoke('hermes_run_status', { runId }),
+  // Batch 1 §E: 会话消息导出（走 dashboard /api/sessions/{id}/messages）
+  hermesSessionExport: (sessionId) => invoke('hermes_session_export', { sessionId }),
+  // Batch 2 §H 基础设施: 通用 Dashboard 9119 HTTP 代理
+  hermesDashboardApi: (method, path, body, headers) => invoke('hermes_dashboard_api_proxy', {
+    method, path,
+    body: body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body)),
+    headers: headers || null,
+  }),
+  // Batch 2 §G: 多 Gateway 看板
+  hermesMultiGatewayList: () => invoke('hermes_multi_gateway_list'),
+  hermesMultiGatewayAdd: (name, profile) => invoke('hermes_multi_gateway_add', { name, profile }),
+  hermesMultiGatewayRemove: (name) => invoke('hermes_multi_gateway_remove', { name }),
+  hermesMultiGatewayStart: (name) => invoke('hermes_multi_gateway_start', { name }),
+  hermesMultiGatewayStop: (name) => invoke('hermes_multi_gateway_stop', { name }),
+  // Batch 3 §L: 文件管理器（限定在 hermes_home 子树内）
+  hermesFsList: (path = '') => invoke('hermes_fs_list', { path }),
+  hermesFsRead: (path) => invoke('hermes_fs_read', { path }),
+  hermesFsWrite: (path, content) => invoke('hermes_fs_write', { path, content }),
   hermesReadConfig: () => invoke('hermes_read_config'),
+  hermesReadConfigFull: () => invoke('hermes_read_config_full'),
+  hermesLazyDepsFeatures: () => cachedInvoke('hermes_lazy_deps_features', {}, 600000),
+  hermesLazyDepsStatus: (features) => invoke('hermes_lazy_deps_status', { features }),
+  hermesLazyDepsEnsure: (feature) => invoke('hermes_lazy_deps_ensure', { feature }),
   hermesFetchModels: (baseUrl, apiKey, apiType, provider) => invoke('hermes_fetch_models', { baseUrl, apiKey, apiType: apiType || null, provider: provider || null }),
   hermesUpdateModel: (model, provider) => invoke('hermes_update_model', { model, provider: provider || null }),
   hermesListProviders: () => cachedInvoke('hermes_list_providers', {}, 600000),
