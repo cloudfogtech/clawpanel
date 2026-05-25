@@ -5651,6 +5651,17 @@ const HERMES_DISPLAY_LANGUAGE_VALUES: &[&str] = &[
 const HERMES_DISPLAY_BUSY_INPUT_MODES: &[&str] = &["interrupt", "queue", "steer"];
 const HERMES_DISPLAY_BACKGROUND_PROCESS_NOTIFICATIONS: &[&str] = &["off", "result", "error", "all"];
 const HERMES_DISPLAY_FINAL_RESPONSE_MARKDOWN_VALUES: &[&str] = &["render", "strip", "raw"];
+const HERMES_DISPLAY_SKINS: &[&str] = &[
+    "default",
+    "ares",
+    "mono",
+    "slate",
+    "daylight",
+    "warm-lightmode",
+    "poseidon",
+    "sisyphus",
+    "charizard",
+];
 
 const HERMES_RUNTIME_FOOTER_FIELDS: &[&str] =
     &["model", "context_pct", "cwd", "duration", "tokens", "cost"];
@@ -5671,6 +5682,22 @@ fn normalize_hermes_display_language(
         Err("display.language 不在支持列表中".to_string())
     } else {
         Ok("en".to_string())
+    }
+}
+
+fn normalize_hermes_display_skin(value: Option<String>, strict: bool) -> Result<String, String> {
+    let skin = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let skin = if skin.is_empty() {
+        "default".to_string()
+    } else {
+        skin
+    };
+    if HERMES_DISPLAY_SKINS.contains(&skin.as_str()) {
+        Ok(skin)
+    } else if strict {
+        Err("display.skin 必须是内置皮肤 default、ares、mono、slate、daylight、warm-lightmode、poseidon、sisyphus 或 charizard".to_string())
+    } else {
+        Ok("default".to_string())
     }
 }
 
@@ -5841,6 +5868,11 @@ fn build_hermes_display_config_values(config: &serde_yaml::Value) -> Value {
     });
 
     serde_json::json!({
+        "displayCompact": display.and_then(|map| yaml_bool_field(map, "compact")).unwrap_or(false),
+        "displaySkin": normalize_hermes_display_skin(
+            display.and_then(|map| yaml_string_field(map, "skin")),
+            false,
+        ).unwrap_or_else(|_| "default".to_string()),
         "displayToolProgress": normalize_hermes_display_tool_progress(
             display.and_then(|map| yaml_string_field(map, "tool_progress")),
             false,
@@ -5919,6 +5951,21 @@ fn merge_hermes_display_config(config: &mut serde_yaml::Value, form: &Value) -> 
     )?;
 
     let display = yaml_child_object(ensure_yaml_object(config)?, "display")?;
+    display.insert(
+        yaml_key("compact"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayCompact")
+                .unwrap_or_else(|| current["displayCompact"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
+        yaml_key("skin"),
+        serde_yaml::Value::String(normalize_hermes_display_skin(
+            form_string(form, "displaySkin")
+                .or_else(|| current["displaySkin"].as_str().map(ToString::to_string)),
+            true,
+        )?),
+    );
     display.insert(
         yaml_key("tool_progress"),
         serde_yaml::Value::String(tool_progress),
@@ -17785,6 +17832,8 @@ mod hermes_display_config_tests {
         let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
         let values = build_hermes_display_config_values(&config);
         assert_eq!(values["displayToolProgress"], "all");
+        assert_eq!(values["displayCompact"], false);
+        assert_eq!(values["displaySkin"], "default");
         assert_eq!(values["displayToolProgressCommand"], false);
         assert_eq!(values["displayInterimAssistantMessages"], true);
         assert_eq!(values["displayRuntimeFooterEnabled"], false);
@@ -17810,6 +17859,8 @@ mod hermes_display_config_tests {
             r#"
 display:
   tool_progress: VERBOSE
+  compact: true
+  skin: MONO
   tool_progress_command: true
   interim_assistant_messages: false
   runtime_footer:
@@ -17833,6 +17884,8 @@ display:
         .unwrap();
         let values = build_hermes_display_config_values(&config);
         assert_eq!(values["displayToolProgress"], "verbose");
+        assert_eq!(values["displayCompact"], true);
+        assert_eq!(values["displaySkin"], "mono");
         assert_eq!(values["displayToolProgressCommand"], true);
         assert_eq!(values["displayInterimAssistantMessages"], false);
         assert_eq!(values["displayRuntimeFooterEnabled"], true);
@@ -17876,6 +17929,8 @@ memory:
             &mut config,
             &json!({
                 "displayToolProgress": "off",
+                "displayCompact": true,
+                "displaySkin": "slate",
                 "displayToolProgressCommand": true,
                 "displayInterimAssistantMessages": false,
                 "displayRuntimeFooterEnabled": true,
@@ -17896,7 +17951,8 @@ memory:
 
         assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
         assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
-        assert_eq!(config["display"]["skin"].as_str(), Some("midnight"));
+        assert_eq!(config["display"]["compact"].as_bool(), Some(true));
+        assert_eq!(config["display"]["skin"].as_str(), Some("slate"));
         assert_eq!(
             config["display"]["platforms"]["telegram"]["tool_progress"].as_str(),
             Some("new")
@@ -17966,6 +18022,10 @@ memory:
         )
         .unwrap_err();
         assert!(err.contains("display.tool_progress"));
+
+        let err = merge_hermes_display_config(&mut config, &json!({ "displaySkin": "unknown" }))
+            .unwrap_err();
+        assert!(err.contains("display.skin"));
 
         let err =
             merge_hermes_display_config(&mut config, &json!({ "displayResumeDisplay": "compact" }))

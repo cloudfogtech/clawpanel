@@ -11,6 +11,8 @@ test('Hermes 显示配置读取会提供上游默认值', () => {
 
   assert.deepEqual(values, {
     displayToolProgress: 'all',
+    displayCompact: false,
+    displaySkin: 'default',
     displayToolProgressCommand: false,
     displayInterimAssistantMessages: true,
     displayRuntimeFooterEnabled: false,
@@ -32,6 +34,8 @@ test('Hermes 显示配置读取会规范化已有字段', () => {
   const values = buildHermesDisplayConfigValues({
     display: {
       tool_progress: 'VERBOSE',
+      compact: true,
+      skin: 'MONO',
       tool_progress_command: true,
       interim_assistant_messages: false,
       runtime_footer: {
@@ -52,6 +56,8 @@ test('Hermes 显示配置读取会规范化已有字段', () => {
   })
 
   assert.equal(values.displayToolProgress, 'verbose')
+  assert.equal(values.displayCompact, true)
+  assert.equal(values.displaySkin, 'mono')
   assert.equal(values.displayToolProgressCommand, true)
   assert.equal(values.displayInterimAssistantMessages, false)
   assert.equal(values.displayRuntimeFooterEnabled, true)
@@ -84,6 +90,8 @@ test('Hermes 显示配置保存会保留未知 YAML 并写入 display', () => {
     memory: { memory_enabled: true },
   }, {
     displayToolProgress: 'off',
+    displayCompact: true,
+    displaySkin: 'slate',
     displayToolProgressCommand: 'true',
     displayInterimAssistantMessages: false,
     displayRuntimeFooterEnabled: true,
@@ -102,7 +110,8 @@ test('Hermes 显示配置保存会保留未知 YAML 并写入 display', () => {
 
   assert.deepEqual(next.model, { provider: 'anthropic' })
   assert.deepEqual(next.memory, { memory_enabled: true })
-  assert.equal(next.display.skin, 'midnight')
+  assert.equal(next.display.compact, true)
+  assert.equal(next.display.skin, 'slate')
   assert.deepEqual(next.display.platforms.telegram, { tool_progress: 'new' })
   assert.equal(next.display.tool_progress, 'off')
   assert.equal(next.display.tool_progress_command, true)
@@ -126,6 +135,10 @@ test('Hermes 显示配置保存会拒绝非法枚举和页脚字段', () => {
   assert.throws(
     () => mergeHermesDisplayConfig({}, { displayToolProgress: 'everything' }),
     /display\.tool_progress/,
+  )
+  assert.throws(
+    () => mergeHermesDisplayConfig({}, { displaySkin: 'unknown' }),
+    /display\.skin/,
   )
   assert.throws(
     () => mergeHermesDisplayConfig({}, { displayResumeDisplay: 'compact' }),

@@ -136,6 +136,8 @@ const SECURITY_DEFAULTS = {
 
 const DISPLAY_DEFAULTS = {
   displayToolProgress: 'all',
+  displayCompact: false,
+  displaySkin: 'default',
   displayToolProgressCommand: false,
   displayInterimAssistantMessages: true,
   displayRuntimeFooterEnabled: false,
@@ -265,6 +267,7 @@ const UNAUTHORIZED_DM_BEHAVIORS = ['pair', 'ignore']
 const IMAGE_INPUT_MODES = ['auto', 'native', 'text']
 const REASONING_EFFORTS = ['xhigh', 'high', 'medium', 'low', 'minimal', 'none']
 const DISPLAY_TOOL_PROGRESS_VALUES = ['off', 'new', 'all', 'verbose']
+const DISPLAY_SKINS = ['default', 'ares', 'mono', 'slate', 'daylight', 'warm-lightmode', 'poseidon', 'sisyphus', 'charizard']
 const DISPLAY_LANGUAGE_VALUES = ['en', 'zh', 'zh-hant', 'ja', 'de', 'es', 'fr', 'tr', 'uk', 'af', 'ko', 'it', 'ga', 'pt', 'ru', 'hu']
 const DISPLAY_RESUME_VALUES = ['full', 'minimal']
 const DISPLAY_BUSY_INPUT_MODES = ['interrupt', 'queue', 'steer']
@@ -1244,6 +1247,12 @@ export function render() {
               </select>
             </label>
             <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesDisplayConfigSkin')}</span>
+              <select id="hm-display-skin" class="hm-input" ${disabled ? 'disabled' : ''}>
+                ${DISPLAY_SKINS.map(mode => option(`engine.hermesDisplayConfigSkin_${mode}`, mode, displayValues.displaySkin)).join('')}
+              </select>
+            </label>
+            <label class="hm-field">
               <span class="hm-field-label">${t('engine.hermesDisplayConfigLanguage')}</span>
               <select id="hm-display-language" class="hm-input" ${disabled ? 'disabled' : ''}>
                 ${DISPLAY_LANGUAGE_VALUES.map(mode => option(`engine.hermesDisplayConfigLanguage_${mode}`, mode, displayValues.displayLanguage)).join('')}
@@ -1283,6 +1292,10 @@ export function render() {
             </label>
           </div>
           <div class="hm-config-check-grid">
+            <label class="hm-channel-check">
+              <input id="hm-display-compact" type="checkbox" ${displayValues.displayCompact ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesDisplayConfigCompact')}</span>
+            </label>
             <label class="hm-channel-check">
               <input id="hm-display-tool-progress-command" type="checkbox" ${displayValues.displayToolProgressCommand ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
               <span>${t('engine.hermesDisplayConfigToolProgressCommand')}</span>
@@ -3159,6 +3172,8 @@ export function render() {
   async function saveDisplayConfig() {
     const form = {
       displayToolProgress: el.querySelector('#hm-display-tool-progress')?.value || 'all',
+      displayCompact: !!el.querySelector('#hm-display-compact')?.checked,
+      displaySkin: el.querySelector('#hm-display-skin')?.value || 'default',
       displayToolProgressCommand: !!el.querySelector('#hm-display-tool-progress-command')?.checked,
       displayInterimAssistantMessages: !!el.querySelector('#hm-display-interim-assistant-messages')?.checked,
       displayRuntimeFooterEnabled: !!el.querySelector('#hm-display-runtime-footer-enabled')?.checked,

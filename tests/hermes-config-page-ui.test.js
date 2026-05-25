@@ -162,6 +162,8 @@ test('Hermes 配置页会暴露全局显示与可靠性结构化配置字段', (
   for (const id of [
     'hm-display-save',
     'hm-display-tool-progress',
+    'hm-display-compact',
+    'hm-display-skin',
     'hm-display-tool-progress-command',
     'hm-display-interim-assistant-messages',
     'hm-display-runtime-footer-enabled',

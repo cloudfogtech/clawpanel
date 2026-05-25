@@ -3345,6 +3345,7 @@ const HERMES_DISPLAY_BUSY_INPUT_MODES = new Set(['interrupt', 'queue', 'steer'])
 const HERMES_DISPLAY_BACKGROUND_PROCESS_NOTIFICATIONS = new Set(['off', 'result', 'error', 'all'])
 const HERMES_DISPLAY_FINAL_RESPONSE_MARKDOWN_VALUES = new Set(['render', 'strip', 'raw'])
 const HERMES_DISPLAY_LANGUAGE_VALUES = new Set(['en', 'zh', 'zh-hant', 'ja', 'de', 'es', 'fr', 'tr', 'uk', 'af', 'ko', 'it', 'ga', 'pt', 'ru', 'hu'])
+const HERMES_DISPLAY_SKINS = new Set(['default', 'ares', 'mono', 'slate', 'daylight', 'warm-lightmode', 'poseidon', 'sisyphus', 'charizard'])
 const HERMES_RUNTIME_FOOTER_FIELDS = new Set(['model', 'context_pct', 'cwd', 'duration', 'tokens', 'cost'])
 const HERMES_HOOK_EVENTS = new Set([
   'pre_tool_call',
@@ -3624,6 +3625,13 @@ function normalizeHermesDisplayLanguage(value, strict = false) {
   return 'en'
 }
 
+function normalizeHermesDisplaySkin(value, strict = false) {
+  const skin = String(value ?? '').trim().toLowerCase() || 'default'
+  if (HERMES_DISPLAY_SKINS.has(skin)) return skin
+  if (strict) throw new Error('display.skin 必须是内置皮肤 default、ares、mono、slate、daylight、warm-lightmode、poseidon、sisyphus 或 charizard')
+  return 'default'
+}
+
 function normalizeHermesRuntimeFooterFields(value, strict = false) {
   const items = Array.isArray(value)
     ? value
@@ -3660,6 +3668,8 @@ export function buildHermesDisplayConfigValues(config = {}) {
     ? display.runtime_footer
     : {}
   return {
+    displayCompact: readHermesBool(display.compact, false),
+    displaySkin: normalizeHermesDisplaySkin(display.skin, false),
     displayToolProgress: normalizeHermesDisplayToolProgress(display.tool_progress, false),
     displayToolProgressCommand: readHermesBool(display.tool_progress_command, false),
     displayInterimAssistantMessages: readHermesBool(display.interim_assistant_messages, true),
@@ -3688,6 +3698,8 @@ export function mergeHermesDisplayConfig(config = {}, form = {}) {
     ? mergeConfigsPreservingFields(display.runtime_footer, {})
     : {}
 
+  display.compact = formHermesBool(form, 'displayCompact', currentValues.displayCompact)
+  display.skin = normalizeHermesDisplaySkin(Object.hasOwn(form, 'displaySkin') ? form.displaySkin : currentValues.displaySkin, true)
   display.tool_progress = normalizeHermesDisplayToolProgress(Object.hasOwn(form, 'displayToolProgress') ? form.displayToolProgress : currentValues.displayToolProgress, true, 'display.tool_progress')
   display.tool_progress_command = formHermesBool(form, 'displayToolProgressCommand', currentValues.displayToolProgressCommand)
   display.interim_assistant_messages = formHermesBool(form, 'displayInterimAssistantMessages', currentValues.displayInterimAssistantMessages)
