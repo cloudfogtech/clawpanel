@@ -3329,6 +3329,7 @@ const HERMES_STT_PROVIDERS = new Set(['auto', 'local', 'groq', 'openai', 'mistra
 const HERMES_STT_LOCAL_MODELS = new Set(['tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'])
 const HERMES_STT_OPENAI_MODELS = new Set(['whisper-1', 'gpt-4o-mini-transcribe', 'gpt-4o-transcribe'])
 const HERMES_STT_MISTRAL_MODELS = new Set(['voxtral-mini-latest', 'voxtral-mini-2602'])
+const HERMES_AUXILIARY_PROVIDERS = new Set(['auto', 'openrouter', 'nous', 'gemini', 'ollama-cloud', 'codex', 'main'])
 const HERMES_APPROVAL_MODES = new Set(['manual', 'smart', 'off'])
 const HERMES_APPROVAL_CRON_MODES = new Set(['deny', 'approve'])
 const HERMES_LOGGING_LEVELS = new Set(['DEBUG', 'INFO', 'WARNING'])
@@ -3503,6 +3504,21 @@ function normalizeHermesPromptCacheTtl(value, strict = false) {
   if (HERMES_PROMPT_CACHE_TTLS.has(ttl)) return ttl
   if (strict) throw new Error('prompt_caching.cache_ttl 必须是 5m 或 1h')
   return '5m'
+}
+
+function normalizeHermesAuxiliaryProvider(value, key, strict = false) {
+  const provider = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_AUXILIARY_PROVIDERS.has(provider)) return provider
+  if (strict) throw new Error(`${key} 必须是 auto、openrouter、nous、gemini、ollama-cloud、codex 或 main`)
+  return 'auto'
+}
+
+function normalizeHermesAuxiliaryModel(value, key, strict = false) {
+  const model = String(value ?? '').trim()
+  if (!model) return ''
+  if (/^[a-zA-Z0-9_./:@+-]+$/.test(model) && !model.split('/').includes('..')) return model
+  if (strict) throw new Error(`${key} 只能包含字母、数字、下划线、点、斜杠、冒号、@、加号和短横线`)
+  return ''
 }
 
 function normalizeHermesDisplayToolProgress(value, strict = false, key = 'display.tool_progress') {
@@ -3724,6 +3740,68 @@ export function mergeHermesPromptCachingConfig(config = {}, form = {}) {
     : {}
   promptCaching.cache_ttl = normalizeHermesPromptCacheTtl(Object.hasOwn(form, 'promptCacheTtl') ? form.promptCacheTtl : currentValues.promptCacheTtl, true)
   next.prompt_caching = promptCaching
+  return next
+}
+
+function hermesAuxiliaryTask(root, key) {
+  const auxiliary = root.auxiliary && typeof root.auxiliary === 'object' && !Array.isArray(root.auxiliary)
+    ? root.auxiliary
+    : {}
+  return auxiliary[key] && typeof auxiliary[key] === 'object' && !Array.isArray(auxiliary[key])
+    ? auxiliary[key]
+    : {}
+}
+
+export function buildHermesAuxiliaryConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const vision = hermesAuxiliaryTask(root, 'vision')
+  const webExtract = hermesAuxiliaryTask(root, 'web_extract')
+  const sessionSearch = hermesAuxiliaryTask(root, 'session_search')
+  return {
+    auxiliaryVisionProvider: normalizeHermesAuxiliaryProvider(vision.provider, 'auxiliary.vision.provider', false),
+    auxiliaryVisionModel: normalizeHermesAuxiliaryModel(vision.model, 'auxiliary.vision.model', false),
+    auxiliaryVisionTimeout: parseHermesInteger(vision.timeout, 'auxiliary.vision.timeout', 30, 1, 3600, false),
+    auxiliaryVisionDownloadTimeout: parseHermesInteger(vision.download_timeout, 'auxiliary.vision.download_timeout', 30, 1, 3600, false),
+    auxiliaryWebExtractProvider: normalizeHermesAuxiliaryProvider(webExtract.provider, 'auxiliary.web_extract.provider', false),
+    auxiliaryWebExtractModel: normalizeHermesAuxiliaryModel(webExtract.model, 'auxiliary.web_extract.model', false),
+    auxiliarySessionSearchProvider: normalizeHermesAuxiliaryProvider(sessionSearch.provider, 'auxiliary.session_search.provider', false),
+    auxiliarySessionSearchModel: normalizeHermesAuxiliaryModel(sessionSearch.model, 'auxiliary.session_search.model', false),
+    auxiliarySessionSearchTimeout: parseHermesInteger(sessionSearch.timeout, 'auxiliary.session_search.timeout', 30, 1, 3600, false),
+    auxiliarySessionSearchMaxConcurrency: parseHermesInteger(sessionSearch.max_concurrency, 'auxiliary.session_search.max_concurrency', 3, 1, 100, false),
+  }
+}
+
+export function mergeHermesAuxiliaryConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesAuxiliaryConfigValues(next)
+  const auxiliary = next.auxiliary && typeof next.auxiliary === 'object' && !Array.isArray(next.auxiliary)
+    ? mergeConfigsPreservingFields(next.auxiliary, {})
+    : {}
+  const vision = auxiliary.vision && typeof auxiliary.vision === 'object' && !Array.isArray(auxiliary.vision)
+    ? mergeConfigsPreservingFields(auxiliary.vision, {})
+    : {}
+  const webExtract = auxiliary.web_extract && typeof auxiliary.web_extract === 'object' && !Array.isArray(auxiliary.web_extract)
+    ? mergeConfigsPreservingFields(auxiliary.web_extract, {})
+    : {}
+  const sessionSearch = auxiliary.session_search && typeof auxiliary.session_search === 'object' && !Array.isArray(auxiliary.session_search)
+    ? mergeConfigsPreservingFields(auxiliary.session_search, {})
+    : {}
+
+  vision.provider = normalizeHermesAuxiliaryProvider(Object.hasOwn(form, 'auxiliaryVisionProvider') ? form.auxiliaryVisionProvider : currentValues.auxiliaryVisionProvider, 'auxiliary.vision.provider', true)
+  vision.model = normalizeHermesAuxiliaryModel(Object.hasOwn(form, 'auxiliaryVisionModel') ? form.auxiliaryVisionModel : currentValues.auxiliaryVisionModel, 'auxiliary.vision.model', true)
+  vision.timeout = parseHermesInteger(Object.hasOwn(form, 'auxiliaryVisionTimeout') ? form.auxiliaryVisionTimeout : currentValues.auxiliaryVisionTimeout, 'auxiliary.vision.timeout', 30, 1, 3600, true)
+  vision.download_timeout = parseHermesInteger(Object.hasOwn(form, 'auxiliaryVisionDownloadTimeout') ? form.auxiliaryVisionDownloadTimeout : currentValues.auxiliaryVisionDownloadTimeout, 'auxiliary.vision.download_timeout', 30, 1, 3600, true)
+  webExtract.provider = normalizeHermesAuxiliaryProvider(Object.hasOwn(form, 'auxiliaryWebExtractProvider') ? form.auxiliaryWebExtractProvider : currentValues.auxiliaryWebExtractProvider, 'auxiliary.web_extract.provider', true)
+  webExtract.model = normalizeHermesAuxiliaryModel(Object.hasOwn(form, 'auxiliaryWebExtractModel') ? form.auxiliaryWebExtractModel : currentValues.auxiliaryWebExtractModel, 'auxiliary.web_extract.model', true)
+  sessionSearch.provider = normalizeHermesAuxiliaryProvider(Object.hasOwn(form, 'auxiliarySessionSearchProvider') ? form.auxiliarySessionSearchProvider : currentValues.auxiliarySessionSearchProvider, 'auxiliary.session_search.provider', true)
+  sessionSearch.model = normalizeHermesAuxiliaryModel(Object.hasOwn(form, 'auxiliarySessionSearchModel') ? form.auxiliarySessionSearchModel : currentValues.auxiliarySessionSearchModel, 'auxiliary.session_search.model', true)
+  sessionSearch.timeout = parseHermesInteger(Object.hasOwn(form, 'auxiliarySessionSearchTimeout') ? form.auxiliarySessionSearchTimeout : currentValues.auxiliarySessionSearchTimeout, 'auxiliary.session_search.timeout', 30, 1, 3600, true)
+  sessionSearch.max_concurrency = parseHermesInteger(Object.hasOwn(form, 'auxiliarySessionSearchMaxConcurrency') ? form.auxiliarySessionSearchMaxConcurrency : currentValues.auxiliarySessionSearchMaxConcurrency, 'auxiliary.session_search.max_concurrency', 3, 1, 100, true)
+
+  auxiliary.vision = vision
+  auxiliary.web_extract = webExtract
+  auxiliary.session_search = sessionSearch
+  next.auxiliary = auxiliary
   return next
 }
 
@@ -10827,6 +10905,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesPromptCachingConfigValues(next),
+    }
+  },
+
+  hermes_auxiliary_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesAuxiliaryConfigValues(config),
+    }
+  },
+
+  hermes_auxiliary_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesAuxiliaryConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesAuxiliaryConfigValues(next),
     }
   },
 

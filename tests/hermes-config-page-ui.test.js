@@ -150,6 +150,24 @@ test('Hermes 配置页会暴露提示缓存结构化配置字段', () => {
   }
 })
 
+test('Hermes 配置页会暴露辅助模型结构化配置字段', () => {
+  for (const id of [
+    'hm-auxiliary-save',
+    'hm-auxiliary-vision-provider',
+    'hm-auxiliary-vision-model',
+    'hm-auxiliary-vision-timeout',
+    'hm-auxiliary-vision-download-timeout',
+    'hm-auxiliary-web-extract-provider',
+    'hm-auxiliary-web-extract-model',
+    'hm-auxiliary-session-search-provider',
+    'hm-auxiliary-session-search-model',
+    'hm-auxiliary-session-search-timeout',
+    'hm-auxiliary-session-search-max-concurrency',
+  ]) {
+    assert.match(source, new RegExp(`id="${id}"`), `缺少 ${id}`)
+  }
+})
+
 test('Hermes 配置页会暴露网关流式结构化配置字段', () => {
   for (const id of [
     'hm-streaming-save',
@@ -316,6 +334,7 @@ test('Hermes 配置页新增结构化配置不会暴露翻译 key', () => {
     key.includes('HumanDelayConfig') ||
     key.includes('DisplayConfig') ||
     key.includes('PromptCachingConfig') ||
+    key.includes('AuxiliaryConfig') ||
     key.includes('StreamingConfig') ||
     key.includes('ExecutionLimits') ||
     key.includes('PrivacyConfig') ||

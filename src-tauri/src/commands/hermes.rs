@@ -2168,6 +2168,15 @@ const HERMES_CHANNEL_PLATFORMS: [&str; 10] = [
 const HERMES_DISPLAY_TOOL_PROGRESS_VALUES: [&str; 4] = ["off", "new", "all", "verbose"];
 const HERMES_DISPLAY_STREAMING_VALUES: [&str; 3] = ["inherit", "true", "false"];
 const HERMES_PROMPT_CACHE_TTLS: [&str; 2] = ["5m", "1h"];
+const HERMES_AUXILIARY_PROVIDERS: [&str; 7] = [
+    "auto",
+    "openrouter",
+    "nous",
+    "gemini",
+    "ollama-cloud",
+    "codex",
+    "main",
+];
 
 fn normalize_hermes_channel_platform(platform: &str) -> Option<&'static str> {
     let platform = platform.trim().to_ascii_lowercase();
@@ -2265,6 +2274,52 @@ fn normalize_hermes_prompt_cache_ttl(
         Err("prompt_caching.cache_ttl 必须是 5m 或 1h".to_string())
     } else {
         Ok("5m".to_string())
+    }
+}
+
+fn normalize_hermes_auxiliary_provider(
+    value: Option<String>,
+    key: &str,
+    strict: bool,
+) -> Result<String, String> {
+    let provider = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let provider = if provider.is_empty() {
+        "auto".to_string()
+    } else {
+        provider
+    };
+    if HERMES_AUXILIARY_PROVIDERS.contains(&provider.as_str()) {
+        Ok(provider)
+    } else if strict {
+        Err(format!(
+            "{key} 必须是 auto、openrouter、nous、gemini、ollama-cloud、codex 或 main"
+        ))
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_auxiliary_model(
+    value: Option<String>,
+    key: &str,
+    strict: bool,
+) -> Result<String, String> {
+    let model = value.unwrap_or_default().trim().to_string();
+    if model.is_empty() {
+        return Ok(String::new());
+    }
+    if !model.split('/').any(|part| part == "..")
+        && model.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '@' | '+' | '-')
+        })
+    {
+        Ok(model)
+    } else if strict {
+        Err(format!(
+            "{key} 只能包含字母、数字、下划线、点、斜杠、冒号、@、加号和短横线"
+        ))
+    } else {
+        Ok(String::new())
     }
 }
 
@@ -3461,6 +3516,221 @@ fn merge_hermes_prompt_caching_config(
     let root = ensure_yaml_object(config)?;
     let prompt_caching = yaml_child_object(root, "prompt_caching")?;
     prompt_caching.insert(yaml_key("cache_ttl"), serde_yaml::Value::String(cache_ttl));
+    Ok(())
+}
+
+fn hermes_auxiliary_task<'a>(
+    root: Option<&'a serde_yaml::Mapping>,
+    key: &str,
+) -> Option<&'a serde_yaml::Mapping> {
+    root.and_then(|map| yaml_get_mapping(map, "auxiliary"))
+        .and_then(|map| yaml_get_mapping(map, key))
+}
+
+fn build_hermes_auxiliary_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let vision = hermes_auxiliary_task(root, "vision");
+    let web_extract = hermes_auxiliary_task(root, "web_extract");
+    let session_search = hermes_auxiliary_task(root, "session_search");
+
+    serde_json::json!({
+        "auxiliaryVisionProvider": normalize_hermes_auxiliary_provider(
+            vision.and_then(|map| yaml_string_field(map, "provider")),
+            "auxiliary.vision.provider",
+            false,
+        ).unwrap_or_else(|_| "auto".to_string()),
+        "auxiliaryVisionModel": normalize_hermes_auxiliary_model(
+            vision.and_then(|map| yaml_string_field(map, "model")),
+            "auxiliary.vision.model",
+            false,
+        ).unwrap_or_default(),
+        "auxiliaryVisionTimeout": vision.map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 30, 1, 3600)).unwrap_or(30),
+        "auxiliaryVisionDownloadTimeout": vision.map(|map| bounded_hermes_i64(yaml_i64_field(map, "download_timeout"), 30, 1, 3600)).unwrap_or(30),
+        "auxiliaryWebExtractProvider": normalize_hermes_auxiliary_provider(
+            web_extract.and_then(|map| yaml_string_field(map, "provider")),
+            "auxiliary.web_extract.provider",
+            false,
+        ).unwrap_or_else(|_| "auto".to_string()),
+        "auxiliaryWebExtractModel": normalize_hermes_auxiliary_model(
+            web_extract.and_then(|map| yaml_string_field(map, "model")),
+            "auxiliary.web_extract.model",
+            false,
+        ).unwrap_or_default(),
+        "auxiliarySessionSearchProvider": normalize_hermes_auxiliary_provider(
+            session_search.and_then(|map| yaml_string_field(map, "provider")),
+            "auxiliary.session_search.provider",
+            false,
+        ).unwrap_or_else(|_| "auto".to_string()),
+        "auxiliarySessionSearchModel": normalize_hermes_auxiliary_model(
+            session_search.and_then(|map| yaml_string_field(map, "model")),
+            "auxiliary.session_search.model",
+            false,
+        ).unwrap_or_default(),
+        "auxiliarySessionSearchTimeout": session_search.map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 30, 1, 3600)).unwrap_or(30),
+        "auxiliarySessionSearchMaxConcurrency": session_search.map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_concurrency"), 3, 1, 100)).unwrap_or(3),
+    })
+}
+
+fn merge_hermes_auxiliary_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_auxiliary_config_values(config);
+    let vision_provider = normalize_hermes_auxiliary_provider(
+        form_string(form, "auxiliaryVisionProvider").or_else(|| {
+            current["auxiliaryVisionProvider"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.vision.provider",
+        true,
+    )?;
+    let vision_model = normalize_hermes_auxiliary_model(
+        form_string(form, "auxiliaryVisionModel").or_else(|| {
+            current["auxiliaryVisionModel"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.vision.model",
+        true,
+    )?;
+    let vision_timeout = validate_hermes_i64(
+        if form.get("auxiliaryVisionTimeout").is_some() {
+            form_i64(form, "auxiliaryVisionTimeout")
+        } else {
+            Some(current["auxiliaryVisionTimeout"].as_i64().unwrap_or(30))
+        },
+        "auxiliary.vision.timeout",
+        30,
+        1,
+        3600,
+    )?;
+    let vision_download_timeout = validate_hermes_i64(
+        if form.get("auxiliaryVisionDownloadTimeout").is_some() {
+            form_i64(form, "auxiliaryVisionDownloadTimeout")
+        } else {
+            Some(
+                current["auxiliaryVisionDownloadTimeout"]
+                    .as_i64()
+                    .unwrap_or(30),
+            )
+        },
+        "auxiliary.vision.download_timeout",
+        30,
+        1,
+        3600,
+    )?;
+    let web_extract_provider = normalize_hermes_auxiliary_provider(
+        form_string(form, "auxiliaryWebExtractProvider").or_else(|| {
+            current["auxiliaryWebExtractProvider"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.web_extract.provider",
+        true,
+    )?;
+    let web_extract_model = normalize_hermes_auxiliary_model(
+        form_string(form, "auxiliaryWebExtractModel").or_else(|| {
+            current["auxiliaryWebExtractModel"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.web_extract.model",
+        true,
+    )?;
+    let session_search_provider = normalize_hermes_auxiliary_provider(
+        form_string(form, "auxiliarySessionSearchProvider").or_else(|| {
+            current["auxiliarySessionSearchProvider"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.session_search.provider",
+        true,
+    )?;
+    let session_search_model = normalize_hermes_auxiliary_model(
+        form_string(form, "auxiliarySessionSearchModel").or_else(|| {
+            current["auxiliarySessionSearchModel"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.session_search.model",
+        true,
+    )?;
+    let session_search_timeout = validate_hermes_i64(
+        if form.get("auxiliarySessionSearchTimeout").is_some() {
+            form_i64(form, "auxiliarySessionSearchTimeout")
+        } else {
+            Some(
+                current["auxiliarySessionSearchTimeout"]
+                    .as_i64()
+                    .unwrap_or(30),
+            )
+        },
+        "auxiliary.session_search.timeout",
+        30,
+        1,
+        3600,
+    )?;
+    let session_search_max_concurrency = validate_hermes_i64(
+        if form.get("auxiliarySessionSearchMaxConcurrency").is_some() {
+            form_i64(form, "auxiliarySessionSearchMaxConcurrency")
+        } else {
+            Some(
+                current["auxiliarySessionSearchMaxConcurrency"]
+                    .as_i64()
+                    .unwrap_or(3),
+            )
+        },
+        "auxiliary.session_search.max_concurrency",
+        3,
+        1,
+        100,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let auxiliary = yaml_child_object(root, "auxiliary")?;
+    let vision = yaml_child_object(auxiliary, "vision")?;
+    vision.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(vision_provider),
+    );
+    vision.insert(yaml_key("model"), serde_yaml::Value::String(vision_model));
+    vision.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(vision_timeout.into()),
+    );
+    vision.insert(
+        yaml_key("download_timeout"),
+        serde_yaml::Value::Number(vision_download_timeout.into()),
+    );
+
+    let web_extract = yaml_child_object(auxiliary, "web_extract")?;
+    web_extract.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(web_extract_provider),
+    );
+    web_extract.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(web_extract_model),
+    );
+
+    let session_search = yaml_child_object(auxiliary, "session_search")?;
+    session_search.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(session_search_provider),
+    );
+    session_search.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(session_search_model),
+    );
+    session_search.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(session_search_timeout.into()),
+    );
+    session_search.insert(
+        yaml_key("max_concurrency"),
+        serde_yaml::Value::Number(session_search_max_concurrency.into()),
+    );
     Ok(())
 }
 
@@ -7228,6 +7498,30 @@ pub fn hermes_prompt_caching_config_save(form: Value) -> Result<Value, String> {
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_prompt_caching_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_auxiliary_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_auxiliary_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_auxiliary_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_auxiliary_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_auxiliary_config_values(&config),
     }))
 }
 
@@ -12881,6 +13175,202 @@ compression:
             merge_hermes_prompt_caching_config(&mut config, &json!({ "promptCacheTtl": "30m" }))
                 .unwrap_err();
         assert!(err.contains("prompt_caching.cache_ttl"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_auxiliary_config_tests {
+    use super::{build_hermes_auxiliary_config_values, merge_hermes_auxiliary_config};
+    use serde_json::json;
+
+    #[test]
+    fn auxiliary_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_auxiliary_config_values(&config);
+        assert_eq!(values["auxiliaryVisionProvider"], "auto");
+        assert_eq!(values["auxiliaryVisionModel"], "");
+        assert_eq!(values["auxiliaryVisionTimeout"], 30);
+        assert_eq!(values["auxiliaryVisionDownloadTimeout"], 30);
+        assert_eq!(values["auxiliaryWebExtractProvider"], "auto");
+        assert_eq!(values["auxiliaryWebExtractModel"], "");
+        assert_eq!(values["auxiliarySessionSearchProvider"], "auto");
+        assert_eq!(values["auxiliarySessionSearchModel"], "");
+        assert_eq!(values["auxiliarySessionSearchTimeout"], 30);
+        assert_eq!(values["auxiliarySessionSearchMaxConcurrency"], 3);
+    }
+
+    #[test]
+    fn auxiliary_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+auxiliary:
+  vision:
+    provider: openrouter
+    model: google/gemini-2.5-flash
+    timeout: 45
+    download_timeout: 60
+  web_extract:
+    provider: main
+    model: local-summary
+  session_search:
+    provider: nous
+    model: gemini-3-flash
+    timeout: 50
+    max_concurrency: 5
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_auxiliary_config_values(&config);
+        assert_eq!(values["auxiliaryVisionProvider"], "openrouter");
+        assert_eq!(values["auxiliaryVisionModel"], "google/gemini-2.5-flash");
+        assert_eq!(values["auxiliaryVisionTimeout"], 45);
+        assert_eq!(values["auxiliaryVisionDownloadTimeout"], 60);
+        assert_eq!(values["auxiliaryWebExtractProvider"], "main");
+        assert_eq!(values["auxiliaryWebExtractModel"], "local-summary");
+        assert_eq!(values["auxiliarySessionSearchProvider"], "nous");
+        assert_eq!(values["auxiliarySessionSearchModel"], "gemini-3-flash");
+        assert_eq!(values["auxiliarySessionSearchTimeout"], 50);
+        assert_eq!(values["auxiliarySessionSearchMaxConcurrency"], 5);
+    }
+
+    #[test]
+    fn merge_auxiliary_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+auxiliary:
+  vision:
+    provider: auto
+    custom_flag: keep-vision
+  web_extract:
+    custom_flag: keep-web
+  session_search:
+    extra_body:
+      enable_thinking: false
+    custom_flag: keep-search
+  custom_task:
+    provider: main
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({
+                "auxiliaryVisionProvider": "codex",
+                "auxiliaryVisionModel": "gpt-5.3-codex",
+                "auxiliaryVisionTimeout": "40",
+                "auxiliaryVisionDownloadTimeout": "55",
+                "auxiliaryWebExtractProvider": "gemini",
+                "auxiliaryWebExtractModel": "gemini-3-flash",
+                "auxiliarySessionSearchProvider": "ollama-cloud",
+                "auxiliarySessionSearchModel": "gpt-oss:20b",
+                "auxiliarySessionSearchTimeout": "70",
+                "auxiliarySessionSearchMaxConcurrency": "6",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["auxiliary"]["vision"]["provider"].as_str(),
+            Some("codex")
+        );
+        assert_eq!(
+            config["auxiliary"]["vision"]["model"].as_str(),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(config["auxiliary"]["vision"]["timeout"].as_i64(), Some(40));
+        assert_eq!(
+            config["auxiliary"]["vision"]["download_timeout"].as_i64(),
+            Some(55)
+        );
+        assert_eq!(
+            config["auxiliary"]["vision"]["custom_flag"].as_str(),
+            Some("keep-vision")
+        );
+        assert_eq!(
+            config["auxiliary"]["web_extract"]["provider"].as_str(),
+            Some("gemini")
+        );
+        assert_eq!(
+            config["auxiliary"]["web_extract"]["model"].as_str(),
+            Some("gemini-3-flash")
+        );
+        assert_eq!(
+            config["auxiliary"]["web_extract"]["custom_flag"].as_str(),
+            Some("keep-web")
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["provider"].as_str(),
+            Some("ollama-cloud")
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["model"].as_str(),
+            Some("gpt-oss:20b")
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["timeout"].as_i64(),
+            Some(70)
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["max_concurrency"].as_i64(),
+            Some(6)
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["extra_body"]["enable_thinking"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["custom_flag"].as_str(),
+            Some("keep-search")
+        );
+        assert_eq!(
+            config["auxiliary"]["custom_task"]["provider"].as_str(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn merge_auxiliary_config_rejects_invalid_values() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliaryVisionProvider": "bad-provider" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.vision.provider"));
+
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliaryVisionModel": "../secret" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.vision.model"));
+
+        let err =
+            merge_hermes_auxiliary_config(&mut config, &json!({ "auxiliaryVisionTimeout": 0 }))
+                .unwrap_err();
+        assert!(err.contains("auxiliary.vision.timeout"));
+
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliaryVisionDownloadTimeout": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.vision.download_timeout"));
+
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliarySessionSearchMaxConcurrency": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.session_search.max_concurrency"));
     }
 }
 
