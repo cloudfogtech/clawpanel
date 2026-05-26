@@ -6589,6 +6589,22 @@ fn build_hermes_kanban_config_values(config: &serde_yaml::Value) -> Value {
                 1000,
             ))
             .unwrap_or(3),
+        "workerLogRotateBytes": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "worker_log_rotate_bytes"),
+                2097152,
+                1,
+                1073741824,
+            ))
+            .unwrap_or(2097152),
+        "workerLogBackupCount": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "worker_log_backup_count"),
+                1,
+                0,
+                100,
+            ))
+            .unwrap_or(1),
         "dispatchStaleTimeoutSeconds": kanban
             .map(|map| bounded_hermes_i64(
                 yaml_i64_field(map, "dispatch_stale_timeout_seconds"),
@@ -6644,6 +6660,20 @@ fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> R
         1,
         1000,
     )?;
+    let worker_log_rotate_bytes = validate_hermes_i64(
+        form_i64(form, "workerLogRotateBytes").or_else(|| current["workerLogRotateBytes"].as_i64()),
+        "kanban.worker_log_rotate_bytes",
+        2097152,
+        1,
+        1073741824,
+    )?;
+    let worker_log_backup_count = validate_hermes_i64(
+        form_i64(form, "workerLogBackupCount").or_else(|| current["workerLogBackupCount"].as_i64()),
+        "kanban.worker_log_backup_count",
+        1,
+        0,
+        100,
+    )?;
     let stale_timeout = validate_hermes_i64(
         form_i64(form, "dispatchStaleTimeoutSeconds")
             .or_else(|| current["dispatchStaleTimeoutSeconds"].as_i64()),
@@ -6689,6 +6719,14 @@ fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> R
     kanban.insert(
         yaml_key("auto_decompose_per_tick"),
         serde_yaml::Value::Number(serde_yaml::Number::from(auto_decompose_per_tick)),
+    );
+    kanban.insert(
+        yaml_key("worker_log_rotate_bytes"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(worker_log_rotate_bytes)),
+    );
+    kanban.insert(
+        yaml_key("worker_log_backup_count"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(worker_log_backup_count)),
     );
     kanban.insert(
         yaml_key("dispatch_stale_timeout_seconds"),
@@ -19460,6 +19498,8 @@ mod hermes_kanban_config_tests {
         assert_eq!(values["failureLimit"], 2);
         assert_eq!(values["autoDecompose"], true);
         assert_eq!(values["autoDecomposePerTick"], 3);
+        assert_eq!(values["workerLogRotateBytes"], 2097152);
+        assert_eq!(values["workerLogBackupCount"], 1);
         assert_eq!(values["dispatchStaleTimeoutSeconds"], 14400);
     }
 
@@ -19475,6 +19515,8 @@ kanban:
   failure_limit: "5"
   auto_decompose: false
   auto_decompose_per_tick: "7"
+  worker_log_rotate_bytes: "4194304"
+  worker_log_backup_count: "3"
   dispatch_stale_timeout_seconds: "7200"
 "#,
         )
@@ -19487,6 +19529,8 @@ kanban:
         assert_eq!(values["failureLimit"], 5);
         assert_eq!(values["autoDecompose"], false);
         assert_eq!(values["autoDecomposePerTick"], 7);
+        assert_eq!(values["workerLogRotateBytes"], 4194304);
+        assert_eq!(values["workerLogBackupCount"], 3);
         assert_eq!(values["dispatchStaleTimeoutSeconds"], 7200);
     }
 
@@ -19517,6 +19561,8 @@ memory:
                 "failureLimit": 4,
                 "autoDecompose": false,
                 "autoDecomposePerTick": 2,
+                "workerLogRotateBytes": 1048576,
+                "workerLogBackupCount": 0,
                 "dispatchStaleTimeoutSeconds": 0,
             }),
         )
@@ -19540,6 +19586,14 @@ memory:
         assert_eq!(
             config["kanban"]["auto_decompose_per_tick"].as_i64(),
             Some(2)
+        );
+        assert_eq!(
+            config["kanban"]["worker_log_rotate_bytes"].as_i64(),
+            Some(1048576)
+        );
+        assert_eq!(
+            config["kanban"]["worker_log_backup_count"].as_i64(),
+            Some(0)
         );
         assert_eq!(
             config["kanban"]["dispatch_stale_timeout_seconds"].as_i64(),
@@ -19594,6 +19648,14 @@ kanban:
         let err = merge_hermes_kanban_config(&mut config, &json!({ "autoDecomposePerTick": 0 }))
             .unwrap_err();
         assert!(err.contains("kanban.auto_decompose_per_tick"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "workerLogRotateBytes": 0 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.worker_log_rotate_bytes"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "workerLogBackupCount": -1 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.worker_log_backup_count"));
 
         let err =
             merge_hermes_kanban_config(&mut config, &json!({ "dispatchStaleTimeoutSeconds": -1 }))

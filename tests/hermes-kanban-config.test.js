@@ -17,6 +17,8 @@ test('Hermes Kanban 配置读取会提供上游默认值', () => {
     failureLimit: 2,
     autoDecompose: true,
     autoDecomposePerTick: 3,
+    workerLogRotateBytes: 2097152,
+    workerLogBackupCount: 1,
     dispatchStaleTimeoutSeconds: 14400,
   })
 })
@@ -31,6 +33,8 @@ test('Hermes Kanban 配置读取会规范化已有字段', () => {
       failure_limit: '5',
       auto_decompose: false,
       auto_decompose_per_tick: '7',
+      worker_log_rotate_bytes: '4194304',
+      worker_log_backup_count: '3',
       dispatch_stale_timeout_seconds: '7200',
     },
   })
@@ -42,6 +46,8 @@ test('Hermes Kanban 配置读取会规范化已有字段', () => {
   assert.equal(values.failureLimit, 5)
   assert.equal(values.autoDecompose, false)
   assert.equal(values.autoDecomposePerTick, 7)
+  assert.equal(values.workerLogRotateBytes, 4194304)
+  assert.equal(values.workerLogBackupCount, 3)
   assert.equal(values.dispatchStaleTimeoutSeconds, 7200)
 })
 
@@ -63,6 +69,8 @@ test('Hermes Kanban 配置保存会保留未知 YAML 并写入 kanban', () => {
     failureLimit: '4',
     autoDecompose: false,
     autoDecomposePerTick: '2',
+    workerLogRotateBytes: '1048576',
+    workerLogBackupCount: '0',
     dispatchStaleTimeoutSeconds: '0',
   })
 
@@ -76,6 +84,8 @@ test('Hermes Kanban 配置保存会保留未知 YAML 并写入 kanban', () => {
   assert.equal(next.kanban.failure_limit, 4)
   assert.equal(next.kanban.auto_decompose, false)
   assert.equal(next.kanban.auto_decompose_per_tick, 2)
+  assert.equal(next.kanban.worker_log_rotate_bytes, 1048576)
+  assert.equal(next.kanban.worker_log_backup_count, 0)
   assert.equal(next.kanban.dispatch_stale_timeout_seconds, 0)
 })
 
@@ -116,6 +126,14 @@ test('Hermes Kanban 配置保存会拒绝非法调度参数', () => {
   assert.throws(
     () => mergeHermesKanbanConfig({}, { autoDecomposePerTick: '0' }),
     /kanban\.auto_decompose_per_tick/,
+  )
+  assert.throws(
+    () => mergeHermesKanbanConfig({}, { workerLogRotateBytes: '0' }),
+    /kanban\.worker_log_rotate_bytes/,
+  )
+  assert.throws(
+    () => mergeHermesKanbanConfig({}, { workerLogBackupCount: '-1' }),
+    /kanban\.worker_log_backup_count/,
   )
   assert.throws(
     () => mergeHermesKanbanConfig({}, { dispatchStaleTimeoutSeconds: '-1' }),

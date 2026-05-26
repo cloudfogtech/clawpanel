@@ -181,6 +181,8 @@ const KANBAN_DEFAULTS = {
   failureLimit: 2,
   autoDecompose: true,
   autoDecomposePerTick: 3,
+  workerLogRotateBytes: 2097152,
+  workerLogBackupCount: 1,
   dispatchStaleTimeoutSeconds: 14400,
 }
 
@@ -1524,6 +1526,14 @@ export function render() {
             <label class="hm-field">
               <span class="hm-field-label">${t('engine.hermesKanbanConfigAutoDecomposePerTick')}</span>
               <input id="hm-kanban-auto-decompose-per-tick" class="hm-input" type="number" inputmode="numeric" min="1" max="1000" step="1" value="${esc(kanbanValues.autoDecomposePerTick)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigWorkerLogRotateBytes')}</span>
+              <input id="hm-kanban-worker-log-rotate-bytes" class="hm-input" type="number" inputmode="numeric" min="1" max="1073741824" step="1024" value="${esc(kanbanValues.workerLogRotateBytes)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigWorkerLogBackupCount')}</span>
+              <input id="hm-kanban-worker-log-backup-count" class="hm-input" type="number" inputmode="numeric" min="0" max="100" step="1" value="${esc(kanbanValues.workerLogBackupCount)}" ${disabled ? 'disabled' : ''}>
             </label>
             <label class="hm-field">
               <span class="hm-field-label">${t('engine.hermesKanbanConfigDispatchStaleTimeoutSeconds')}</span>
@@ -3530,6 +3540,8 @@ export function render() {
       failureLimit: el.querySelector('#hm-kanban-failure-limit')?.value || '2',
       autoDecompose: el.querySelector('#hm-kanban-auto-decompose')?.checked ?? true,
       autoDecomposePerTick: el.querySelector('#hm-kanban-auto-decompose-per-tick')?.value || '3',
+      workerLogRotateBytes: el.querySelector('#hm-kanban-worker-log-rotate-bytes')?.value || '2097152',
+      workerLogBackupCount: el.querySelector('#hm-kanban-worker-log-backup-count')?.value || '1',
       dispatchStaleTimeoutSeconds: el.querySelector('#hm-kanban-dispatch-stale-timeout-seconds')?.value || '14400',
     }
     kanbanSaving = true

@@ -3800,6 +3800,22 @@ export function buildHermesKanbanConfigValues(config = {}) {
       1000,
       false,
     ),
+    workerLogRotateBytes: parseHermesInteger(
+      kanban.worker_log_rotate_bytes,
+      'kanban.worker_log_rotate_bytes',
+      2097152,
+      1,
+      1073741824,
+      false,
+    ),
+    workerLogBackupCount: parseHermesInteger(
+      kanban.worker_log_backup_count,
+      'kanban.worker_log_backup_count',
+      1,
+      0,
+      100,
+      false,
+    ),
     dispatchStaleTimeoutSeconds: parseHermesInteger(
       kanban.dispatch_stale_timeout_seconds,
       'kanban.dispatch_stale_timeout_seconds',
@@ -3862,6 +3878,22 @@ export function mergeHermesKanbanConfig(config = {}, form = {}) {
     3,
     1,
     1000,
+    true,
+  )
+  kanban.worker_log_rotate_bytes = parseHermesInteger(
+    Object.hasOwn(form, 'workerLogRotateBytes') ? form.workerLogRotateBytes : currentValues.workerLogRotateBytes,
+    'kanban.worker_log_rotate_bytes',
+    2097152,
+    1,
+    1073741824,
+    true,
+  )
+  kanban.worker_log_backup_count = parseHermesInteger(
+    Object.hasOwn(form, 'workerLogBackupCount') ? form.workerLogBackupCount : currentValues.workerLogBackupCount,
+    'kanban.worker_log_backup_count',
+    1,
+    0,
+    100,
     true,
   )
   kanban.dispatch_stale_timeout_seconds = parseHermesInteger(
