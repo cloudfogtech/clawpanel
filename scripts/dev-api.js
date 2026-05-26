@@ -3331,6 +3331,7 @@ const HERMES_BROWSER_DIALOG_POLICIES = new Set(['must_respond', 'auto_dismiss', 
 const HERMES_WEB_BACKENDS = new Set(['tavily', 'firecrawl', 'parallel', 'exa', 'searxng', 'brave', 'brave_free', 'ddgs', 'xai', 'native'])
 const HERMES_LSP_WAIT_MODES = new Set(['document', 'full'])
 const HERMES_LSP_INSTALL_STRATEGIES = new Set(['auto', 'manual', 'off'])
+const HERMES_MODEL_CATALOG_DEFAULT_URL = 'https://hermes-agent.nousresearch.com/docs/api/model-catalog.json'
 const HERMES_STT_PROVIDERS = new Set(['auto', 'local', 'groq', 'openai', 'mistral'])
 const HERMES_STT_LOCAL_MODELS = new Set(['tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'])
 const HERMES_STT_OPENAI_MODELS = new Set(['whisper-1', 'gpt-4o-mini-transcribe', 'gpt-4o-transcribe'])
@@ -3497,6 +3498,22 @@ function normalizeHermesWebBackend(value, key, strict = false) {
   if (HERMES_WEB_BACKENDS.has(backend)) return backend
   if (strict) throw new Error(`${key} 必须为空或 tavily、firecrawl、parallel、exa、searxng、brave、brave_free、ddgs、xai、native`)
   return ''
+}
+
+function normalizeHermesHttpUrl(value, key, fallback = '', strict = false) {
+  const raw = String(value ?? '').trim()
+  if (!raw) {
+    if (strict && !fallback) throw new Error(`${key} 不能为空`)
+    return fallback
+  }
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return raw
+  } catch (_) {
+    // 统一在下面抛出可读错误
+  }
+  if (strict) throw new Error(`${key} 必须是 http:// 或 https:// URL`)
+  return fallback
 }
 
 function normalizeHermesLspWaitMode(value, strict = false) {
@@ -5548,6 +5565,74 @@ export function mergeHermesWebConfig(config = {}, form = {}) {
   if (extractBackend) web.extract_backend = extractBackend
   else delete web.extract_backend
   next.web = web
+  return next
+}
+
+function validateHermesModelCatalogProviders(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('model_catalog.providers 必须是 JSON object')
+  }
+  const normalized = {}
+  for (const [provider, rawEntry] of Object.entries(value)) {
+    const name = String(provider || '').trim()
+    if (!/^[a-zA-Z0-9_.-]+$/.test(name)) {
+      throw new Error(`model_catalog.providers.${provider} 名称只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+      throw new Error(`model_catalog.providers.${name} 必须是 object`)
+    }
+    const entry = mergeConfigsPreservingFields({}, rawEntry)
+    if (Object.hasOwn(entry, 'url')) {
+      const url = normalizeHermesHttpUrl(entry.url, `model_catalog.providers.${name}.url`, '', true)
+      if (url) entry.url = url
+      else delete entry.url
+    }
+    normalized[name] = entry
+  }
+  return normalized
+}
+
+function parseHermesModelCatalogProvidersJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`model_catalog.providers JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesModelCatalogProviders(value)
+}
+
+export function buildHermesModelCatalogConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const modelCatalog = root.model_catalog && typeof root.model_catalog === 'object' && !Array.isArray(root.model_catalog)
+    ? root.model_catalog
+    : {}
+  const providers = modelCatalog.providers && typeof modelCatalog.providers === 'object' && !Array.isArray(modelCatalog.providers)
+    ? validateHermesModelCatalogProviders(modelCatalog.providers)
+    : {}
+  return {
+    modelCatalogEnabled: readHermesBool(modelCatalog.enabled, true),
+    modelCatalogUrl: normalizeHermesHttpUrl(modelCatalog.url, 'model_catalog.url', HERMES_MODEL_CATALOG_DEFAULT_URL, false),
+    modelCatalogTtlHours: parseHermesInteger(modelCatalog.ttl_hours, 'model_catalog.ttl_hours', 24, 1, 8760, false),
+    modelCatalogProvidersJson: JSON.stringify(providers, null, 2),
+  }
+}
+
+export function mergeHermesModelCatalogConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesModelCatalogConfigValues(next)
+  const modelCatalog = next.model_catalog && typeof next.model_catalog === 'object' && !Array.isArray(next.model_catalog)
+    ? mergeConfigsPreservingFields(next.model_catalog, {})
+    : {}
+  modelCatalog.enabled = formHermesBool(form, 'modelCatalogEnabled', currentValues.modelCatalogEnabled)
+  modelCatalog.url = normalizeHermesHttpUrl(Object.hasOwn(form, 'modelCatalogUrl') ? form.modelCatalogUrl : currentValues.modelCatalogUrl, 'model_catalog.url', HERMES_MODEL_CATALOG_DEFAULT_URL, true)
+  modelCatalog.ttl_hours = parseHermesInteger(Object.hasOwn(form, 'modelCatalogTtlHours') ? form.modelCatalogTtlHours : currentValues.modelCatalogTtlHours, 'model_catalog.ttl_hours', 24, 1, 8760, true)
+  const providers = parseHermesModelCatalogProvidersJson(Object.hasOwn(form, 'modelCatalogProvidersJson') ? form.modelCatalogProvidersJson : currentValues.modelCatalogProvidersJson)
+  if (Object.keys(providers).length) modelCatalog.providers = providers
+  else delete modelCatalog.providers
+  next.model_catalog = modelCatalog
   return next
 }
 
@@ -12899,6 +12984,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesLspConfigValues(next),
+    }
+  },
+
+  hermes_model_catalog_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesModelCatalogConfigValues(config),
+    }
+  },
+
+  hermes_model_catalog_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesModelCatalogConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesModelCatalogConfigValues(next),
     }
   },
 

@@ -127,6 +127,18 @@ test('Hermes 配置页会暴露基础模型结构化配置字段', () => {
   }
 })
 
+test('Hermes 配置页会暴露模型目录结构化配置字段', () => {
+  for (const id of [
+    'hm-model-catalog-save',
+    'hm-model-catalog-enabled',
+    'hm-model-catalog-url',
+    'hm-model-catalog-ttl-hours',
+    'hm-model-catalog-providers-json',
+  ]) {
+    assert.match(source, new RegExp(`id="${id}"`), `缺少 ${id}`)
+  }
+})
+
 test('Hermes 配置页会暴露 provider 超时覆盖结构化配置字段', () => {
   for (const id of [
     'hm-provider-overrides-save',

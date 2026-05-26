@@ -3568,6 +3568,85 @@ fn validate_hermes_f64(
     Ok((value * 10_000.0).round() / 10_000.0)
 }
 
+const HERMES_MODEL_CATALOG_DEFAULT_URL: &str =
+    "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json";
+
+fn normalize_hermes_http_url(
+    value: Option<String>,
+    key: &str,
+    fallback: &str,
+    strict: bool,
+) -> Result<String, String> {
+    let raw = value.unwrap_or_default().trim().to_string();
+    if raw.is_empty() {
+        if strict && fallback.is_empty() {
+            return Err(format!("{key} 不能为空"));
+        }
+        return Ok(fallback.to_string());
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Ok(raw);
+    }
+    if strict {
+        return Err(format!("{key} 必须是 http:// 或 https:// URL"));
+    }
+    Ok(fallback.to_string())
+}
+
+fn validate_hermes_model_catalog_providers(
+    value: &Value,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "model_catalog.providers 必须是 JSON object".to_string())?;
+    let mut normalized = serde_json::Map::new();
+    for (provider, raw_entry) in object {
+        if provider.is_empty()
+            || !provider
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(format!(
+                "model_catalog.providers.{provider} 名称只能包含字母、数字、下划线、点和短横线"
+            ));
+        }
+        let mut entry = raw_entry
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("model_catalog.providers.{provider} 必须是 object"))?;
+        if entry.contains_key("url") {
+            let url = normalize_hermes_http_url(
+                entry
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
+                &format!("model_catalog.providers.{provider}.url"),
+                "",
+                true,
+            )?;
+            if url.is_empty() {
+                entry.remove("url");
+            } else {
+                entry.insert("url".to_string(), Value::String(url));
+            }
+        }
+        normalized.insert(provider.to_string(), Value::Object(entry));
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_model_catalog_providers_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|err| format!("model_catalog.providers JSON 格式错误: {err}"))?;
+    validate_hermes_model_catalog_providers(&value)
+}
+
 fn build_hermes_compression_config_values(config: &serde_yaml::Value) -> Value {
     let root = config.as_mapping();
     let compression = root.and_then(|map| yaml_get_mapping(map, "compression"));
@@ -8560,6 +8639,91 @@ fn merge_hermes_web_config(config: &mut serde_yaml::Value, form: &Value) -> Resu
     Ok(())
 }
 
+fn build_hermes_model_catalog_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let model_catalog = root.and_then(|map| yaml_get_mapping(map, "model_catalog"));
+    let enabled = model_catalog
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(true);
+    let url = normalize_hermes_http_url(
+        model_catalog.and_then(|map| yaml_string_field(map, "url")),
+        "model_catalog.url",
+        HERMES_MODEL_CATALOG_DEFAULT_URL,
+        false,
+    )
+    .unwrap_or_else(|_| HERMES_MODEL_CATALOG_DEFAULT_URL.to_string());
+    let ttl_hours = model_catalog
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "ttl_hours"), 24, 1, 8760))
+        .unwrap_or(24);
+    let providers = model_catalog
+        .and_then(|map| yaml_get(map, "providers"))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_model_catalog_providers(&value).ok())
+        .unwrap_or_default();
+    serde_json::json!({
+        "modelCatalogEnabled": enabled,
+        "modelCatalogUrl": url,
+        "modelCatalogTtlHours": ttl_hours,
+        "modelCatalogProvidersJson": serde_json::to_string_pretty(&Value::Object(providers)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn merge_hermes_model_catalog_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_model_catalog_config_values(config);
+    let enabled = form_bool(form, "modelCatalogEnabled")
+        .unwrap_or_else(|| current["modelCatalogEnabled"].as_bool().unwrap_or(true));
+    let url = normalize_hermes_http_url(
+        if form.get("modelCatalogUrl").is_some() {
+            form_string(form, "modelCatalogUrl")
+        } else {
+            current["modelCatalogUrl"].as_str().map(ToString::to_string)
+        },
+        "model_catalog.url",
+        HERMES_MODEL_CATALOG_DEFAULT_URL,
+        true,
+    )?;
+    let ttl_hours = validate_hermes_i64(
+        if form.get("modelCatalogTtlHours").is_some() {
+            form_i64(form, "modelCatalogTtlHours")
+        } else {
+            current["modelCatalogTtlHours"].as_i64()
+        },
+        "model_catalog.ttl_hours",
+        24,
+        1,
+        8760,
+    )?;
+    let providers = parse_hermes_model_catalog_providers_json(
+        if form.get("modelCatalogProvidersJson").is_some() {
+            form_string(form, "modelCatalogProvidersJson")
+        } else {
+            current["modelCatalogProvidersJson"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let model_catalog = yaml_child_object(root, "model_catalog")?;
+    model_catalog.insert(yaml_key("enabled"), serde_yaml::Value::Bool(enabled));
+    model_catalog.insert(yaml_key("url"), serde_yaml::Value::String(url));
+    model_catalog.insert(
+        yaml_key("ttl_hours"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(ttl_hours)),
+    );
+    if providers.is_empty() {
+        model_catalog.remove(yaml_key("providers"));
+    } else {
+        let yaml_value = serde_yaml::to_value(Value::Object(providers))
+            .map_err(|err| format!("model_catalog.providers 序列化失败: {err}"))?;
+        model_catalog.insert(yaml_key("providers"), yaml_value);
+    }
+    Ok(())
+}
+
 fn build_hermes_lsp_config_values(config: &serde_yaml::Value) -> Value {
     let root = config.as_mapping();
     let lsp = root.and_then(|map| yaml_get_mapping(map, "lsp"));
@@ -11314,6 +11478,30 @@ pub fn hermes_lsp_config_save(form: Value) -> Result<Value, String> {
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_lsp_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_catalog_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_model_catalog_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_catalog_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_model_catalog_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_model_catalog_config_values(&config),
     }))
 }
 
@@ -17907,6 +18095,184 @@ web:
         let err = merge_hermes_web_config(&mut config, &json!({ "webExtractBackend": "unsafe" }))
             .unwrap_err();
         assert!(err.contains("web.extract_backend"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_model_catalog_config_tests {
+    use super::{
+        build_hermes_model_catalog_config_values, merge_hermes_model_catalog_config,
+        HERMES_MODEL_CATALOG_DEFAULT_URL,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn model_catalog_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_model_catalog_config_values(&config);
+        assert_eq!(values["modelCatalogEnabled"], true);
+        assert_eq!(values["modelCatalogUrl"], HERMES_MODEL_CATALOG_DEFAULT_URL);
+        assert_eq!(values["modelCatalogTtlHours"], 24);
+        assert_eq!(values["modelCatalogProvidersJson"], "{}");
+    }
+
+    #[test]
+    fn model_catalog_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_catalog:
+  enabled: false
+  url: https://example.com/catalog.json
+  ttl_hours: 6
+  providers:
+    openrouter:
+      url: https://mirror.example.com/openrouter.json
+    nous:
+      url: https://mirror.example.com/nous.json
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_model_catalog_config_values(&config);
+        assert_eq!(values["modelCatalogEnabled"], false);
+        assert_eq!(
+            values["modelCatalogUrl"],
+            "https://example.com/catalog.json"
+        );
+        assert_eq!(values["modelCatalogTtlHours"], 6);
+        let providers: serde_json::Value =
+            serde_json::from_str(values["modelCatalogProvidersJson"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            providers["openrouter"]["url"],
+            "https://mirror.example.com/openrouter.json"
+        );
+        assert_eq!(
+            providers["nous"]["url"],
+            "https://mirror.example.com/nous.json"
+        );
+    }
+
+    #[test]
+    fn merge_model_catalog_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+model_catalog:
+  enabled: false
+  url: https://old.example.com/catalog.json
+  ttl_hours: 12
+  providers:
+    openrouter:
+      url: https://old.example.com/openrouter.json
+  custom_flag: keep-catalog
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({
+                "modelCatalogEnabled": true,
+                "modelCatalogUrl": "https://catalog.example.com/model-catalog.json",
+                "modelCatalogTtlHours": 48,
+                "modelCatalogProvidersJson": serde_json::to_string(&json!({
+                    "openrouter": { "url": "https://catalog.example.com/openrouter.json" },
+                    "nous": { "url": "https://catalog.example.com/nous.json" },
+                })).unwrap(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["model_catalog"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["model_catalog"]["url"].as_str(),
+            Some("https://catalog.example.com/model-catalog.json")
+        );
+        assert_eq!(config["model_catalog"]["ttl_hours"].as_i64(), Some(48));
+        assert_eq!(
+            config["model_catalog"]["providers"]["openrouter"]["url"].as_str(),
+            Some("https://catalog.example.com/openrouter.json")
+        );
+        assert_eq!(
+            config["model_catalog"]["providers"]["nous"]["url"].as_str(),
+            Some("https://catalog.example.com/nous.json")
+        );
+        assert_eq!(
+            config["model_catalog"]["custom_flag"].as_str(),
+            Some("keep-catalog")
+        );
+    }
+
+    #[test]
+    fn merge_model_catalog_config_removes_empty_providers() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_catalog:
+  providers:
+    openrouter:
+      url: https://old.example.com/openrouter.json
+  custom_flag: keep-catalog
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({
+                "modelCatalogProvidersJson": "{}",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["model_catalog"]["custom_flag"].as_str(),
+            Some("keep-catalog")
+        );
+        assert!(config["model_catalog"].get("providers").is_none());
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_model_catalog_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogUrl": "ftp://example.com/catalog.json" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.url"));
+        let err =
+            merge_hermes_model_catalog_config(&mut config, &json!({ "modelCatalogTtlHours": 0 }))
+                .unwrap_err();
+        assert!(err.contains("model_catalog.ttl_hours"));
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogProvidersJson": "[" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.providers"));
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogProvidersJson": serde_json::to_string(&json!({
+                "bad provider": { "url": "https://example.com/catalog.json" }
+            })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.providers.bad provider"));
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogProvidersJson": serde_json::to_string(&json!({
+                "openrouter": { "url": "file:///tmp/catalog.json" }
+            })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.providers.openrouter.url"));
     }
 }
 

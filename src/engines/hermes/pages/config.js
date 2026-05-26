@@ -119,6 +119,13 @@ const MODEL_DEFAULTS = {
   modelMaxTokens: '',
 }
 
+const MODEL_CATALOG_DEFAULTS = {
+  modelCatalogEnabled: true,
+  modelCatalogUrl: 'https://hermes-agent.nousresearch.com/docs/api/model-catalog.json',
+  modelCatalogTtlHours: 24,
+  modelCatalogProvidersJson: '{}',
+}
+
 const MODEL_ALIASES_DEFAULTS = {
   modelAliasesJson: '{}',
 }
@@ -421,6 +428,7 @@ export function render() {
   let curatorValues = { ...CURATOR_DEFAULTS }
   let quickCommandsValues = { ...QUICK_COMMANDS_DEFAULTS }
   let modelValues = { ...MODEL_DEFAULTS }
+  let modelCatalogValues = { ...MODEL_CATALOG_DEFAULTS }
   let modelAliasesValues = { ...MODEL_ALIASES_DEFAULTS }
   let hooksValues = { ...HOOKS_DEFAULTS }
   let providerOverridesValues = { ...PROVIDER_OVERRIDES_DEFAULTS }
@@ -462,6 +470,7 @@ export function render() {
   let curatorLoading = true
   let quickCommandsLoading = true
   let modelLoading = true
+  let modelCatalogLoading = true
   let modelAliasesLoading = true
   let hooksLoading = true
   let providerOverridesLoading = true
@@ -503,6 +512,7 @@ export function render() {
   let curatorSaving = false
   let quickCommandsSaving = false
   let modelSaving = false
+  let modelCatalogSaving = false
   let modelAliasesSaving = false
   let hooksSaving = false
   let providerOverridesSaving = false
@@ -544,6 +554,7 @@ export function render() {
   let curatorError = null
   let quickCommandsError = null
   let modelError = null
+  let modelCatalogError = null
   let modelAliasesError = null
   let hooksError = null
   let providerOverridesError = null
@@ -580,7 +591,7 @@ export function render() {
   }
 
   function isBusy() {
-    return loading || runtimeLoading || sessionsMaintenanceLoading || updatesLoading || compressionLoading || promptCachingLoading || openrouterCacheLoading || providerRoutingLoading || auxiliaryLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || curatorLoading || quickCommandsLoading || modelLoading || modelAliasesLoading || hooksLoading || providerOverridesLoading || mcpServersLoading || agentToolsetsLoading || platformToolsetsLoading || agentRuntimeLoading || unauthorizedDmLoading || securityLoading || displayLoading || humanDelayLoading || kanbanLoading || streamingLoading || executionLimitsLoading || ioSafetyLoading || checkpointsLoading || cronLoading || loggingLoading || approvalsLoading || privacyLoading || browserLoading || webLoading || lspLoading || sttLoading || ttsVoiceLoading || terminalLoading || saving || runtimeSaving || sessionsMaintenanceSaving || updatesSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || curatorSaving || quickCommandsSaving || modelSaving || modelAliasesSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || platformToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || kanbanSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || privacySaving || browserSaving || webSaving || lspSaving || sttSaving || ttsVoiceSaving || terminalSaving
+    return loading || runtimeLoading || sessionsMaintenanceLoading || updatesLoading || compressionLoading || promptCachingLoading || openrouterCacheLoading || providerRoutingLoading || auxiliaryLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || curatorLoading || quickCommandsLoading || modelLoading || modelCatalogLoading || modelAliasesLoading || hooksLoading || providerOverridesLoading || mcpServersLoading || agentToolsetsLoading || platformToolsetsLoading || agentRuntimeLoading || unauthorizedDmLoading || securityLoading || displayLoading || humanDelayLoading || kanbanLoading || streamingLoading || executionLimitsLoading || ioSafetyLoading || checkpointsLoading || cronLoading || loggingLoading || approvalsLoading || privacyLoading || browserLoading || webLoading || lspLoading || sttLoading || ttsVoiceLoading || terminalLoading || saving || runtimeSaving || sessionsMaintenanceSaving || updatesSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || curatorSaving || quickCommandsSaving || modelSaving || modelCatalogSaving || modelAliasesSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || platformToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || kanbanSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || privacySaving || browserSaving || webSaving || lspSaving || sttSaving || ttsVoiceSaving || terminalSaving
   }
 
   function option(labelKey, value, selected) {
@@ -1224,7 +1235,7 @@ export function render() {
   }
 
   function renderModelConfigPanel() {
-    const disabled = loading || saving || modelLoading || modelSaving || quickCommandsSaving || modelAliasesSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || terminalSaving
+    const disabled = loading || saving || modelLoading || modelSaving || modelCatalogSaving || quickCommandsSaving || modelAliasesSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-model-panel">
         <div class="hm-panel-header">
@@ -1267,8 +1278,50 @@ export function render() {
     `
   }
 
+  function renderModelCatalogConfigPanel() {
+    const disabled = loading || saving || modelCatalogLoading || modelCatalogSaving || modelSaving || quickCommandsSaving || modelAliasesSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || terminalSaving
+    return `
+      <div class="hm-panel hm-config-runtime-panel hm-config-model-catalog-panel">
+        <div class="hm-panel-header">
+          <div>
+            <div class="hm-panel-title">${t('engine.hermesModelCatalogConfigTitle')}</div>
+            <div class="hm-channel-panel-desc">${t('engine.hermesModelCatalogConfigDesc')}</div>
+          </div>
+          <div class="hm-panel-actions">
+            <span class="hm-muted">${modelCatalogSaving ? t('engine.hermesConfigStatusSaving') : modelCatalogLoading ? t('engine.hermesConfigStatusLoading') : t('engine.hermesModelCatalogConfigStatusReady')}</span>
+            <button class="hm-btn hm-btn--cta hm-btn--sm" id="hm-model-catalog-save" ${disabled ? 'disabled' : ''}>${t('engine.hermesModelCatalogConfigSave')}</button>
+          </div>
+        </div>
+        <div class="hm-panel-body">
+          ${renderError(modelCatalogError)}
+          <div class="hm-config-check-grid">
+            <label class="hm-channel-check">
+              <input id="hm-model-catalog-enabled" type="checkbox" ${modelCatalogValues.modelCatalogEnabled ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesModelCatalogConfigEnabled')}</span>
+            </label>
+          </div>
+          <div class="hm-config-runtime-grid">
+            <label class="hm-field hm-field--wide">
+              <span class="hm-field-label">${t('engine.hermesModelCatalogConfigUrl')}</span>
+              <input id="hm-model-catalog-url" class="hm-input" type="url" value="${esc(modelCatalogValues.modelCatalogUrl)}" placeholder="https://hermes-agent.nousresearch.com/docs/api/model-catalog.json" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesModelCatalogConfigTtlHours')}</span>
+              <input id="hm-model-catalog-ttl-hours" class="hm-input" type="number" inputmode="numeric" min="1" max="8760" step="1" value="${esc(modelCatalogValues.modelCatalogTtlHours)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field hm-field--wide">
+              <span class="hm-field-label">${t('engine.hermesModelCatalogConfigProvidersJson')}</span>
+              <textarea id="hm-model-catalog-providers-json" class="hm-input" spellcheck="false" rows="8" ${disabled ? 'disabled' : ''} style="font-family:var(--hm-font-mono);line-height:1.65;min-height:220px">${esc(modelCatalogValues.modelCatalogProvidersJson)}</textarea>
+            </label>
+          </div>
+          <div class="hm-channel-footnote">${t('engine.hermesModelCatalogConfigFootnote')}</div>
+        </div>
+      </div>
+    `
+  }
+
   function renderModelAliasesConfigPanel() {
-    const disabled = loading || saving || modelAliasesLoading || modelAliasesSaving || quickCommandsSaving || modelSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || terminalSaving
+    const disabled = loading || saving || modelAliasesLoading || modelAliasesSaving || quickCommandsSaving || modelSaving || modelCatalogSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || agentRuntimeSaving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || streamingSaving || executionLimitsSaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || terminalSaving
     return `
       <div class="hm-panel hm-config-runtime-panel hm-config-model-aliases-panel">
         <div class="hm-panel-header">
@@ -2701,6 +2754,7 @@ export function render() {
       ${renderCuratorConfigPanel()}
       ${renderQuickCommandsConfigPanel()}
       ${renderModelConfigPanel()}
+      ${renderModelCatalogConfigPanel()}
       ${renderModelAliasesConfigPanel()}
       ${renderHooksConfigPanel()}
       ${renderProviderOverridesConfigPanel()}
@@ -2746,6 +2800,7 @@ export function render() {
     el.querySelector('#hm-curator-config-save')?.addEventListener('click', saveCuratorConfig)
     el.querySelector('#hm-quick-commands-save')?.addEventListener('click', saveQuickCommandsConfig)
     el.querySelector('#hm-model-config-save')?.addEventListener('click', saveModelConfig)
+    el.querySelector('#hm-model-catalog-save')?.addEventListener('click', saveModelCatalogConfig)
     el.querySelector('#hm-model-aliases-save')?.addEventListener('click', saveModelAliasesConfig)
     el.querySelector('#hm-hooks-save')?.addEventListener('click', saveHooksConfig)
     el.querySelector('#hm-provider-overrides-save')?.addEventListener('click', saveProviderOverridesConfig)
@@ -2847,6 +2902,11 @@ export function render() {
   async function loadModelConfig() {
     const data = await api.hermesModelConfigRead()
     modelValues = { ...MODEL_DEFAULTS, ...(data?.values || {}) }
+  }
+
+  async function loadModelCatalogConfig() {
+    const data = await api.hermesModelCatalogConfigRead()
+    modelCatalogValues = { ...MODEL_CATALOG_DEFAULTS, ...(data?.values || {}) }
   }
 
   async function loadModelAliasesConfig() {
@@ -2995,6 +3055,7 @@ export function render() {
     curatorLoading = true
     quickCommandsLoading = true
     modelLoading = true
+    modelCatalogLoading = true
     modelAliasesLoading = true
     hooksLoading = true
     providerOverridesLoading = true
@@ -3036,6 +3097,7 @@ export function render() {
     curatorError = null
     quickCommandsError = null
     modelError = null
+    modelCatalogError = null
     modelAliasesError = null
     hooksError = null
     providerOverridesError = null
@@ -3291,6 +3353,14 @@ export function render() {
       modelError = humanizeError(err, t('engine.hermesModelConfigLoadFailed') || 'Load model config failed')
     } finally {
       modelLoading = false
+      draw()
+    }
+    try {
+      await loadModelCatalogConfig()
+    } catch (err) {
+      modelCatalogError = humanizeError(err, t('engine.hermesModelCatalogConfigLoadFailed') || 'Load model catalog config failed')
+    } finally {
+      modelCatalogLoading = false
       draw()
     }
     try {
@@ -3927,6 +3997,34 @@ export function render() {
       toast(modelError, 'error')
     } finally {
       modelSaving = false
+      draw()
+    }
+  }
+
+  async function saveModelCatalogConfig() {
+    const form = {
+      modelCatalogEnabled: !!el.querySelector('#hm-model-catalog-enabled')?.checked,
+      modelCatalogUrl: el.querySelector('#hm-model-catalog-url')?.value || MODEL_CATALOG_DEFAULTS.modelCatalogUrl,
+      modelCatalogTtlHours: el.querySelector('#hm-model-catalog-ttl-hours')?.value || '24',
+      modelCatalogProvidersJson: el.querySelector('#hm-model-catalog-providers-json')?.value || '{}',
+    }
+    modelCatalogSaving = true
+    modelCatalogError = null
+    draw()
+    try {
+      const result = await api.hermesModelCatalogConfigSave(form)
+      modelCatalogValues = { ...MODEL_CATALOG_DEFAULTS, ...(result?.values || form) }
+      await refreshRawAfterStructuredSave()
+      const backup = result?.backup || ''
+      toast({
+        message: t('engine.hermesModelCatalogConfigSaveSuccess'),
+        hint: backup ? t('engine.hermesConfigBackupHint', { path: backup }) : '',
+      }, 'success')
+    } catch (err) {
+      modelCatalogError = humanizeError(err, t('engine.hermesModelCatalogConfigSaveFailed') || 'Save model catalog config failed')
+      toast(modelCatalogError, 'error')
+    } finally {
+      modelCatalogSaving = false
       draw()
     }
   }
