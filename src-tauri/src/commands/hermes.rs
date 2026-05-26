@@ -6554,6 +6554,22 @@ fn build_hermes_kanban_config_values(config: &serde_yaml::Value) -> Value {
                 86400,
             ))
             .unwrap_or(60),
+        "maxSpawn": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "max_spawn"),
+                0,
+                0,
+                1000,
+            ))
+            .unwrap_or(0),
+        "maxInProgress": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "max_in_progress"),
+                0,
+                0,
+                1000,
+            ))
+            .unwrap_or(0),
         "failureLimit": kanban
             .map(|map| bounded_hermes_i64(
                 yaml_i64_field(map, "failure_limit"),
@@ -6597,6 +6613,20 @@ fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> R
         1,
         86400,
     )?;
+    let max_spawn = validate_hermes_i64(
+        form_i64(form, "maxSpawn").or_else(|| current["maxSpawn"].as_i64()),
+        "kanban.max_spawn",
+        0,
+        0,
+        1000,
+    )?;
+    let max_in_progress = validate_hermes_i64(
+        form_i64(form, "maxInProgress").or_else(|| current["maxInProgress"].as_i64()),
+        "kanban.max_in_progress",
+        0,
+        0,
+        1000,
+    )?;
     let failure_limit = validate_hermes_i64(
         form_i64(form, "failureLimit").or_else(|| current["failureLimit"].as_i64()),
         "kanban.failure_limit",
@@ -6632,6 +6662,22 @@ fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> R
         yaml_key("dispatch_interval_seconds"),
         serde_yaml::Value::Number(serde_yaml::Number::from(dispatch_interval_seconds)),
     );
+    if max_spawn > 0 {
+        kanban.insert(
+            yaml_key("max_spawn"),
+            serde_yaml::Value::Number(serde_yaml::Number::from(max_spawn)),
+        );
+    } else {
+        kanban.remove(yaml_key("max_spawn"));
+    }
+    if max_in_progress > 0 {
+        kanban.insert(
+            yaml_key("max_in_progress"),
+            serde_yaml::Value::Number(serde_yaml::Number::from(max_in_progress)),
+        );
+    } else {
+        kanban.remove(yaml_key("max_in_progress"));
+    }
     kanban.insert(
         yaml_key("failure_limit"),
         serde_yaml::Value::Number(serde_yaml::Number::from(failure_limit)),
@@ -19409,6 +19455,8 @@ mod hermes_kanban_config_tests {
         let values = build_hermes_kanban_config_values(&config);
         assert_eq!(values["dispatchInGateway"], true);
         assert_eq!(values["dispatchIntervalSeconds"], 60);
+        assert_eq!(values["maxSpawn"], 0);
+        assert_eq!(values["maxInProgress"], 0);
         assert_eq!(values["failureLimit"], 2);
         assert_eq!(values["autoDecompose"], true);
         assert_eq!(values["autoDecomposePerTick"], 3);
@@ -19422,6 +19470,8 @@ mod hermes_kanban_config_tests {
 kanban:
   dispatch_in_gateway: false
   dispatch_interval_seconds: "120"
+  max_spawn: "4"
+  max_in_progress: "6"
   failure_limit: "5"
   auto_decompose: false
   auto_decompose_per_tick: "7"
@@ -19432,6 +19482,8 @@ kanban:
         let values = build_hermes_kanban_config_values(&config);
         assert_eq!(values["dispatchInGateway"], false);
         assert_eq!(values["dispatchIntervalSeconds"], 120);
+        assert_eq!(values["maxSpawn"], 4);
+        assert_eq!(values["maxInProgress"], 6);
         assert_eq!(values["failureLimit"], 5);
         assert_eq!(values["autoDecompose"], false);
         assert_eq!(values["autoDecomposePerTick"], 7);
@@ -19446,6 +19498,8 @@ model:
   provider: anthropic
 kanban:
   dispatch_interval_seconds: 30
+  max_spawn: 9
+  max_in_progress: 11
   custom_flag: keep-me
 memory:
   memory_enabled: true
@@ -19458,6 +19512,8 @@ memory:
             &json!({
                 "dispatchInGateway": false,
                 "dispatchIntervalSeconds": 15,
+                "maxSpawn": 4,
+                "maxInProgress": 6,
                 "failureLimit": 4,
                 "autoDecompose": false,
                 "autoDecomposePerTick": 2,
@@ -19477,6 +19533,8 @@ memory:
             config["kanban"]["dispatch_interval_seconds"].as_i64(),
             Some(15)
         );
+        assert_eq!(config["kanban"]["max_spawn"].as_i64(), Some(4));
+        assert_eq!(config["kanban"]["max_in_progress"].as_i64(), Some(6));
         assert_eq!(config["kanban"]["failure_limit"].as_i64(), Some(4));
         assert_eq!(config["kanban"]["auto_decompose"].as_bool(), Some(false));
         assert_eq!(
@@ -19490,11 +19548,44 @@ memory:
     }
 
     #[test]
+    fn merge_kanban_config_removes_optional_concurrency_limits() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kanban:
+  max_spawn: 4
+  max_in_progress: 6
+  custom_flag: keep-me
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_kanban_config(
+            &mut config,
+            &json!({
+                "maxSpawn": 0,
+                "maxInProgress": 0,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["kanban"]["custom_flag"].as_str(), Some("keep-me"));
+        assert!(config["kanban"].get("max_spawn").is_none());
+        assert!(config["kanban"].get("max_in_progress").is_none());
+    }
+
+    #[test]
     fn merge_kanban_config_rejects_invalid_timeout() {
         let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
         let err = merge_hermes_kanban_config(&mut config, &json!({ "dispatchIntervalSeconds": 0 }))
             .unwrap_err();
         assert!(err.contains("kanban.dispatch_interval_seconds"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "maxSpawn": -1 })).unwrap_err();
+        assert!(err.contains("kanban.max_spawn"));
+
+        let err =
+            merge_hermes_kanban_config(&mut config, &json!({ "maxInProgress": -1 })).unwrap_err();
+        assert!(err.contains("kanban.max_in_progress"));
 
         let err =
             merge_hermes_kanban_config(&mut config, &json!({ "failureLimit": 0 })).unwrap_err();

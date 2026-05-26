@@ -12,6 +12,8 @@ test('Hermes Kanban 配置读取会提供上游默认值', () => {
   assert.deepEqual(values, {
     dispatchInGateway: true,
     dispatchIntervalSeconds: 60,
+    maxSpawn: 0,
+    maxInProgress: 0,
     failureLimit: 2,
     autoDecompose: true,
     autoDecomposePerTick: 3,
@@ -24,6 +26,8 @@ test('Hermes Kanban 配置读取会规范化已有字段', () => {
     kanban: {
       dispatch_in_gateway: false,
       dispatch_interval_seconds: '120',
+      max_spawn: '4',
+      max_in_progress: '6',
       failure_limit: '5',
       auto_decompose: false,
       auto_decompose_per_tick: '7',
@@ -33,6 +37,8 @@ test('Hermes Kanban 配置读取会规范化已有字段', () => {
 
   assert.equal(values.dispatchInGateway, false)
   assert.equal(values.dispatchIntervalSeconds, 120)
+  assert.equal(values.maxSpawn, 4)
+  assert.equal(values.maxInProgress, 6)
   assert.equal(values.failureLimit, 5)
   assert.equal(values.autoDecompose, false)
   assert.equal(values.autoDecomposePerTick, 7)
@@ -44,12 +50,16 @@ test('Hermes Kanban 配置保存会保留未知 YAML 并写入 kanban', () => {
     model: { provider: 'anthropic' },
     kanban: {
       dispatch_interval_seconds: 30,
+      max_spawn: 9,
+      max_in_progress: 11,
       custom_flag: 'keep-me',
     },
     memory: { memory_enabled: true },
   }, {
     dispatchInGateway: false,
     dispatchIntervalSeconds: '15',
+    maxSpawn: '4',
+    maxInProgress: '6',
     failureLimit: '4',
     autoDecompose: false,
     autoDecomposePerTick: '2',
@@ -61,10 +71,29 @@ test('Hermes Kanban 配置保存会保留未知 YAML 并写入 kanban', () => {
   assert.equal(next.kanban.custom_flag, 'keep-me')
   assert.equal(next.kanban.dispatch_in_gateway, false)
   assert.equal(next.kanban.dispatch_interval_seconds, 15)
+  assert.equal(next.kanban.max_spawn, 4)
+  assert.equal(next.kanban.max_in_progress, 6)
   assert.equal(next.kanban.failure_limit, 4)
   assert.equal(next.kanban.auto_decompose, false)
   assert.equal(next.kanban.auto_decompose_per_tick, 2)
   assert.equal(next.kanban.dispatch_stale_timeout_seconds, 0)
+})
+
+test('Hermes Kanban 并发上限保存为 0 会移除可选限制字段', () => {
+  const next = mergeHermesKanbanConfig({
+    kanban: {
+      max_spawn: 4,
+      max_in_progress: 6,
+      custom_flag: 'keep-me',
+    },
+  }, {
+    maxSpawn: '0',
+    maxInProgress: '0',
+  })
+
+  assert.equal(next.kanban.custom_flag, 'keep-me')
+  assert.equal(Object.hasOwn(next.kanban, 'max_spawn'), false)
+  assert.equal(Object.hasOwn(next.kanban, 'max_in_progress'), false)
 })
 
 test('Hermes Kanban 配置保存会拒绝非法调度参数', () => {
@@ -75,6 +104,14 @@ test('Hermes Kanban 配置保存会拒绝非法调度参数', () => {
   assert.throws(
     () => mergeHermesKanbanConfig({}, { failureLimit: '0' }),
     /kanban\.failure_limit/,
+  )
+  assert.throws(
+    () => mergeHermesKanbanConfig({}, { maxSpawn: '-1' }),
+    /kanban\.max_spawn/,
+  )
+  assert.throws(
+    () => mergeHermesKanbanConfig({}, { maxInProgress: '-1' }),
+    /kanban\.max_in_progress/,
   )
   assert.throws(
     () => mergeHermesKanbanConfig({}, { autoDecomposePerTick: '0' }),

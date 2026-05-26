@@ -3767,6 +3767,22 @@ export function buildHermesKanbanConfigValues(config = {}) {
       86400,
       false,
     ),
+    maxSpawn: parseHermesInteger(
+      kanban.max_spawn,
+      'kanban.max_spawn',
+      0,
+      0,
+      1000,
+      false,
+    ),
+    maxInProgress: parseHermesInteger(
+      kanban.max_in_progress,
+      'kanban.max_in_progress',
+      0,
+      0,
+      1000,
+      false,
+    ),
     failureLimit: parseHermesInteger(
       kanban.failure_limit,
       'kanban.failure_limit',
@@ -3811,6 +3827,26 @@ export function mergeHermesKanbanConfig(config = {}, form = {}) {
     86400,
     true,
   )
+  const maxSpawn = parseHermesInteger(
+    Object.hasOwn(form, 'maxSpawn') ? form.maxSpawn : currentValues.maxSpawn,
+    'kanban.max_spawn',
+    0,
+    0,
+    1000,
+    true,
+  )
+  if (maxSpawn > 0) kanban.max_spawn = maxSpawn
+  else delete kanban.max_spawn
+  const maxInProgress = parseHermesInteger(
+    Object.hasOwn(form, 'maxInProgress') ? form.maxInProgress : currentValues.maxInProgress,
+    'kanban.max_in_progress',
+    0,
+    0,
+    1000,
+    true,
+  )
+  if (maxInProgress > 0) kanban.max_in_progress = maxInProgress
+  else delete kanban.max_in_progress
   kanban.failure_limit = parseHermesInteger(
     Object.hasOwn(form, 'failureLimit') ? form.failureLimit : currentValues.failureLimit,
     'kanban.failure_limit',

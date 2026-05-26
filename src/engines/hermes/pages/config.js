@@ -176,6 +176,8 @@ const HUMAN_DELAY_DEFAULTS = {
 const KANBAN_DEFAULTS = {
   dispatchInGateway: true,
   dispatchIntervalSeconds: 60,
+  maxSpawn: 0,
+  maxInProgress: 0,
   failureLimit: 2,
   autoDecompose: true,
   autoDecomposePerTick: 3,
@@ -1500,6 +1502,14 @@ export function render() {
             <label class="hm-field">
               <span class="hm-field-label">${t('engine.hermesKanbanConfigDispatchIntervalSeconds')}</span>
               <input id="hm-kanban-dispatch-interval-seconds" class="hm-input" type="number" inputmode="numeric" min="1" max="86400" step="1" value="${esc(kanbanValues.dispatchIntervalSeconds)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigMaxSpawn')}</span>
+              <input id="hm-kanban-max-spawn" class="hm-input" type="number" inputmode="numeric" min="0" max="1000" step="1" value="${esc(kanbanValues.maxSpawn)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigMaxInProgress')}</span>
+              <input id="hm-kanban-max-in-progress" class="hm-input" type="number" inputmode="numeric" min="0" max="1000" step="1" value="${esc(kanbanValues.maxInProgress)}" ${disabled ? 'disabled' : ''}>
             </label>
             <label class="hm-field">
               <span class="hm-field-label">${t('engine.hermesKanbanConfigFailureLimit')}</span>
@@ -3515,6 +3525,8 @@ export function render() {
     const form = {
       dispatchInGateway: el.querySelector('#hm-kanban-dispatch-in-gateway')?.checked ?? true,
       dispatchIntervalSeconds: el.querySelector('#hm-kanban-dispatch-interval-seconds')?.value || '60',
+      maxSpawn: el.querySelector('#hm-kanban-max-spawn')?.value || '0',
+      maxInProgress: el.querySelector('#hm-kanban-max-in-progress')?.value || '0',
       failureLimit: el.querySelector('#hm-kanban-failure-limit')?.value || '2',
       autoDecompose: el.querySelector('#hm-kanban-auto-decompose')?.checked ?? true,
       autoDecomposePerTick: el.querySelector('#hm-kanban-auto-decompose-per-tick')?.value || '3',

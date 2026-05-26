@@ -430,6 +430,8 @@ test('Hermes 配置页会暴露 Kanban 调度稳定性结构化配置字段', ()
     'hm-kanban-config-save',
     'hm-kanban-dispatch-in-gateway',
     'hm-kanban-dispatch-interval-seconds',
+    'hm-kanban-max-spawn',
+    'hm-kanban-max-in-progress',
     'hm-kanban-failure-limit',
     'hm-kanban-auto-decompose',
     'hm-kanban-auto-decompose-per-tick',
