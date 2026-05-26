@@ -173,6 +173,10 @@ const HUMAN_DELAY_DEFAULTS = {
   humanDelayMaxMs: 2500,
 }
 
+const KANBAN_DEFAULTS = {
+  dispatchStaleTimeoutSeconds: 14400,
+}
+
 const STREAMING_DEFAULTS = {
   enabled: false,
   transport: 'edit',
@@ -333,6 +337,7 @@ export function render() {
   let securityValues = { ...SECURITY_DEFAULTS }
   let displayValues = { ...DISPLAY_DEFAULTS }
   let humanDelayValues = { ...HUMAN_DELAY_DEFAULTS }
+  let kanbanValues = { ...KANBAN_DEFAULTS }
   let streamingValues = { ...STREAMING_DEFAULTS }
   let executionLimitsValues = { ...EXECUTION_LIMITS_DEFAULTS }
   let ioSafetyValues = { ...IO_SAFETY_DEFAULTS }
@@ -367,6 +372,7 @@ export function render() {
   let securityLoading = true
   let displayLoading = true
   let humanDelayLoading = true
+  let kanbanLoading = true
   let streamingLoading = true
   let executionLimitsLoading = true
   let ioSafetyLoading = true
@@ -401,6 +407,7 @@ export function render() {
   let securitySaving = false
   let displaySaving = false
   let humanDelaySaving = false
+  let kanbanSaving = false
   let streamingSaving = false
   let executionLimitsSaving = false
   let ioSafetySaving = false
@@ -435,6 +442,7 @@ export function render() {
   let securityError = null
   let displayError = null
   let humanDelayError = null
+  let kanbanError = null
   let streamingError = null
   let executionLimitsError = null
   let ioSafetyError = null
@@ -456,7 +464,7 @@ export function render() {
   }
 
   function isBusy() {
-    return loading || runtimeLoading || compressionLoading || promptCachingLoading || openrouterCacheLoading || providerRoutingLoading || auxiliaryLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || quickCommandsLoading || modelLoading || modelAliasesLoading || hooksLoading || providerOverridesLoading || mcpServersLoading || agentToolsetsLoading || platformToolsetsLoading || agentRuntimeLoading || unauthorizedDmLoading || securityLoading || displayLoading || humanDelayLoading || streamingLoading || executionLimitsLoading || ioSafetyLoading || checkpointsLoading || cronLoading || loggingLoading || approvalsLoading || privacyLoading || browserLoading || sttLoading || terminalLoading || saving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || modelSaving || modelAliasesSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || platformToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || privacySaving || browserSaving || sttSaving || terminalSaving
+    return loading || runtimeLoading || compressionLoading || promptCachingLoading || openrouterCacheLoading || providerRoutingLoading || auxiliaryLoading || toolGuardrailsLoading || memoryLoading || skillsLoading || quickCommandsLoading || modelLoading || modelAliasesLoading || hooksLoading || providerOverridesLoading || mcpServersLoading || agentToolsetsLoading || platformToolsetsLoading || agentRuntimeLoading || unauthorizedDmLoading || securityLoading || displayLoading || humanDelayLoading || kanbanLoading || streamingLoading || executionLimitsLoading || ioSafetyLoading || checkpointsLoading || cronLoading || loggingLoading || approvalsLoading || privacyLoading || browserLoading || sttLoading || terminalLoading || saving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || modelSaving || modelAliasesSaving || hooksSaving || providerOverridesSaving || mcpServersSaving || agentToolsetsSaving || platformToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || kanbanSaving || streamingSaving || executionLimitsSaving || ioSafetySaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || privacySaving || browserSaving || sttSaving || terminalSaving
   }
 
   function option(labelKey, value, selected) {
@@ -1461,6 +1469,34 @@ export function render() {
     `
   }
 
+  function renderKanbanConfigPanel() {
+    const disabled = loading || saving || kanbanLoading || kanbanSaving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || providerOverridesSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || displaySaving || humanDelaySaving || streamingSaving || executionLimitsSaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || terminalSaving
+    return `
+      <div class="hm-panel hm-config-runtime-panel hm-config-kanban-panel">
+        <div class="hm-panel-header">
+          <div>
+            <div class="hm-panel-title">${t('engine.hermesKanbanConfigTitle')}</div>
+            <div class="hm-channel-panel-desc">${t('engine.hermesKanbanConfigDesc')}</div>
+          </div>
+          <div class="hm-panel-actions">
+            <span class="hm-muted">${kanbanSaving ? t('engine.hermesConfigStatusSaving') : kanbanLoading ? t('engine.hermesConfigStatusLoading') : t('engine.hermesKanbanConfigStatusReady')}</span>
+            <button class="hm-btn hm-btn--cta hm-btn--sm" id="hm-kanban-config-save" ${disabled ? 'disabled' : ''}>${t('engine.hermesKanbanConfigSave')}</button>
+          </div>
+        </div>
+        <div class="hm-panel-body">
+          ${renderError(kanbanError)}
+          <div class="hm-config-runtime-grid hm-config-kanban-grid">
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigDispatchStaleTimeoutSeconds')}</span>
+              <input id="hm-kanban-dispatch-stale-timeout-seconds" class="hm-input" type="number" inputmode="numeric" min="0" max="604800" step="60" value="${esc(kanbanValues.dispatchStaleTimeoutSeconds)}" ${disabled ? 'disabled' : ''}>
+            </label>
+          </div>
+          <div class="hm-channel-footnote">${t('engine.hermesKanbanConfigFootnote')}</div>
+        </div>
+      </div>
+    `
+  }
+
   function renderStreamingPanel() {
     const disabled = loading || saving || streamingLoading || streamingSaving || runtimeSaving || compressionSaving || promptCachingSaving || openrouterCacheSaving || providerRoutingSaving || auxiliarySaving || toolGuardrailsSaving || memorySaving || skillsSaving || quickCommandsSaving || providerOverridesSaving || agentToolsetsSaving || agentRuntimeSaving || unauthorizedDmSaving || securitySaving || executionLimitsSaving || checkpointsSaving || cronSaving || loggingSaving || approvalsSaving || terminalSaving
     return `
@@ -2110,6 +2146,7 @@ export function render() {
       ${renderSecurityConfigPanel()}
       ${renderDisplayConfigPanel()}
       ${renderHumanDelayConfigPanel()}
+      ${renderKanbanConfigPanel()}
 
       <div class="hm-panel">
         <div class="hm-panel-header">
@@ -2151,6 +2188,7 @@ export function render() {
     el.querySelector('#hm-security-save')?.addEventListener('click', saveSecurityConfig)
     el.querySelector('#hm-display-save')?.addEventListener('click', saveDisplayConfig)
     el.querySelector('#hm-human-delay-save')?.addEventListener('click', saveHumanDelayConfig)
+    el.querySelector('#hm-kanban-config-save')?.addEventListener('click', saveKanbanConfig)
     el.querySelector('#hm-streaming-save')?.addEventListener('click', saveStreaming)
     el.querySelector('#hm-execution-limits-save')?.addEventListener('click', saveExecutionLimits)
     el.querySelector('#hm-io-safety-save')?.addEventListener('click', saveIoSafety)
@@ -2279,6 +2317,11 @@ export function render() {
     humanDelayValues = { ...HUMAN_DELAY_DEFAULTS, ...(data?.values || {}) }
   }
 
+  async function loadKanbanConfig() {
+    const data = await api.hermesKanbanConfigRead()
+    kanbanValues = { ...KANBAN_DEFAULTS, ...(data?.values || {}) }
+  }
+
   async function loadStreaming() {
     const data = await api.hermesStreamingConfigRead()
     streamingValues = { ...STREAMING_DEFAULTS, ...(data?.values || {}) }
@@ -2358,6 +2401,7 @@ export function render() {
     securityLoading = true
     displayLoading = true
     humanDelayLoading = true
+    kanbanLoading = true
     streamingLoading = true
     executionLimitsLoading = true
     ioSafetyLoading = true
@@ -2675,6 +2719,14 @@ export function render() {
       humanDelayLoading = false
       draw()
     }
+    try {
+      await loadKanbanConfig()
+    } catch (err) {
+      kanbanError = humanizeError(err, t('engine.hermesKanbanConfigLoadFailed') || 'Load Kanban config failed')
+    } finally {
+      kanbanLoading = false
+      draw()
+    }
   }
 
   async function refreshRawAfterStructuredSave() {
@@ -2758,6 +2810,9 @@ export function render() {
       } catch {}
       try {
         await loadHumanDelayConfig()
+      } catch {}
+      try {
+        await loadKanbanConfig()
       } catch {}
       try {
         await loadStreaming()
@@ -3423,6 +3478,31 @@ export function render() {
       toast(humanDelayError, 'error')
     } finally {
       humanDelaySaving = false
+      draw()
+    }
+  }
+
+  async function saveKanbanConfig() {
+    const form = {
+      dispatchStaleTimeoutSeconds: el.querySelector('#hm-kanban-dispatch-stale-timeout-seconds')?.value || '14400',
+    }
+    kanbanSaving = true
+    kanbanError = null
+    draw()
+    try {
+      const result = await api.hermesKanbanConfigSave(form)
+      kanbanValues = { ...KANBAN_DEFAULTS, ...(result?.values || form) }
+      await refreshRawAfterStructuredSave()
+      const backup = result?.backup || ''
+      toast({
+        message: t('engine.hermesKanbanConfigSaveSuccess'),
+        hint: backup ? t('engine.hermesConfigBackupHint', { path: backup }) : '',
+      }, 'success')
+    } catch (err) {
+      kanbanError = humanizeError(err, t('engine.hermesKanbanConfigSaveFailed') || 'Save Kanban config failed')
+      toast(kanbanError, 'error')
+    } finally {
+      kanbanSaving = false
       draw()
     }
   }

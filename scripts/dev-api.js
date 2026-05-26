@@ -3752,6 +3752,42 @@ export function mergeHermesDisplayConfig(config = {}, form = {}) {
   return next
 }
 
+export function buildHermesKanbanConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const kanban = root.kanban && typeof root.kanban === 'object' && !Array.isArray(root.kanban)
+    ? root.kanban
+    : {}
+  return {
+    dispatchStaleTimeoutSeconds: parseHermesInteger(
+      kanban.dispatch_stale_timeout_seconds,
+      'kanban.dispatch_stale_timeout_seconds',
+      14400,
+      0,
+      604800,
+      false,
+    ),
+  }
+}
+
+export function mergeHermesKanbanConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesKanbanConfigValues(next)
+  const kanban = next.kanban && typeof next.kanban === 'object' && !Array.isArray(next.kanban)
+    ? mergeConfigsPreservingFields(next.kanban, {})
+    : {}
+
+  kanban.dispatch_stale_timeout_seconds = parseHermesInteger(
+    Object.hasOwn(form, 'dispatchStaleTimeoutSeconds') ? form.dispatchStaleTimeoutSeconds : currentValues.dispatchStaleTimeoutSeconds,
+    'kanban.dispatch_stale_timeout_seconds',
+    14400,
+    0,
+    604800,
+    true,
+  )
+  next.kanban = kanban
+  return next
+}
+
 function putHermesChannelDisplayFields(form, config, platform) {
   const { display, platformDisplay } = hermesDisplayConfigParts(config, platform)
   const legacyToolProgress = display.tool_progress_overrides && typeof display.tool_progress_overrides === 'object' && !Array.isArray(display.tool_progress_overrides)
@@ -12025,6 +12061,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesDisplayConfigValues(next),
+    }
+  },
+
+  hermes_kanban_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesKanbanConfigValues(config),
+    }
+  },
+
+  hermes_kanban_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesKanbanConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesKanbanConfigValues(next),
     }
   },
 

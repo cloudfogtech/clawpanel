@@ -6539,6 +6539,40 @@ fn build_hermes_human_delay_config_values(config: &serde_yaml::Value) -> Value {
     })
 }
 
+fn build_hermes_kanban_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let kanban = root.and_then(|map| yaml_get_mapping(map, "kanban"));
+    serde_json::json!({
+        "dispatchStaleTimeoutSeconds": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "dispatch_stale_timeout_seconds"),
+                14400,
+                0,
+                604800,
+            ))
+            .unwrap_or(14400),
+    })
+}
+
+fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_kanban_config_values(config);
+    let stale_timeout = validate_hermes_i64(
+        form_i64(form, "dispatchStaleTimeoutSeconds")
+            .or_else(|| current["dispatchStaleTimeoutSeconds"].as_i64()),
+        "kanban.dispatch_stale_timeout_seconds",
+        14400,
+        0,
+        604800,
+    )?;
+
+    let kanban = yaml_child_object(ensure_yaml_object(config)?, "kanban")?;
+    kanban.insert(
+        yaml_key("dispatch_stale_timeout_seconds"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(stale_timeout)),
+    );
+    Ok(())
+}
+
 fn merge_hermes_human_delay_config(
     config: &mut serde_yaml::Value,
     form: &Value,
@@ -9572,6 +9606,29 @@ pub fn hermes_display_config_save(form: Value) -> Result<Value, String> {
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_display_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_kanban_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_kanban_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_kanban_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_kanban_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_kanban_config_values(&config),
     }))
 }
 
@@ -19260,6 +19317,84 @@ memory:
         )
         .unwrap_err();
         assert!(err.contains("display.tool_preview_length"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_kanban_config_tests {
+    use super::{build_hermes_kanban_config_values, merge_hermes_kanban_config};
+    use serde_json::json;
+
+    #[test]
+    fn kanban_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_kanban_config_values(&config);
+        assert_eq!(values["dispatchStaleTimeoutSeconds"], 14400);
+    }
+
+    #[test]
+    fn kanban_values_normalize_existing_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kanban:
+  dispatch_stale_timeout_seconds: "7200"
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_kanban_config_values(&config);
+        assert_eq!(values["dispatchStaleTimeoutSeconds"], 7200);
+    }
+
+    #[test]
+    fn merge_kanban_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+kanban:
+  dispatch_interval_seconds: 30
+  custom_flag: keep-me
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_kanban_config(
+            &mut config,
+            &json!({
+                "dispatchStaleTimeoutSeconds": 0,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["kanban"]["dispatch_interval_seconds"].as_i64(),
+            Some(30)
+        );
+        assert_eq!(config["kanban"]["custom_flag"].as_str(), Some("keep-me"));
+        assert_eq!(
+            config["kanban"]["dispatch_stale_timeout_seconds"].as_i64(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn merge_kanban_config_rejects_invalid_timeout() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_kanban_config(&mut config, &json!({ "dispatchStaleTimeoutSeconds": -1 }))
+                .unwrap_err();
+        assert!(err.contains("kanban.dispatch_stale_timeout_seconds"));
+
+        let err = merge_hermes_kanban_config(
+            &mut config,
+            &json!({ "dispatchStaleTimeoutSeconds": 604801 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("kanban.dispatch_stale_timeout_seconds"));
     }
 }
 

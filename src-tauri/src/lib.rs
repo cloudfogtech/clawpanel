@@ -299,6 +299,8 @@ pub fn run() {
             hermes::hermes_security_config_save,
             hermes::hermes_display_config_read,
             hermes::hermes_display_config_save,
+            hermes::hermes_kanban_config_read,
+            hermes::hermes_kanban_config_save,
             hermes::hermes_human_delay_config_read,
             hermes::hermes_human_delay_config_save,
             hermes::hermes_streaming_config_read,
