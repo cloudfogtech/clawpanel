@@ -174,6 +174,11 @@ const HUMAN_DELAY_DEFAULTS = {
 }
 
 const KANBAN_DEFAULTS = {
+  dispatchInGateway: true,
+  dispatchIntervalSeconds: 60,
+  failureLimit: 2,
+  autoDecompose: true,
+  autoDecomposePerTick: 3,
   dispatchStaleTimeoutSeconds: 14400,
 }
 
@@ -1486,6 +1491,30 @@ export function render() {
         <div class="hm-panel-body">
           ${renderError(kanbanError)}
           <div class="hm-config-runtime-grid hm-config-kanban-grid">
+            <label class="hm-field hm-field--checkbox">
+              <input id="hm-kanban-dispatch-in-gateway" type="checkbox" ${kanbanValues.dispatchInGateway ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>
+                <span class="hm-field-label">${t('engine.hermesKanbanConfigDispatchInGateway')}</span>
+              </span>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigDispatchIntervalSeconds')}</span>
+              <input id="hm-kanban-dispatch-interval-seconds" class="hm-input" type="number" inputmode="numeric" min="1" max="86400" step="1" value="${esc(kanbanValues.dispatchIntervalSeconds)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigFailureLimit')}</span>
+              <input id="hm-kanban-failure-limit" class="hm-input" type="number" inputmode="numeric" min="1" max="100" step="1" value="${esc(kanbanValues.failureLimit)}" ${disabled ? 'disabled' : ''}>
+            </label>
+            <label class="hm-field hm-field--checkbox">
+              <input id="hm-kanban-auto-decompose" type="checkbox" ${kanbanValues.autoDecompose ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>
+                <span class="hm-field-label">${t('engine.hermesKanbanConfigAutoDecompose')}</span>
+              </span>
+            </label>
+            <label class="hm-field">
+              <span class="hm-field-label">${t('engine.hermesKanbanConfigAutoDecomposePerTick')}</span>
+              <input id="hm-kanban-auto-decompose-per-tick" class="hm-input" type="number" inputmode="numeric" min="1" max="1000" step="1" value="${esc(kanbanValues.autoDecomposePerTick)}" ${disabled ? 'disabled' : ''}>
+            </label>
             <label class="hm-field">
               <span class="hm-field-label">${t('engine.hermesKanbanConfigDispatchStaleTimeoutSeconds')}</span>
               <input id="hm-kanban-dispatch-stale-timeout-seconds" class="hm-input" type="number" inputmode="numeric" min="0" max="604800" step="60" value="${esc(kanbanValues.dispatchStaleTimeoutSeconds)}" ${disabled ? 'disabled' : ''}>
@@ -3484,6 +3513,11 @@ export function render() {
 
   async function saveKanbanConfig() {
     const form = {
+      dispatchInGateway: el.querySelector('#hm-kanban-dispatch-in-gateway')?.checked ?? true,
+      dispatchIntervalSeconds: el.querySelector('#hm-kanban-dispatch-interval-seconds')?.value || '60',
+      failureLimit: el.querySelector('#hm-kanban-failure-limit')?.value || '2',
+      autoDecompose: el.querySelector('#hm-kanban-auto-decompose')?.checked ?? true,
+      autoDecomposePerTick: el.querySelector('#hm-kanban-auto-decompose-per-tick')?.value || '3',
       dispatchStaleTimeoutSeconds: el.querySelector('#hm-kanban-dispatch-stale-timeout-seconds')?.value || '14400',
     }
     kanbanSaving = true

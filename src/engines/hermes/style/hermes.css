@@ -741,6 +741,11 @@
   gap: 8px;
 }
 
+[data-engine="hermes"] .hm-field--checkbox {
+  min-height: 44px;
+  justify-content: center;
+}
+
 [data-engine="hermes"] .hm-field-label {
   font-family: var(--hm-font-serif);
   font-style: italic;

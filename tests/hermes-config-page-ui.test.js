@@ -428,6 +428,11 @@ test('Hermes 配置页会暴露语音转写结构化配置字段', () => {
 test('Hermes 配置页会暴露 Kanban 调度稳定性结构化配置字段', () => {
   for (const id of [
     'hm-kanban-config-save',
+    'hm-kanban-dispatch-in-gateway',
+    'hm-kanban-dispatch-interval-seconds',
+    'hm-kanban-failure-limit',
+    'hm-kanban-auto-decompose',
+    'hm-kanban-auto-decompose-per-tick',
     'hm-kanban-dispatch-stale-timeout-seconds',
   ]) {
     assert.match(source, new RegExp(`id="${id}"`), `缺少 ${id}`)

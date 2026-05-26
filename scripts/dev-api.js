@@ -3758,6 +3758,32 @@ export function buildHermesKanbanConfigValues(config = {}) {
     ? root.kanban
     : {}
   return {
+    dispatchInGateway: readHermesBool(kanban.dispatch_in_gateway, true),
+    dispatchIntervalSeconds: parseHermesInteger(
+      kanban.dispatch_interval_seconds,
+      'kanban.dispatch_interval_seconds',
+      60,
+      1,
+      86400,
+      false,
+    ),
+    failureLimit: parseHermesInteger(
+      kanban.failure_limit,
+      'kanban.failure_limit',
+      2,
+      1,
+      100,
+      false,
+    ),
+    autoDecompose: readHermesBool(kanban.auto_decompose, true),
+    autoDecomposePerTick: parseHermesInteger(
+      kanban.auto_decompose_per_tick,
+      'kanban.auto_decompose_per_tick',
+      3,
+      1,
+      1000,
+      false,
+    ),
     dispatchStaleTimeoutSeconds: parseHermesInteger(
       kanban.dispatch_stale_timeout_seconds,
       'kanban.dispatch_stale_timeout_seconds',
@@ -3776,6 +3802,32 @@ export function mergeHermesKanbanConfig(config = {}, form = {}) {
     ? mergeConfigsPreservingFields(next.kanban, {})
     : {}
 
+  kanban.dispatch_in_gateway = formHermesBool(form, 'dispatchInGateway', currentValues.dispatchInGateway)
+  kanban.dispatch_interval_seconds = parseHermesInteger(
+    Object.hasOwn(form, 'dispatchIntervalSeconds') ? form.dispatchIntervalSeconds : currentValues.dispatchIntervalSeconds,
+    'kanban.dispatch_interval_seconds',
+    60,
+    1,
+    86400,
+    true,
+  )
+  kanban.failure_limit = parseHermesInteger(
+    Object.hasOwn(form, 'failureLimit') ? form.failureLimit : currentValues.failureLimit,
+    'kanban.failure_limit',
+    2,
+    1,
+    100,
+    true,
+  )
+  kanban.auto_decompose = formHermesBool(form, 'autoDecompose', currentValues.autoDecompose)
+  kanban.auto_decompose_per_tick = parseHermesInteger(
+    Object.hasOwn(form, 'autoDecomposePerTick') ? form.autoDecomposePerTick : currentValues.autoDecomposePerTick,
+    'kanban.auto_decompose_per_tick',
+    3,
+    1,
+    1000,
+    true,
+  )
   kanban.dispatch_stale_timeout_seconds = parseHermesInteger(
     Object.hasOwn(form, 'dispatchStaleTimeoutSeconds') ? form.dispatchStaleTimeoutSeconds : currentValues.dispatchStaleTimeoutSeconds,
     'kanban.dispatch_stale_timeout_seconds',

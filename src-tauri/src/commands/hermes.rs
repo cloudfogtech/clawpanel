@@ -6543,6 +6543,36 @@ fn build_hermes_kanban_config_values(config: &serde_yaml::Value) -> Value {
     let root = config.as_mapping();
     let kanban = root.and_then(|map| yaml_get_mapping(map, "kanban"));
     serde_json::json!({
+        "dispatchInGateway": kanban
+            .and_then(|map| yaml_bool_field(map, "dispatch_in_gateway"))
+            .unwrap_or(true),
+        "dispatchIntervalSeconds": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "dispatch_interval_seconds"),
+                60,
+                1,
+                86400,
+            ))
+            .unwrap_or(60),
+        "failureLimit": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "failure_limit"),
+                2,
+                1,
+                100,
+            ))
+            .unwrap_or(2),
+        "autoDecompose": kanban
+            .and_then(|map| yaml_bool_field(map, "auto_decompose"))
+            .unwrap_or(true),
+        "autoDecomposePerTick": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "auto_decompose_per_tick"),
+                3,
+                1,
+                1000,
+            ))
+            .unwrap_or(3),
         "dispatchStaleTimeoutSeconds": kanban
             .map(|map| bounded_hermes_i64(
                 yaml_i64_field(map, "dispatch_stale_timeout_seconds"),
@@ -6556,6 +6586,34 @@ fn build_hermes_kanban_config_values(config: &serde_yaml::Value) -> Value {
 
 fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
     let current = build_hermes_kanban_config_values(config);
+    let dispatch_in_gateway = form_bool(form, "dispatchInGateway")
+        .or_else(|| current["dispatchInGateway"].as_bool())
+        .unwrap_or(true);
+    let dispatch_interval_seconds = validate_hermes_i64(
+        form_i64(form, "dispatchIntervalSeconds")
+            .or_else(|| current["dispatchIntervalSeconds"].as_i64()),
+        "kanban.dispatch_interval_seconds",
+        60,
+        1,
+        86400,
+    )?;
+    let failure_limit = validate_hermes_i64(
+        form_i64(form, "failureLimit").or_else(|| current["failureLimit"].as_i64()),
+        "kanban.failure_limit",
+        2,
+        1,
+        100,
+    )?;
+    let auto_decompose = form_bool(form, "autoDecompose")
+        .or_else(|| current["autoDecompose"].as_bool())
+        .unwrap_or(true);
+    let auto_decompose_per_tick = validate_hermes_i64(
+        form_i64(form, "autoDecomposePerTick").or_else(|| current["autoDecomposePerTick"].as_i64()),
+        "kanban.auto_decompose_per_tick",
+        3,
+        1,
+        1000,
+    )?;
     let stale_timeout = validate_hermes_i64(
         form_i64(form, "dispatchStaleTimeoutSeconds")
             .or_else(|| current["dispatchStaleTimeoutSeconds"].as_i64()),
@@ -6566,6 +6624,26 @@ fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> R
     )?;
 
     let kanban = yaml_child_object(ensure_yaml_object(config)?, "kanban")?;
+    kanban.insert(
+        yaml_key("dispatch_in_gateway"),
+        serde_yaml::Value::Bool(dispatch_in_gateway),
+    );
+    kanban.insert(
+        yaml_key("dispatch_interval_seconds"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(dispatch_interval_seconds)),
+    );
+    kanban.insert(
+        yaml_key("failure_limit"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(failure_limit)),
+    );
+    kanban.insert(
+        yaml_key("auto_decompose"),
+        serde_yaml::Value::Bool(auto_decompose),
+    );
+    kanban.insert(
+        yaml_key("auto_decompose_per_tick"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(auto_decompose_per_tick)),
+    );
     kanban.insert(
         yaml_key("dispatch_stale_timeout_seconds"),
         serde_yaml::Value::Number(serde_yaml::Number::from(stale_timeout)),
@@ -19329,6 +19407,11 @@ mod hermes_kanban_config_tests {
     fn kanban_values_have_upstream_defaults() {
         let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
         let values = build_hermes_kanban_config_values(&config);
+        assert_eq!(values["dispatchInGateway"], true);
+        assert_eq!(values["dispatchIntervalSeconds"], 60);
+        assert_eq!(values["failureLimit"], 2);
+        assert_eq!(values["autoDecompose"], true);
+        assert_eq!(values["autoDecomposePerTick"], 3);
         assert_eq!(values["dispatchStaleTimeoutSeconds"], 14400);
     }
 
@@ -19337,11 +19420,21 @@ mod hermes_kanban_config_tests {
         let config: serde_yaml::Value = serde_yaml::from_str(
             r#"
 kanban:
+  dispatch_in_gateway: false
+  dispatch_interval_seconds: "120"
+  failure_limit: "5"
+  auto_decompose: false
+  auto_decompose_per_tick: "7"
   dispatch_stale_timeout_seconds: "7200"
 "#,
         )
         .unwrap();
         let values = build_hermes_kanban_config_values(&config);
+        assert_eq!(values["dispatchInGateway"], false);
+        assert_eq!(values["dispatchIntervalSeconds"], 120);
+        assert_eq!(values["failureLimit"], 5);
+        assert_eq!(values["autoDecompose"], false);
+        assert_eq!(values["autoDecomposePerTick"], 7);
         assert_eq!(values["dispatchStaleTimeoutSeconds"], 7200);
     }
 
@@ -19363,6 +19456,11 @@ memory:
         merge_hermes_kanban_config(
             &mut config,
             &json!({
+                "dispatchInGateway": false,
+                "dispatchIntervalSeconds": 15,
+                "failureLimit": 4,
+                "autoDecompose": false,
+                "autoDecomposePerTick": 2,
                 "dispatchStaleTimeoutSeconds": 0,
             }),
         )
@@ -19370,11 +19468,21 @@ memory:
 
         assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
         assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(config["kanban"]["custom_flag"].as_str(), Some("keep-me"));
+        assert_eq!(
+            config["kanban"]["dispatch_in_gateway"].as_bool(),
+            Some(false)
+        );
         assert_eq!(
             config["kanban"]["dispatch_interval_seconds"].as_i64(),
-            Some(30)
+            Some(15)
         );
-        assert_eq!(config["kanban"]["custom_flag"].as_str(), Some("keep-me"));
+        assert_eq!(config["kanban"]["failure_limit"].as_i64(), Some(4));
+        assert_eq!(config["kanban"]["auto_decompose"].as_bool(), Some(false));
+        assert_eq!(
+            config["kanban"]["auto_decompose_per_tick"].as_i64(),
+            Some(2)
+        );
         assert_eq!(
             config["kanban"]["dispatch_stale_timeout_seconds"].as_i64(),
             Some(0)
@@ -19384,6 +19492,18 @@ memory:
     #[test]
     fn merge_kanban_config_rejects_invalid_timeout() {
         let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "dispatchIntervalSeconds": 0 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.dispatch_interval_seconds"));
+
+        let err =
+            merge_hermes_kanban_config(&mut config, &json!({ "failureLimit": 0 })).unwrap_err();
+        assert!(err.contains("kanban.failure_limit"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "autoDecomposePerTick": 0 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.auto_decompose_per_tick"));
+
         let err =
             merge_hermes_kanban_config(&mut config, &json!({ "dispatchStaleTimeoutSeconds": -1 }))
                 .unwrap_err();
