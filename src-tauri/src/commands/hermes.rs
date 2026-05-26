@@ -7826,6 +7826,51 @@ fn merge_hermes_sessions_maintenance_config(
     Ok(())
 }
 
+fn build_hermes_updates_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let updates = root.and_then(|map| yaml_get_mapping(map, "updates"));
+    let updates_pre_update_backup = updates
+        .and_then(|map| yaml_bool_field(map, "pre_update_backup"))
+        .unwrap_or(false);
+    let updates_backup_keep = updates
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "backup_keep"), 5, 1, 1000))
+        .unwrap_or(5);
+
+    serde_json::json!({
+        "updatesPreUpdateBackup": updates_pre_update_backup,
+        "updatesBackupKeep": updates_backup_keep,
+    })
+}
+
+fn merge_hermes_updates_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_updates_config_values(config);
+    let updates_pre_update_backup = form_bool(form, "updatesPreUpdateBackup")
+        .unwrap_or_else(|| current["updatesPreUpdateBackup"].as_bool().unwrap_or(false));
+    let updates_backup_keep = validate_hermes_i64(
+        if form.get("updatesBackupKeep").is_some() {
+            form_i64(form, "updatesBackupKeep")
+        } else {
+            Some(current["updatesBackupKeep"].as_i64().unwrap_or(5))
+        },
+        "updates.backup_keep",
+        5,
+        1,
+        1000,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let updates = yaml_child_object(root, "updates")?;
+    updates.insert(
+        yaml_key("pre_update_backup"),
+        serde_yaml::Value::Bool(updates_pre_update_backup),
+    );
+    updates.insert(
+        yaml_key("backup_keep"),
+        serde_yaml::Value::Number(updates_backup_keep.into()),
+    );
+    Ok(())
+}
+
 fn build_hermes_logging_config_values(config: &serde_yaml::Value) -> Value {
     let root = config.as_mapping();
     let logging = root.and_then(|map| yaml_get_mapping(map, "logging"));
@@ -10389,6 +10434,30 @@ pub fn hermes_sessions_maintenance_config_save(form: Value) -> Result<Value, Str
         "configPath": config_path.to_string_lossy(),
         "backup": backup,
         "values": build_hermes_sessions_maintenance_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_updates_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_updates_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_updates_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_updates_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_updates_config_values(&config),
     }))
 }
 
@@ -17392,6 +17461,80 @@ streaming:
         )
         .unwrap_err();
         assert!(err.contains("sessions.min_interval_hours"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_updates_config_tests {
+    use super::{build_hermes_updates_config_values, merge_hermes_updates_config};
+    use serde_json::json;
+
+    #[test]
+    fn updates_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_updates_config_values(&config);
+        assert_eq!(values["updatesPreUpdateBackup"], false);
+        assert_eq!(values["updatesBackupKeep"], 5);
+    }
+
+    #[test]
+    fn updates_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+updates:
+  pre_update_backup: true
+  backup_keep: 9
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_updates_config_values(&config);
+        assert_eq!(values["updatesPreUpdateBackup"], true);
+        assert_eq!(values["updatesBackupKeep"], 9);
+    }
+
+    #[test]
+    fn merge_updates_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+updates:
+  pre_update_backup: false
+  custom_flag: keep-updates
+sessions:
+  auto_prune: true
+model:
+  provider: anthropic
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_updates_config(
+            &mut config,
+            &json!({
+                "updatesPreUpdateBackup": true,
+                "updatesBackupKeep": "7",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["sessions"]["auto_prune"].as_bool(), Some(true));
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["updates"]["pre_update_backup"].as_bool(), Some(true));
+        assert_eq!(config["updates"]["backup_keep"].as_i64(), Some(7));
+        assert_eq!(
+            config["updates"]["custom_flag"].as_str(),
+            Some("keep-updates")
+        );
+    }
+
+    #[test]
+    fn merge_updates_config_rejects_invalid_backup_keep() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_updates_config(&mut config, &json!({ "updatesBackupKeep": 0 }))
+            .unwrap_err();
+        assert!(err.contains("updates.backup_keep"));
+        let err = merge_hermes_updates_config(&mut config, &json!({ "updatesBackupKeep": 1001 }))
+            .unwrap_err();
+        assert!(err.contains("updates.backup_keep"));
     }
 }
 

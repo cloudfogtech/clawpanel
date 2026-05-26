@@ -5285,6 +5285,30 @@ export function mergeHermesSessionsMaintenanceConfig(config = {}, form = {}) {
   return next
 }
 
+export function buildHermesUpdatesConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const updates = root.updates && typeof root.updates === 'object' && !Array.isArray(root.updates)
+    ? root.updates
+    : {}
+  return {
+    updatesPreUpdateBackup: readHermesBool(updates.pre_update_backup, false),
+    updatesBackupKeep: parseHermesInteger(updates.backup_keep, 'updates.backup_keep', 5, 1, 1000, false),
+  }
+}
+
+export function mergeHermesUpdatesConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesUpdatesConfigValues(next)
+  const updates = next.updates && typeof next.updates === 'object' && !Array.isArray(next.updates)
+    ? mergeConfigsPreservingFields(next.updates, {})
+    : {}
+
+  updates.pre_update_backup = formHermesBool(form, 'updatesPreUpdateBackup', currentValues.updatesPreUpdateBackup)
+  updates.backup_keep = parseHermesInteger(Object.hasOwn(form, 'updatesBackupKeep') ? form.updatesBackupKeep : currentValues.updatesBackupKeep, 'updates.backup_keep', 5, 1, 1000, true)
+  next.updates = updates
+  return next
+}
+
 export function buildHermesLoggingConfigValues(config = {}) {
   const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
   const logging = root.logging && typeof root.logging === 'object' && !Array.isArray(root.logging)
@@ -12484,6 +12508,27 @@ const handlers = {
       configPath,
       backup,
       values: buildHermesSessionsMaintenanceConfigValues(next),
+    }
+  },
+
+  hermes_updates_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesUpdatesConfigValues(config),
+    }
+  },
+
+  hermes_updates_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesUpdatesConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesUpdatesConfigValues(next),
     }
   },
 

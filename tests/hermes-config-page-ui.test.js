@@ -36,6 +36,16 @@ test('Hermes 配置页会暴露会话维护结构化配置字段', () => {
   }
 })
 
+test('Hermes 配置页会暴露更新备份结构化配置字段', () => {
+  for (const id of [
+    'hm-updates-save',
+    'hm-updates-pre-update-backup',
+    'hm-updates-backup-keep',
+  ]) {
+    assert.match(source, new RegExp(`id="${id}"`), `缺少 ${id}`)
+  }
+})
+
 test('Hermes 配置页会暴露工具循环防护结构化配置字段', () => {
   for (const id of [
     'hm-tool-guardrails-save',
@@ -514,6 +524,7 @@ test('Hermes 配置页新增结构化配置不会暴露翻译 key', () => {
     key.includes('SttConfig') ||
     key.includes('KanbanConfig') ||
     key.includes('CheckpointsConfig') ||
+    key.includes('UpdatesConfig') ||
     key.includes('ApprovalsConfig') ||
     key.includes('CronConfig') ||
     key.includes('LoggingConfig') ||
