@@ -3806,6 +3806,9 @@ export function buildHermesDisplayConfigValues(config = {}) {
   const display = root.display && typeof root.display === 'object' && !Array.isArray(root.display)
     ? root.display
     : {}
+  const dashboard = root.dashboard && typeof root.dashboard === 'object' && !Array.isArray(root.dashboard)
+    ? root.dashboard
+    : {}
   const runtimeFooter = display.runtime_footer && typeof display.runtime_footer === 'object' && !Array.isArray(display.runtime_footer)
     ? display.runtime_footer
     : {}
@@ -3822,6 +3825,8 @@ export function buildHermesDisplayConfigValues(config = {}) {
     displayRuntimeFooterEnabled: readHermesBool(runtimeFooter.enabled, false),
     displayRuntimeFooterFields: normalizeHermesRuntimeFooterFields(runtimeFooter.fields, false).join('\n'),
     displayFileMutationVerifier: readHermesBool(display.file_mutation_verifier, true),
+    displayShowCost: readHermesBool(display.show_cost, false),
+    dashboardShowTokenAnalytics: readHermesBool(dashboard.show_token_analytics, false),
     displayLanguage: normalizeHermesDisplayLanguage(display.language, false),
     displayResumeDisplay: normalizeHermesDisplayResume(display.resume_display, false),
     displayBusyInputMode: normalizeHermesDisplayBusyInputMode(display.busy_input_mode, false),
@@ -3857,6 +3862,7 @@ export function mergeHermesDisplayConfig(config = {}, form = {}) {
   runtimeFooter.fields = normalizeHermesRuntimeFooterFields(Object.hasOwn(form, 'displayRuntimeFooterFields') ? form.displayRuntimeFooterFields : currentValues.displayRuntimeFooterFields, true)
   display.runtime_footer = runtimeFooter
   display.file_mutation_verifier = formHermesBool(form, 'displayFileMutationVerifier', currentValues.displayFileMutationVerifier)
+  display.show_cost = formHermesBool(form, 'displayShowCost', currentValues.displayShowCost)
   display.language = normalizeHermesDisplayLanguage(Object.hasOwn(form, 'displayLanguage') ? form.displayLanguage : currentValues.displayLanguage, true)
   display.resume_display = normalizeHermesDisplayResume(Object.hasOwn(form, 'displayResumeDisplay') ? form.displayResumeDisplay : currentValues.displayResumeDisplay, true)
   display.busy_input_mode = normalizeHermesDisplayBusyInputMode(Object.hasOwn(form, 'displayBusyInputMode') ? form.displayBusyInputMode : currentValues.displayBusyInputMode, true)
@@ -3867,6 +3873,11 @@ export function mergeHermesDisplayConfig(config = {}, form = {}) {
   display.persistent_output = formHermesBool(form, 'displayPersistentOutput', currentValues.displayPersistentOutput)
   display.persistent_output_max_lines = parseHermesInteger(Object.hasOwn(form, 'displayPersistentOutputMaxLines') ? form.displayPersistentOutputMaxLines : currentValues.displayPersistentOutputMaxLines, 'display.persistent_output_max_lines', 200, 0, 100000, true)
   next.display = display
+  const dashboard = next.dashboard && typeof next.dashboard === 'object' && !Array.isArray(next.dashboard)
+    ? mergeConfigsPreservingFields(next.dashboard, {})
+    : {}
+  dashboard.show_token_analytics = formHermesBool(form, 'dashboardShowTokenAnalytics', currentValues.dashboardShowTokenAnalytics)
+  next.dashboard = dashboard
   return next
 }
 

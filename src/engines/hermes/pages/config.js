@@ -200,6 +200,8 @@ const DISPLAY_DEFAULTS = {
   displayRuntimeFooterEnabled: false,
   displayRuntimeFooterFields: 'model\ncontext_pct\ncwd',
   displayFileMutationVerifier: true,
+  displayShowCost: false,
+  dashboardShowTokenAnalytics: false,
   displayLanguage: 'en',
   displayResumeDisplay: 'full',
   displayBusyInputMode: 'interrupt',
@@ -1814,6 +1816,14 @@ export function render() {
             <label class="hm-channel-check">
               <input id="hm-display-file-mutation-verifier" type="checkbox" ${displayValues.displayFileMutationVerifier ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
               <span>${t('engine.hermesDisplayConfigFileMutationVerifier')}</span>
+            </label>
+            <label class="hm-channel-check">
+              <input id="hm-display-show-cost" type="checkbox" ${displayValues.displayShowCost ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesDisplayConfigShowCost')}</span>
+            </label>
+            <label class="hm-channel-check">
+              <input id="hm-dashboard-show-token-analytics" type="checkbox" ${displayValues.dashboardShowTokenAnalytics ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+              <span>${t('engine.hermesDisplayConfigShowTokenAnalytics')}</span>
             </label>
             <label class="hm-channel-check">
               <input id="hm-display-timestamps" type="checkbox" ${displayValues.displayTimestamps ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
@@ -4451,6 +4461,8 @@ export function render() {
       displayRuntimeFooterEnabled: !!el.querySelector('#hm-display-runtime-footer-enabled')?.checked,
       displayRuntimeFooterFields: el.querySelector('#hm-display-runtime-footer-fields')?.value || 'model\ncontext_pct\ncwd',
       displayFileMutationVerifier: !!el.querySelector('#hm-display-file-mutation-verifier')?.checked,
+      displayShowCost: !!el.querySelector('#hm-display-show-cost')?.checked,
+      dashboardShowTokenAnalytics: !!el.querySelector('#hm-dashboard-show-token-analytics')?.checked,
       displayLanguage: el.querySelector('#hm-display-language')?.value || 'en',
       displayResumeDisplay: el.querySelector('#hm-display-resume-display')?.value || 'full',
       displayBusyInputMode: el.querySelector('#hm-display-busy-input-mode')?.value || 'interrupt',

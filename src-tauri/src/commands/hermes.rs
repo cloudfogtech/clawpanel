@@ -6515,6 +6515,7 @@ fn normalize_hermes_runtime_footer_fields(
 fn build_hermes_display_config_values(config: &serde_yaml::Value) -> Value {
     let root = config.as_mapping();
     let display = root.and_then(|map| yaml_get_mapping(map, "display"));
+    let dashboard = root.and_then(|map| yaml_get_mapping(map, "dashboard"));
     let runtime_footer = display.and_then(|map| yaml_get_mapping(map, "runtime_footer"));
     let runtime_footer_fields = normalize_hermes_runtime_footer_fields(
         runtime_footer.and_then(|map| yaml_get(map, "fields")),
@@ -6553,6 +6554,8 @@ fn build_hermes_display_config_values(config: &serde_yaml::Value) -> Value {
         "displayRuntimeFooterEnabled": runtime_footer.and_then(|map| yaml_bool_field(map, "enabled")).unwrap_or(false),
         "displayRuntimeFooterFields": runtime_footer_fields.join("\n"),
         "displayFileMutationVerifier": display.and_then(|map| yaml_bool_field(map, "file_mutation_verifier")).unwrap_or(true),
+        "displayShowCost": display.and_then(|map| yaml_bool_field(map, "show_cost")).unwrap_or(false),
+        "dashboardShowTokenAnalytics": dashboard.and_then(|map| yaml_bool_field(map, "show_token_analytics")).unwrap_or(false),
         "displayLanguage": normalize_hermes_display_language(
             display.and_then(|map| yaml_string_field(map, "language")),
             false,
@@ -6708,6 +6711,13 @@ fn merge_hermes_display_config(config: &mut serde_yaml::Value, form: &Value) -> 
         ),
     );
     display.insert(
+        yaml_key("show_cost"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayShowCost")
+                .unwrap_or_else(|| current["displayShowCost"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
         yaml_key("language"),
         serde_yaml::Value::String(normalize_hermes_display_language(
             form_string(form, "displayLanguage")
@@ -6795,6 +6805,17 @@ fn merge_hermes_display_config(config: &mut serde_yaml::Value, form: &Value) -> 
                 .into_iter()
                 .map(serde_yaml::Value::String)
                 .collect(),
+        ),
+    );
+    let dashboard = yaml_child_object(ensure_yaml_object(config)?, "dashboard")?;
+    dashboard.insert(
+        yaml_key("show_token_analytics"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "dashboardShowTokenAnalytics").unwrap_or_else(|| {
+                current["dashboardShowTokenAnalytics"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
         ),
     );
     Ok(())
@@ -22263,6 +22284,8 @@ mod hermes_display_config_tests {
             "model\ncontext_pct\ncwd"
         );
         assert_eq!(values["displayFileMutationVerifier"], true);
+        assert_eq!(values["displayShowCost"], false);
+        assert_eq!(values["dashboardShowTokenAnalytics"], false);
         assert_eq!(values["displayLanguage"], "en");
         assert_eq!(values["displayResumeDisplay"], "full");
         assert_eq!(values["displayBusyInputMode"], "interrupt");
@@ -22295,6 +22318,7 @@ display:
       - duration
       - cost
   file_mutation_verifier: false
+  show_cost: true
   language: ZH
   resume_display: minimal
   busy_input_mode: QUEUE
@@ -22304,6 +22328,8 @@ display:
   bell_on_complete: true
   persistent_output: false
   persistent_output_max_lines: 80
+dashboard:
+  show_token_analytics: true
 "#,
         )
         .unwrap();
@@ -22323,6 +22349,8 @@ display:
             "model\nduration\ncost"
         );
         assert_eq!(values["displayFileMutationVerifier"], false);
+        assert_eq!(values["displayShowCost"], true);
+        assert_eq!(values["dashboardShowTokenAnalytics"], true);
         assert_eq!(values["displayLanguage"], "zh");
         assert_eq!(values["displayResumeDisplay"], "minimal");
         assert_eq!(values["displayBusyInputMode"], "queue");
@@ -22348,6 +22376,8 @@ display:
   platforms:
     telegram:
       tool_progress: new
+dashboard:
+  custom_flag: keep-dashboard
 memory:
   memory_enabled: true
 "#,
@@ -22369,6 +22399,8 @@ memory:
                 "displayRuntimeFooterEnabled": true,
                 "displayRuntimeFooterFields": "model\ncontext_pct\nduration",
                 "displayFileMutationVerifier": true,
+                "displayShowCost": true,
+                "dashboardShowTokenAnalytics": true,
                 "displayLanguage": "zh-hant",
                 "displayResumeDisplay": "minimal",
                 "displayBusyInputMode": "steer",
@@ -22384,6 +22416,14 @@ memory:
 
         assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
         assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["dashboard"]["custom_flag"].as_str(),
+            Some("keep-dashboard")
+        );
+        assert_eq!(
+            config["dashboard"]["show_token_analytics"].as_bool(),
+            Some(true)
+        );
         assert_eq!(config["display"]["compact"].as_bool(), Some(true));
         assert_eq!(config["display"]["skin"].as_str(), Some("slate"));
         assert_eq!(config["display"]["tool_prefix"].as_str(), Some("│"));
@@ -22424,6 +22464,7 @@ memory:
             config["display"]["file_mutation_verifier"].as_bool(),
             Some(true)
         );
+        assert_eq!(config["display"]["show_cost"].as_bool(), Some(true));
         assert_eq!(config["display"]["language"].as_str(), Some("zh-hant"));
         assert_eq!(
             config["display"]["resume_display"].as_str(),

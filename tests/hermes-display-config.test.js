@@ -22,6 +22,8 @@ test('Hermes 显示配置读取会提供上游默认值', () => {
     displayRuntimeFooterEnabled: false,
     displayRuntimeFooterFields: 'model\ncontext_pct\ncwd',
     displayFileMutationVerifier: true,
+    displayShowCost: false,
+    dashboardShowTokenAnalytics: false,
     displayLanguage: 'en',
     displayResumeDisplay: 'full',
     displayBusyInputMode: 'interrupt',
@@ -51,6 +53,7 @@ test('Hermes 显示配置读取会规范化已有字段', () => {
         fields: ['model', 'duration', 'cost'],
       },
       file_mutation_verifier: false,
+      show_cost: true,
       language: 'ZH',
       resume_display: 'minimal',
       busy_input_mode: 'QUEUE',
@@ -60,6 +63,9 @@ test('Hermes 显示配置读取会规范化已有字段', () => {
       bell_on_complete: true,
       persistent_output: false,
       persistent_output_max_lines: 80,
+    },
+    dashboard: {
+      show_token_analytics: true,
     },
   })
 
@@ -75,6 +81,8 @@ test('Hermes 显示配置读取会规范化已有字段', () => {
   assert.equal(values.displayRuntimeFooterEnabled, true)
   assert.equal(values.displayRuntimeFooterFields, 'model\nduration\ncost')
   assert.equal(values.displayFileMutationVerifier, false)
+  assert.equal(values.displayShowCost, true)
+  assert.equal(values.dashboardShowTokenAnalytics, true)
   assert.equal(values.displayLanguage, 'zh')
   assert.equal(values.displayResumeDisplay, 'minimal')
   assert.equal(values.displayBusyInputMode, 'queue')
@@ -99,6 +107,9 @@ test('Hermes 显示配置保存会保留未知 YAML 并写入 display', () => {
         telegram: { tool_progress: 'new' },
       },
     },
+    dashboard: {
+      custom_flag: 'keep-dashboard',
+    },
     memory: { memory_enabled: true },
   }, {
     displayToolProgress: 'off',
@@ -113,6 +124,8 @@ test('Hermes 显示配置保存会保留未知 YAML 并写入 display', () => {
     displayRuntimeFooterEnabled: true,
     displayRuntimeFooterFields: 'model\ncontext_pct\nduration',
     displayFileMutationVerifier: true,
+    displayShowCost: true,
+    dashboardShowTokenAnalytics: true,
     displayLanguage: 'zh-hant',
     displayResumeDisplay: 'minimal',
     displayBusyInputMode: 'steer',
@@ -126,6 +139,8 @@ test('Hermes 显示配置保存会保留未知 YAML 并写入 display', () => {
 
   assert.deepEqual(next.model, { provider: 'anthropic' })
   assert.deepEqual(next.memory, { memory_enabled: true })
+  assert.equal(next.dashboard.custom_flag, 'keep-dashboard')
+  assert.equal(next.dashboard.show_token_analytics, true)
   assert.equal(next.display.compact, true)
   assert.equal(next.display.skin, 'slate')
   assert.equal(next.display.tool_prefix, '│')
@@ -140,6 +155,7 @@ test('Hermes 显示配置保存会保留未知 YAML 并写入 display', () => {
   assert.deepEqual(next.display.runtime_footer.fields, ['model', 'context_pct', 'duration'])
   assert.equal(next.display.runtime_footer.custom_flag, 'keep-footer')
   assert.equal(next.display.file_mutation_verifier, true)
+  assert.equal(next.display.show_cost, true)
   assert.equal(next.display.language, 'zh-hant')
   assert.equal(next.display.resume_display, 'minimal')
   assert.equal(next.display.busy_input_mode, 'steer')

@@ -274,6 +274,8 @@ test('Hermes 配置页会暴露全局显示与可靠性结构化配置字段', (
     'hm-display-runtime-footer-enabled',
     'hm-display-runtime-footer-fields',
     'hm-display-file-mutation-verifier',
+    'hm-display-show-cost',
+    'hm-dashboard-show-token-analytics',
     'hm-display-language',
     'hm-display-resume-display',
     'hm-display-busy-input-mode',
