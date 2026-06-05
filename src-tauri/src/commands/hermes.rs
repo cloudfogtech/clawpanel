@@ -1193,7 +1193,7 @@ fn kill_dashboard_pid() -> bool {
 ///   3. 进程提前退出 → 读日志尾部检测 deps_missing / port_in_use
 /// 返回 `{ started, kind?, port, pid?, exit_code?, log_tail? }`
 #[tauri::command]
-pub async fn hermes_dashboard_start() -> Result<Value, String> {
+pub async fn hermes_dashboard_start(app: tauri::AppHandle) -> Result<Value, String> {
     let port = hermes_dashboard_port();
     // 1. 已运行？
     if hermes_dashboard_tcp_running(port, 500)
@@ -1210,6 +1210,11 @@ pub async fn hermes_dashboard_start() -> Result<Value, String> {
 
     // 2. 清掉残留 PID（来自上一次 spawn）
     let _ = kill_dashboard_pid();
+
+    // 2b. 上游 wheel 漏装 dashboard_auth + web_dist 时，dashboard 进程会直接崩。
+    // 在 spawn 前先做一次幂等 stub 注入，覆盖既有用户（从早期版本升上来、没走过 install_hermes
+    // 的新代码路径）也能立即恢复。已存在的真实文件不会被覆盖。
+    inject_hermes_dashboard_compat_stub(&app);
 
     let home = hermes_home();
     let log_path = home.join("dashboard-run.log");
@@ -1392,6 +1397,9 @@ pub async fn install_hermes(
 
     let _ = app.emit("hermes-install-progress", 90u32);
 
+    // Step 2b: 注入 dashboard 兼容 stub（弥补上游 wheel 漏装 dashboard_auth + web_dist）
+    inject_hermes_dashboard_compat_stub(&app);
+
     // Step 3: 验证安装
     let _ = app.emit("hermes-install-log", "🔍 验证安装...");
     let enhanced = hermes_enhanced_path();
@@ -1565,6 +1573,366 @@ fn extract_uv_tar_gz(data: &[u8], dest: &std::path::Path) -> Result<(), String> 
 
 const HERMES_GIT_URL: &str = "git+https://github.com/NousResearch/hermes-agent.git";
 
+/// Runtime Python deps that `hermes-agent` needs at runtime but are NOT declared as
+/// install-time dependencies in its `[project].dependencies` (e.g. lazy-loaded
+/// platform adapters). Without these, `hermes gateway run` starts but cannot bring
+/// up the API server. Keep in sync between fresh install and upgrade paths.
+const HERMES_RUNTIME_EXTRA_DEPS: &[&str] =
+    &["croniter", "httpx", "openai", "aiohttp", "websockets"];
+
+/// Append `--with <dep>` for every required runtime extra to the given command.
+fn append_hermes_runtime_extras(cmd: &mut tokio::process::Command) {
+    for dep in HERMES_RUNTIME_EXTRA_DEPS {
+        cmd.args(["--with", dep]);
+    }
+}
+
+/// Human-readable `--with X --with Y ...` segment for log lines so users see the
+/// exact command we ran.
+fn hermes_runtime_extras_log_segment() -> String {
+    HERMES_RUNTIME_EXTRA_DEPS
+        .iter()
+        .map(|d| format!("--with {d}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Hermes Dashboard compat stubs
+//
+// hermes-agent 0.14.0 (both PyPI wheel and `git+...` source) ships
+// `hermes_cli/web_server.py` with hard imports of `hermes_cli.dashboard_auth.*`
+// submodules whose source files are NOT included in the distribution. It also
+// omits the built dashboard SPA (`hermes_cli/web_dist/`). On Windows in
+// particular, the missing dashboard_auth subpackage breaks `hermes dashboard`
+// completely, taking down every ClawPanel page that talks to port 9119
+// (Profile, Kanban, OAuth, Channels, Sessions detail).
+//
+// To stay self-sufficient (per project policy: do not patch upstream), we
+// inject a minimal pass-through stub into the installed venv:
+//   - `hermes_cli/dashboard_auth/{__init__,audit,middleware,prefix,routes,ws_tickets}.py`
+//     so all `from hermes_cli.dashboard_auth.* import ...` lines resolve.
+//     Auth is a no-op; valid for loopback (127.0.0.1) bindings where the
+//     auth gate is intentionally disabled.
+//   - `hermes_cli/web_dist/index.html` so `mount_spa()` takes the
+//     token-injecting branch instead of the `Frontend not built` 404 branch.
+//     Without this, the panel's `dashboard_session_token` scrape returns
+//     404 and all `/api/*` calls fail with 401.
+//
+// The injection is idempotent: if upstream eventually ships either piece,
+// the corresponding stub write is skipped so the real implementation wins.
+// ---------------------------------------------------------------------------
+
+const HERMES_DASHBOARD_AUTH_INIT_PY: &str = r#""""ClawPanel-injected stub for hermes_cli.dashboard_auth.
+
+Upstream hermes-agent ships web_server.py with imports referencing this
+subpackage, but the actual source files are NOT included in the wheel or
+the public git repo. To keep Hermes Dashboard usable in loopback
+(127.0.0.1) mode, ClawPanel injects this minimal pass-through stub at
+install/upgrade time.
+
+When upstream eventually ships the real module, delete this directory
+and reinstall hermes-agent; the real implementation will be picked up.
+"""
+from __future__ import annotations
+
+from typing import Iterable, List
+
+
+class DashboardAuthProvider:
+    """Stub base class. Real providers inherit from this."""
+
+    name: str = ""
+
+
+_REGISTERED: List["DashboardAuthProvider"] = []
+
+
+def register_provider(provider: "DashboardAuthProvider") -> None:
+    """No-op stub. ClawPanel binds to 127.0.0.1 so the gate is disabled."""
+    if isinstance(provider, DashboardAuthProvider):
+        _REGISTERED.append(provider)
+
+
+def list_providers() -> Iterable["DashboardAuthProvider"]:
+    """Return registered providers (empty on loopback)."""
+    return list(_REGISTERED)
+
+
+__all__ = ["DashboardAuthProvider", "register_provider", "list_providers"]
+"#;
+
+const HERMES_DASHBOARD_AUTH_AUDIT_PY: &str = r#""""ClawPanel stub: hermes_cli.dashboard_auth.audit"""
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any
+
+
+class AuditEvent(str, Enum):
+    LOGIN = "login"
+    LOGOUT = "logout"
+    LOGIN_FAILED = "login_failed"
+    WS_TICKET_MINTED = "ws_ticket_minted"
+    WS_TICKET_REJECTED = "ws_ticket_rejected"
+    PROVIDER_REGISTERED = "provider_registered"
+
+
+def audit_log(event: Any, **fields: Any) -> None:
+    """No-op stub. Real implementation appends to an audit log file."""
+    return None
+
+
+__all__ = ["AuditEvent", "audit_log"]
+"#;
+
+const HERMES_DASHBOARD_AUTH_MIDDLEWARE_PY: &str = r#""""ClawPanel stub: hermes_cli.dashboard_auth.middleware"""
+from __future__ import annotations
+
+
+async def gated_auth_middleware(request, call_next):
+    """Pass-through ASGI middleware. Real one enforces JWT on non-loopback."""
+    return await call_next(request)
+
+
+__all__ = ["gated_auth_middleware"]
+"#;
+
+const HERMES_DASHBOARD_AUTH_PREFIX_PY: &str = r#""""ClawPanel stub: hermes_cli.dashboard_auth.prefix"""
+from __future__ import annotations
+
+
+def normalise_prefix(prefix: str) -> str:
+    """Normalise X-Forwarded-Prefix style values to a leading-slash form."""
+    if not prefix:
+        return ""
+    return "/" + prefix.strip("/")
+
+
+__all__ = ["normalise_prefix"]
+"#;
+
+const HERMES_DASHBOARD_AUTH_ROUTES_PY: &str = r#""""ClawPanel stub: hermes_cli.dashboard_auth.routes"""
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+router = APIRouter()
+
+
+__all__ = ["router"]
+"#;
+
+const HERMES_DASHBOARD_AUTH_WS_TICKETS_PY: &str = r#""""ClawPanel stub: hermes_cli.dashboard_auth.ws_tickets"""
+from __future__ import annotations
+
+
+class TicketInvalid(Exception):
+    """Raised when a WS ticket is rejected. Stub never raises."""
+
+
+def mint_ticket(*args, **kwargs) -> str:
+    """Stub. Real one mints short-lived JWTs."""
+    return "stub-loopback-ticket"
+
+
+def consume_ticket(*args, **kwargs) -> None:
+    """Stub. Real one validates signature + expiry. Never raises here."""
+    return None
+
+
+__all__ = ["TicketInvalid", "mint_ticket", "consume_ticket"]
+"#;
+
+const HERMES_DASHBOARD_WEB_DIST_INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Hermes Dashboard (ClawPanel stub)</title>
+    <meta name="generator" content="clawpanel-dashboard-spa-stub">
+  </head>
+  <body>
+    <main style="font-family:system-ui,-apple-system,sans-serif;padding:32px;color:#333">
+      <h1 style="margin:0 0 16px">Hermes Dashboard</h1>
+      <p>This SPA placeholder is injected by ClawPanel so the dashboard backend
+         emits a session token. ClawPanel provides its own UI; the upstream
+         SPA is not shipped with the wheel.</p>
+    </main>
+  </body>
+</html>
+"#;
+
+/// Resolve `<uv tool dir>/hermes-agent` — the venv root that `uv tool install`
+/// creates. Returns `None` if `uv` is unavailable or hermes-agent isn't installed
+/// via the uv-tool path (e.g. user is on the legacy `~/.hermes-venv` uv-pip path).
+fn hermes_uv_tool_root() -> Option<std::path::PathBuf> {
+    let uv_path = uv_bin_path();
+    let uv_cmd = if uv_path.exists() {
+        uv_path.to_string_lossy().to_string()
+    } else {
+        "uv".into()
+    };
+    let mut cmd = std::process::Command::new(&uv_cmd);
+    cmd.args(["tool", "dir"]);
+    cmd.env("PATH", hermes_enhanced_path());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return None;
+    }
+    let root = std::path::PathBuf::from(&stdout).join("hermes-agent");
+    if root.exists() {
+        Some(root)
+    } else {
+        None
+    }
+}
+
+/// Locate the Python interpreter inside the uv-tool hermes-agent venv.
+///
+/// Layouts vary by platform:
+///   - Windows: `<uv tool dir>/hermes-agent/Scripts/python.exe`
+///   - macOS / Linux: `<uv tool dir>/hermes-agent/bin/python`
+fn hermes_uv_tool_python() -> Option<std::path::PathBuf> {
+    let root = hermes_uv_tool_root()?;
+    #[cfg(target_os = "windows")]
+    let py = root.join("Scripts").join("python.exe");
+    #[cfg(not(target_os = "windows"))]
+    let py = root.join("bin").join("python");
+    if py.exists() {
+        Some(py)
+    } else {
+        None
+    }
+}
+
+/// Locate the installed `hermes_cli` package directory inside the uv tool venv.
+///
+/// Layouts vary by platform:
+///   - Windows: `<uv tool dir>/hermes-agent/Lib/site-packages/hermes_cli`
+///   - macOS / Linux: `<uv tool dir>/hermes-agent/lib/python3.X/site-packages/hermes_cli`
+///
+/// Returns `None` if uv is unavailable or hermes-agent is not installed.
+fn locate_hermes_cli_package_dir() -> Option<std::path::PathBuf> {
+    let hermes_root = hermes_uv_tool_root()?;
+
+    let windows_path = hermes_root
+        .join("Lib")
+        .join("site-packages")
+        .join("hermes_cli");
+    if windows_path.exists() {
+        return Some(windows_path);
+    }
+    let lib_dir = hermes_root.join("lib");
+    if let Ok(entries) = std::fs::read_dir(&lib_dir) {
+        for entry in entries.flatten() {
+            let pkg = entry.path().join("site-packages").join("hermes_cli");
+            if pkg.exists() {
+                return Some(pkg);
+            }
+        }
+    }
+    None
+}
+
+/// Inject the dashboard_auth and web_dist stubs into the installed hermes-agent
+/// venv if upstream did not ship them. Idempotent: existing files are never
+/// overwritten so the real implementation, if/when it lands, wins.
+///
+/// Stub injection failures are logged and swallowed — install/upgrade succeeds
+/// regardless so users aren't blocked by best-effort compatibility patches.
+fn inject_hermes_dashboard_compat_stub(app: &tauri::AppHandle) {
+    let hermes_cli = match locate_hermes_cli_package_dir() {
+        Some(p) => p,
+        None => {
+            let _ = app.emit(
+                "hermes-install-log",
+                "⚠ 跳过 dashboard 兼容 stub 注入：未找到 hermes_cli 包目录",
+            );
+            return;
+        }
+    };
+
+    let mut wrote_auth = false;
+    let auth_dir = hermes_cli.join("dashboard_auth");
+    if !auth_dir.join("__init__.py").exists() {
+        if let Err(e) = std::fs::create_dir_all(&auth_dir) {
+            let _ = app.emit(
+                "hermes-install-log",
+                format!("⚠ 无法创建 dashboard_auth 目录: {e}"),
+            );
+            return;
+        }
+        let files: [(&str, &str); 6] = [
+            ("__init__.py", HERMES_DASHBOARD_AUTH_INIT_PY),
+            ("audit.py", HERMES_DASHBOARD_AUTH_AUDIT_PY),
+            ("middleware.py", HERMES_DASHBOARD_AUTH_MIDDLEWARE_PY),
+            ("prefix.py", HERMES_DASHBOARD_AUTH_PREFIX_PY),
+            ("routes.py", HERMES_DASHBOARD_AUTH_ROUTES_PY),
+            ("ws_tickets.py", HERMES_DASHBOARD_AUTH_WS_TICKETS_PY),
+        ];
+        for (name, content) in files {
+            let path = auth_dir.join(name);
+            if let Err(e) = std::fs::write(&path, content) {
+                let _ = app.emit(
+                    "hermes-install-log",
+                    format!("⚠ 写入 dashboard_auth/{name} 失败: {e}"),
+                );
+                return;
+            }
+        }
+        wrote_auth = true;
+    }
+
+    let mut wrote_dist = false;
+    let dist_dir = hermes_cli.join("web_dist");
+    let index_path = dist_dir.join("index.html");
+    if !index_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(dist_dir.join("assets")) {
+            let _ = app.emit(
+                "hermes-install-log",
+                format!("⚠ 无法创建 web_dist 目录: {e}"),
+            );
+            return;
+        }
+        if let Err(e) = std::fs::write(&index_path, HERMES_DASHBOARD_WEB_DIST_INDEX_HTML) {
+            let _ = app.emit(
+                "hermes-install-log",
+                format!("⚠ 写入 web_dist/index.html 失败: {e}"),
+            );
+            return;
+        }
+        wrote_dist = true;
+    }
+
+    if wrote_auth || wrote_dist {
+        let mut parts: Vec<&str> = Vec::new();
+        if wrote_auth {
+            parts.push("dashboard_auth");
+        }
+        if wrote_dist {
+            parts.push("web_dist");
+        }
+        let _ = app.emit(
+            "hermes-install-log",
+            format!("📦 已注入 Hermes Dashboard 兼容 stub: {}", parts.join(", ")),
+        );
+    } else {
+        let _ = app.emit(
+            "hermes-install-log",
+            "✓ Hermes Dashboard 兼容 stub 已存在，无需注入",
+        );
+    }
+}
+
 fn sanitize_hermes_install_output(text: &str) -> String {
     let mut out = text.replace(HERMES_GIT_URL, "hermes-agent");
     out = out.replace(
@@ -1655,24 +2023,8 @@ async fn install_via_uv_tool(
     };
 
     let mut cmd = tokio::process::Command::new(uv_path);
-    cmd.args([
-        "tool",
-        "install",
-        "--force",
-        &pkg,
-        "--python",
-        "3.11",
-        "--with",
-        "croniter",
-        "--with",
-        "httpx",
-        "--with",
-        "openai",
-        "--with",
-        "aiohttp",
-        "--with",
-        "websockets",
-    ]);
+    cmd.args(["tool", "install", "--force", &pkg, "--python", "3.11"]);
+    append_hermes_runtime_extras(&mut cmd);
 
     // 配置 PyPI 镜像（extras 的依赖仍从 PyPI 下载）
     if let Some(mirror) = pypi_mirror_url() {
@@ -1696,7 +2048,10 @@ async fn install_via_uv_tool(
 
     let _ = app.emit(
         "hermes-install-log",
-        "uv tool install hermes-agent --python 3.11 --with croniter --with httpx --with openai --with aiohttp --with websockets",
+        format!(
+            "uv tool install hermes-agent --python 3.11 {}",
+            hermes_runtime_extras_log_segment()
+        ),
     );
 
     let child = cmd.spawn().map_err(|e| format!("启动安装进程失败: {e}"))?;
@@ -2148,6 +2503,10078 @@ fn merge_env_file(existing: &str, managed_keys: &[&str], new_pairs: &[(String, S
 }
 
 // ---------------------------------------------------------------------------
+// Hermes 渠道配置 — 读写 ~/.hermes/config.yaml 的 platforms.<platform>，
+// 并同步 Hermes 运行时仍会读取的 .env 变量。
+// ---------------------------------------------------------------------------
+
+const HERMES_CHANNEL_PLATFORMS: [&str; 10] = [
+    "telegram",
+    "discord",
+    "slack",
+    "feishu",
+    "dingtalk",
+    "teams",
+    "google_chat",
+    "irc",
+    "line",
+    "simplex",
+];
+
+const HERMES_DISPLAY_TOOL_PROGRESS_VALUES: [&str; 4] = ["off", "new", "all", "verbose"];
+const HERMES_DISPLAY_STREAMING_VALUES: [&str; 3] = ["inherit", "true", "false"];
+const HERMES_TELEGRAM_REPLY_TO_MODE_VALUES: [&str; 3] = ["off", "first", "all"];
+const HERMES_PROMPT_CACHE_TTLS: [&str; 2] = ["5m", "1h"];
+const HERMES_PROVIDER_ROUTING_SORTS: [&str; 3] = ["price", "throughput", "latency"];
+const HERMES_PROVIDER_ROUTING_DATA_COLLECTION: [&str; 2] = ["allow", "deny"];
+const HERMES_AUXILIARY_PROVIDERS: [&str; 7] = [
+    "auto",
+    "openrouter",
+    "nous",
+    "gemini",
+    "ollama-cloud",
+    "codex",
+    "main",
+];
+
+fn normalize_hermes_channel_platform(platform: &str) -> Option<&'static str> {
+    let platform = platform.trim().to_ascii_lowercase();
+    HERMES_CHANNEL_PLATFORMS
+        .iter()
+        .copied()
+        .find(|item| *item == platform)
+}
+
+fn normalize_hermes_display_tool_progress(
+    value: Option<String>,
+    strict: bool,
+    key: &str,
+) -> Result<String, String> {
+    let progress = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let progress = if progress.is_empty() {
+        "all".to_string()
+    } else {
+        progress
+    };
+    if HERMES_DISPLAY_TOOL_PROGRESS_VALUES.contains(&progress.as_str()) {
+        Ok(progress)
+    } else if strict {
+        Err(format!("{key} 必须是 off、new、all 或 verbose"))
+    } else {
+        Ok("all".to_string())
+    }
+}
+
+fn normalize_hermes_display_tool_prefix(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let prefix = value.unwrap_or_default().trim().to_string();
+    let prefix = if prefix.is_empty() {
+        "┊".to_string()
+    } else {
+        prefix
+    };
+    if prefix.chars().count() <= 8 && !prefix.contains(['\r', '\n', '\t']) {
+        Ok(prefix)
+    } else if strict {
+        Err("display.tool_prefix 必须是 1 到 8 个字符，且不能包含换行或制表符".to_string())
+    } else {
+        Ok("┊".to_string())
+    }
+}
+
+fn normalize_hermes_display_streaming_text(
+    value: Option<String>,
+    strict: bool,
+    key: &str,
+) -> Result<String, String> {
+    let streaming = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let streaming = if streaming.is_empty() {
+        "inherit".to_string()
+    } else {
+        streaming
+    };
+    if HERMES_DISPLAY_STREAMING_VALUES.contains(&streaming.as_str()) {
+        Ok(streaming)
+    } else if strict {
+        Err(format!("{key} 必须是 inherit、true 或 false"))
+    } else {
+        Ok("inherit".to_string())
+    }
+}
+
+fn normalize_hermes_telegram_reply_to_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "first".to_string()
+    } else {
+        mode
+    };
+    if HERMES_TELEGRAM_REPLY_TO_MODE_VALUES.contains(&mode.as_str()) {
+        Ok(mode)
+    } else if strict {
+        Err("platforms.telegram.extra.reply_to_mode 必须是 off、first 或 all".to_string())
+    } else {
+        Ok("first".to_string())
+    }
+}
+
+fn normalize_hermes_display_streaming_yaml(
+    value: Option<&serde_yaml::Value>,
+    strict: bool,
+    key: &str,
+) -> Result<String, String> {
+    if let Some(value) = value {
+        if let Some(value) = value.as_bool() {
+            return Ok(if value { "true" } else { "false" }.to_string());
+        }
+        if let Some(value) = value.as_str() {
+            return normalize_hermes_display_streaming_text(Some(value.to_string()), strict, key);
+        }
+    }
+    normalize_hermes_display_streaming_text(None, strict, key)
+}
+
+fn normalize_hermes_display_streaming_json(
+    value: Option<&Value>,
+    strict: bool,
+    key: &str,
+) -> Result<String, String> {
+    if let Some(value) = value {
+        if let Some(value) = value.as_bool() {
+            return Ok(if value { "true" } else { "false" }.to_string());
+        }
+        if let Some(value) = value.as_str() {
+            return normalize_hermes_display_streaming_text(Some(value.to_string()), strict, key);
+        }
+    }
+    normalize_hermes_display_streaming_text(None, strict, key)
+}
+
+fn normalize_hermes_prompt_cache_ttl(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let ttl = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let ttl = if ttl.is_empty() {
+        "5m".to_string()
+    } else {
+        ttl
+    };
+    if HERMES_PROMPT_CACHE_TTLS.contains(&ttl.as_str()) {
+        Ok(ttl)
+    } else if strict {
+        Err("prompt_caching.cache_ttl 必须是 5m 或 1h".to_string())
+    } else {
+        Ok("5m".to_string())
+    }
+}
+
+fn normalize_hermes_provider_routing_sort(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let sort = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let sort = if sort.is_empty() {
+        "price".to_string()
+    } else {
+        sort
+    };
+    if HERMES_PROVIDER_ROUTING_SORTS.contains(&sort.as_str()) {
+        Ok(sort)
+    } else if strict {
+        Err("provider_routing.sort 必须是 price、throughput 或 latency".to_string())
+    } else {
+        Ok("price".to_string())
+    }
+}
+
+fn normalize_hermes_provider_routing_data_collection(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let data_collection = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let data_collection = if data_collection.is_empty() {
+        "allow".to_string()
+    } else {
+        data_collection
+    };
+    if HERMES_PROVIDER_ROUTING_DATA_COLLECTION.contains(&data_collection.as_str()) {
+        Ok(data_collection)
+    } else if strict {
+        Err("provider_routing.data_collection 必须是 allow 或 deny".to_string())
+    } else {
+        Ok("allow".to_string())
+    }
+}
+
+fn normalize_hermes_provider_routing_list(
+    raw: Option<String>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for item in normalize_hermes_multiline_list(raw) {
+        let provider = item.trim().to_ascii_lowercase();
+        if provider.is_empty() {
+            continue;
+        }
+        if !provider
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(format!("{key} 只能包含 provider slug，每行一个"));
+        }
+        if !values.contains(&provider) {
+            values.push(provider);
+        }
+    }
+    Ok(values)
+}
+
+fn normalize_hermes_env_name_list(raw: Option<String>, key: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for item in normalize_hermes_multiline_list(raw) {
+        let name = item.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let mut chars = name.chars();
+        let valid_first = chars
+            .next()
+            .map(|ch| ch.is_ascii_alphabetic() || ch == '_')
+            .unwrap_or(false);
+        let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if !valid_first || !valid_rest {
+            return Err(format!(
+                "{key} 只能填写环境变量名，每行一个，例如 GITHUB_TOKEN"
+            ));
+        }
+        if !values.contains(&name) {
+            values.push(name);
+        }
+    }
+    Ok(values)
+}
+
+fn normalize_hermes_shell_init_file_list(
+    raw: Option<String>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for item in normalize_hermes_multiline_list(raw) {
+        let path = item.trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        if path.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+            return Err(format!(
+                "{key} 每行只能填写一个 shell 初始化文件路径，路径不能包含空白字符"
+            ));
+        }
+        if !path.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '~' | '$' | '%' | '{' | '}' | '_' | '.' | '/' | '\\' | ':' | '-'
+                )
+        }) {
+            return Err(format!(
+                "{key} 只能包含路径字符、~、环境变量占位、点、斜杠、冒号和短横线"
+            ));
+        }
+        if !values.contains(&path) {
+            values.push(path);
+        }
+    }
+    Ok(values)
+}
+
+fn validate_hermes_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let valid_first = chars
+        .next()
+        .map(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        .unwrap_or(false);
+    valid_first && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn normalize_hermes_docker_env_json(
+    raw: Option<String>,
+    key: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| format!("{key} JSON 格式错误: {err}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{key} 必须是 JSON object"))?;
+    let mut normalized = serde_json::Map::new();
+    for (name, raw_value) in object {
+        if !validate_hermes_env_name(name) {
+            return Err(format!("{key} 只能使用合法环境变量名作为 key"));
+        }
+        let value = if let Some(value) = raw_value.as_str() {
+            value.to_string()
+        } else if let Some(value) = raw_value.as_i64() {
+            value.to_string()
+        } else if let Some(value) = raw_value.as_u64() {
+            value.to_string()
+        } else if let Some(value) = raw_value.as_f64() {
+            if value.is_finite() {
+                value.to_string()
+            } else {
+                return Err(format!("{key}.{name} 只能是字符串、数字或布尔值"));
+            }
+        } else if let Some(value) = raw_value.as_bool() {
+            value.to_string()
+        } else {
+            return Err(format!("{key}.{name} 只能是字符串、数字或布尔值"));
+        };
+        normalized.insert(name.to_string(), Value::String(value));
+    }
+    Ok(normalized)
+}
+
+fn normalize_hermes_docker_volume_list(
+    raw: Option<String>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for item in normalize_hermes_multiline_list(raw) {
+        let volume = item.trim().to_string();
+        if !volume.contains(':')
+            || volume
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            return Err(format!(
+                "{key} 每行一个 Docker volume 映射，例如 /host/path:/container/path"
+            ));
+        }
+        if !values.contains(&volume) {
+            values.push(volume);
+        }
+    }
+    Ok(values)
+}
+
+fn normalize_hermes_docker_extra_args_list(
+    raw: Option<String>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for item in normalize_hermes_multiline_list(raw) {
+        let arg = item.trim().to_string();
+        if !arg.starts_with('-') || arg.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+            return Err(format!(
+                "{key} 每行一个 Docker 参数，必须以 - 开头，例如 --network=host"
+            ));
+        }
+        if !values.contains(&arg) {
+            values.push(arg);
+        }
+    }
+    Ok(values)
+}
+
+fn normalize_hermes_auxiliary_provider(
+    value: Option<String>,
+    key: &str,
+    strict: bool,
+) -> Result<String, String> {
+    let provider = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let provider = if provider.is_empty() {
+        "auto".to_string()
+    } else {
+        provider
+    };
+    if HERMES_AUXILIARY_PROVIDERS.contains(&provider.as_str()) {
+        Ok(provider)
+    } else if strict {
+        Err(format!(
+            "{key} 必须是 auto、openrouter、nous、gemini、ollama-cloud、codex 或 main"
+        ))
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_auxiliary_model(
+    value: Option<String>,
+    key: &str,
+    strict: bool,
+) -> Result<String, String> {
+    let model = value.unwrap_or_default().trim().to_string();
+    if model.is_empty() {
+        return Ok(String::new());
+    }
+    if !model.split('/').any(|part| part == "..")
+        && model.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '@' | '+' | '-')
+        })
+    {
+        Ok(model)
+    } else if strict {
+        Err(format!(
+            "{key} 只能包含字母、数字、下划线、点、斜杠、冒号、@、加号和短横线"
+        ))
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn yaml_key(key: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(key.to_string())
+}
+
+fn yaml_get<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    map.get(yaml_key(key))
+}
+
+fn yaml_get_mapping<'a>(
+    map: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Mapping> {
+    yaml_get(map, key).and_then(|v| v.as_mapping())
+}
+
+fn yaml_string_field(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    yaml_get(map, key)
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+}
+
+fn set_optional_yaml_string(map: &mut serde_yaml::Mapping, key: &str, value: String) {
+    if value.is_empty() {
+        map.remove(yaml_key(key));
+    } else {
+        map.insert(yaml_key(key), serde_yaml::Value::String(value));
+    }
+}
+
+fn normalize_hermes_camofox_identity(value: Option<String>, key: &str) -> Result<String, String> {
+    let text = value.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    if text
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '@' | '+' | '-'))
+    {
+        Ok(text)
+    } else {
+        Err(format!(
+            "{key} 只能包含字母、数字、下划线、点、冒号、@、加号和短横线"
+        ))
+    }
+}
+
+fn yaml_string_sequence_field(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    yaml_get(map, key)
+        .and_then(|value| value.as_sequence())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn yaml_docker_env_json_field(map: Option<&serde_yaml::Mapping>, key: &str) -> String {
+    let Some(env_map) = map
+        .and_then(|map| yaml_get(map, key))
+        .and_then(|value| value.as_mapping())
+    else {
+        return "{}".to_string();
+    };
+    let mut lines = Vec::new();
+    for (raw_key, raw_value) in env_map {
+        let Some(name) = raw_key.as_str() else {
+            continue;
+        };
+        if !validate_hermes_env_name(name) {
+            continue;
+        }
+        let value = if let Some(value) = raw_value.as_str() {
+            value.to_string()
+        } else if let Some(value) = raw_value.as_i64() {
+            value.to_string()
+        } else if let Some(value) = raw_value.as_u64() {
+            value.to_string()
+        } else if let Some(value) = raw_value.as_f64() {
+            if value.is_finite() {
+                value.to_string()
+            } else {
+                continue;
+            }
+        } else if let Some(value) = raw_value.as_bool() {
+            value.to_string()
+        } else {
+            continue;
+        };
+        let encoded_name = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+        let encoded_value = serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string());
+        lines.push(format!("  {encoded_name}: {encoded_value}"));
+    }
+    if lines.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{\n{}\n}}", lines.join(",\n"))
+    }
+}
+
+fn yaml_scalar_string_field(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    let value = yaml_get(map, key)?;
+    if let Some(value) = value.as_str() {
+        Some(value.to_string())
+    } else if let Some(value) = value.as_i64() {
+        Some(value.to_string())
+    } else if let Some(value) = value.as_u64() {
+        Some(value.to_string())
+    } else {
+        value.as_f64().map(|value| {
+            if value.fract() == 0.0 {
+                format!("{value:.0}")
+            } else {
+                value.to_string()
+            }
+        })
+    }
+}
+
+fn yaml_bool_field(map: &serde_yaml::Mapping, key: &str) -> Option<bool> {
+    yaml_get(map, key).and_then(|v| v.as_bool())
+}
+
+fn yaml_csv_field(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    let value = yaml_get(map, key)?;
+    if let Some(items) = value.as_sequence() {
+        let joined = items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::trim))
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    } else {
+        value
+            .as_str()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+}
+
+fn insert_json_string_if_present(
+    form: &mut serde_json::Map<String, Value>,
+    source: &serde_yaml::Mapping,
+    yaml_key: &str,
+    json_key: &str,
+) {
+    if let Some(value) = yaml_string_field(source, yaml_key) {
+        form.insert(json_key.to_string(), Value::String(value));
+    }
+}
+
+fn insert_json_scalar_string_if_present(
+    form: &mut serde_json::Map<String, Value>,
+    source: &serde_yaml::Mapping,
+    yaml_key: &str,
+    json_key: &str,
+) {
+    if let Some(value) = yaml_scalar_string_field(source, yaml_key) {
+        form.insert(json_key.to_string(), Value::String(value));
+    }
+}
+
+fn insert_json_bool_if_present(
+    form: &mut serde_json::Map<String, Value>,
+    source: &serde_yaml::Mapping,
+    yaml_key: &str,
+    json_key: &str,
+) {
+    if let Some(value) = yaml_bool_field(source, yaml_key) {
+        form.insert(json_key.to_string(), Value::Bool(value));
+    }
+}
+
+fn insert_json_csv_if_present(
+    form: &mut serde_json::Map<String, Value>,
+    source: &serde_yaml::Mapping,
+    yaml_key: &str,
+    json_key: &str,
+) {
+    if let Some(value) = yaml_csv_field(source, yaml_key) {
+        form.insert(json_key.to_string(), Value::String(value));
+    }
+}
+
+fn hermes_env_value(
+    env_values: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    env_values
+        .get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_hermes_channel_env_values() -> std::collections::HashMap<String, String> {
+    let env_path = hermes_home().join(".env");
+    let raw = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let mut values = std::collections::HashMap::new();
+    for (key, value, _) in parse_env_file_lines(&raw) {
+        values.entry(key).or_insert(value);
+    }
+    values
+}
+
+fn json_form_string(form: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    form.get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn put_json_string_from_env(
+    form: &mut serde_json::Map<String, Value>,
+    env_values: &std::collections::HashMap<String, String>,
+    env_key: &str,
+    json_key: &str,
+) {
+    if let Some(value) = hermes_env_value(env_values, env_key) {
+        form.insert(json_key.to_string(), Value::String(value));
+    }
+}
+
+fn put_json_bool_from_env(
+    form: &mut serde_json::Map<String, Value>,
+    env_values: &std::collections::HashMap<String, String>,
+    env_key: &str,
+    json_key: &str,
+) {
+    if let Some(value) = hermes_env_value(env_values, env_key) {
+        let enabled = matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        );
+        form.insert(json_key.to_string(), Value::Bool(enabled));
+    }
+}
+
+fn insert_hermes_home_channel_if_present(
+    form: &mut serde_json::Map<String, Value>,
+    entry: &serde_yaml::Mapping,
+) {
+    let Some(home) = yaml_get_mapping(entry, "home_channel") else {
+        return;
+    };
+    if let Some(value) = yaml_string_field(home, "chat_id") {
+        form.insert("homeChannel".to_string(), Value::String(value));
+    }
+    if let Some(value) = yaml_string_field(home, "name") {
+        form.insert("homeChannelName".to_string(), Value::String(value));
+    }
+}
+
+fn insert_hermes_channel_display_fields(
+    form: &mut serde_json::Map<String, Value>,
+    config: &serde_yaml::Value,
+    platform: &str,
+) {
+    let display = config
+        .as_mapping()
+        .and_then(|map| yaml_get_mapping(map, "display"));
+    let platform_display = display
+        .and_then(|map| yaml_get_mapping(map, "platforms"))
+        .and_then(|map| yaml_get_mapping(map, platform));
+    let legacy_tool_progress = display
+        .and_then(|map| yaml_get_mapping(map, "tool_progress_overrides"))
+        .and_then(|map| yaml_string_field(map, platform));
+    let tool_progress = normalize_hermes_display_tool_progress(
+        platform_display
+            .and_then(|map| yaml_string_field(map, "tool_progress"))
+            .or(legacy_tool_progress)
+            .or_else(|| display.and_then(|map| yaml_string_field(map, "tool_progress"))),
+        false,
+        "display.tool_progress",
+    )
+    .unwrap_or_else(|_| "all".to_string());
+    let show_reasoning = platform_display
+        .and_then(|map| yaml_bool_field(map, "show_reasoning"))
+        .or_else(|| display.and_then(|map| yaml_bool_field(map, "show_reasoning")))
+        .unwrap_or(false);
+    let tool_preview_length = bounded_hermes_i64(
+        platform_display
+            .and_then(|map| yaml_i64_field(map, "tool_preview_length"))
+            .or_else(|| display.and_then(|map| yaml_i64_field(map, "tool_preview_length"))),
+        0,
+        0,
+        200000,
+    );
+    let streaming = if let Some(platform_display) = platform_display {
+        if let Some(value) = yaml_get(platform_display, "streaming") {
+            normalize_hermes_display_streaming_yaml(
+                Some(value),
+                false,
+                "display.platforms.streaming",
+            )
+            .unwrap_or_else(|_| "inherit".to_string())
+        } else {
+            "inherit".to_string()
+        }
+    } else {
+        "inherit".to_string()
+    };
+    let cleanup_progress = platform_display
+        .and_then(|map| yaml_bool_field(map, "cleanup_progress"))
+        .or_else(|| display.and_then(|map| yaml_bool_field(map, "cleanup_progress")))
+        .unwrap_or(false);
+
+    form.insert(
+        "displayToolProgress".to_string(),
+        Value::String(tool_progress),
+    );
+    form.insert(
+        "displayShowReasoning".to_string(),
+        Value::Bool(show_reasoning),
+    );
+    form.insert(
+        "displayToolPreviewLength".to_string(),
+        Value::Number(tool_preview_length.into()),
+    );
+    form.insert("displayStreaming".to_string(), Value::String(streaming));
+    form.insert(
+        "displayCleanupProgress".to_string(),
+        Value::Bool(cleanup_progress),
+    );
+}
+
+fn build_hermes_channel_config_values(
+    config: &serde_yaml::Value,
+    env_values: &std::collections::HashMap<String, String>,
+) -> Value {
+    let mut values = serde_json::Map::new();
+    let root = config.as_mapping();
+    let platforms = root.and_then(|map| yaml_get_mapping(map, "platforms"));
+
+    for platform in HERMES_CHANNEL_PLATFORMS {
+        let entry = platforms
+            .and_then(|map| yaml_get_mapping(map, platform))
+            .cloned()
+            .unwrap_or_default();
+        let extra = yaml_get_mapping(&entry, "extra")
+            .cloned()
+            .unwrap_or_default();
+        let mut form = serde_json::Map::new();
+        form.insert(
+            "enabled".to_string(),
+            Value::Bool(yaml_bool_field(&entry, "enabled").unwrap_or(false)),
+        );
+
+        match platform {
+            "telegram" => {
+                let token = hermes_env_value(env_values, "TELEGRAM_BOT_TOKEN")
+                    .or_else(|| yaml_string_field(&entry, "token"))
+                    .unwrap_or_default();
+                form.insert("botToken".to_string(), Value::String(token));
+                let reply_to_mode = normalize_hermes_telegram_reply_to_mode(
+                    hermes_env_value(env_values, "TELEGRAM_REPLY_TO_MODE")
+                        .or_else(|| yaml_string_field(&extra, "reply_to_mode")),
+                    false,
+                )
+                .unwrap_or_else(|_| "first".to_string());
+                form.insert("replyToMode".to_string(), Value::String(reply_to_mode));
+                insert_json_bool_if_present(&mut form, &extra, "guest_mode", "guestMode");
+                insert_json_bool_if_present(
+                    &mut form,
+                    &extra,
+                    "disable_link_previews",
+                    "disableLinkPreviews",
+                );
+                put_json_bool_from_env(&mut form, env_values, "TELEGRAM_GUEST_MODE", "guestMode");
+                put_json_bool_from_env(
+                    &mut form,
+                    env_values,
+                    "TELEGRAM_DISABLE_LINK_PREVIEWS",
+                    "disableLinkPreviews",
+                );
+            }
+            "discord" => {
+                let token = hermes_env_value(env_values, "DISCORD_BOT_TOKEN")
+                    .or_else(|| yaml_string_field(&entry, "token"))
+                    .unwrap_or_default();
+                form.insert("token".to_string(), Value::String(token));
+                for (yaml_key_name, json_key_name, env_key_name) in [
+                    (
+                        "free_response_channels",
+                        "freeResponseChannels",
+                        "DISCORD_FREE_RESPONSE_CHANNELS",
+                    ),
+                    (
+                        "allowed_channels",
+                        "allowedChannels",
+                        "DISCORD_ALLOWED_CHANNELS",
+                    ),
+                    (
+                        "ignored_channels",
+                        "ignoredChannels",
+                        "DISCORD_IGNORED_CHANNELS",
+                    ),
+                    (
+                        "no_thread_channels",
+                        "noThreadChannels",
+                        "DISCORD_NO_THREAD_CHANNELS",
+                    ),
+                ] {
+                    insert_json_csv_if_present(&mut form, &extra, yaml_key_name, json_key_name);
+                    put_json_string_from_env(&mut form, env_values, env_key_name, json_key_name);
+                }
+                for (yaml_key_name, json_key_name, env_key_name) in [
+                    ("auto_thread", "autoThread", "DISCORD_AUTO_THREAD"),
+                    ("reactions", "reactions", "DISCORD_REACTIONS"),
+                    (
+                        "thread_require_mention",
+                        "threadRequireMention",
+                        "DISCORD_THREAD_REQUIRE_MENTION",
+                    ),
+                    (
+                        "history_backfill",
+                        "historyBackfill",
+                        "DISCORD_HISTORY_BACKFILL",
+                    ),
+                ] {
+                    insert_json_bool_if_present(&mut form, &extra, yaml_key_name, json_key_name);
+                    put_json_bool_from_env(&mut form, env_values, env_key_name, json_key_name);
+                }
+                insert_json_string_if_present(
+                    &mut form,
+                    &extra,
+                    "history_backfill_limit",
+                    "historyBackfillLimit",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "DISCORD_HISTORY_BACKFILL_LIMIT",
+                    "historyBackfillLimit",
+                );
+                insert_json_string_if_present(&mut form, &extra, "reply_to_mode", "replyToMode");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "DISCORD_REPLY_TO_MODE",
+                    "replyToMode",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "DISCORD_HOME_CHANNEL",
+                    "homeChannel",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "DISCORD_HOME_CHANNEL_NAME",
+                    "homeChannelName",
+                );
+            }
+            "slack" => {
+                let bot_token = hermes_env_value(env_values, "SLACK_BOT_TOKEN")
+                    .or_else(|| yaml_string_field(&entry, "token"))
+                    .unwrap_or_default();
+                form.insert("botToken".to_string(), Value::String(bot_token));
+                insert_json_string_if_present(&mut form, &extra, "app_token", "appToken");
+                let app_token = hermes_env_value(env_values, "SLACK_APP_TOKEN")
+                    .or_else(|| json_form_string(&form, "appToken"))
+                    .unwrap_or_default();
+                form.insert("appToken".to_string(), Value::String(app_token));
+                insert_json_string_if_present(&mut form, &extra, "signing_secret", "signingSecret");
+                insert_json_string_if_present(&mut form, &extra, "webhook_path", "webhookPath");
+            }
+            "feishu" => {
+                insert_json_string_if_present(&mut form, &extra, "app_id", "appId");
+                insert_json_string_if_present(&mut form, &extra, "app_secret", "appSecret");
+                insert_json_string_if_present(&mut form, &extra, "domain", "domain");
+                insert_json_string_if_present(
+                    &mut form,
+                    &extra,
+                    "connection_mode",
+                    "connectionMode",
+                );
+                insert_json_string_if_present(&mut form, &extra, "webhook_path", "webhookPath");
+                insert_json_string_if_present(
+                    &mut form,
+                    &extra,
+                    "reaction_notifications",
+                    "reactionNotifications",
+                );
+                put_json_string_from_env(&mut form, env_values, "FEISHU_APP_ID", "appId");
+                put_json_string_from_env(&mut form, env_values, "FEISHU_APP_SECRET", "appSecret");
+                put_json_string_from_env(&mut form, env_values, "FEISHU_DOMAIN", "domain");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "FEISHU_CONNECTION_MODE",
+                    "connectionMode",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "FEISHU_WEBHOOK_PATH",
+                    "webhookPath",
+                );
+                insert_json_bool_if_present(
+                    &mut form,
+                    &extra,
+                    "typing_indicator",
+                    "typingIndicator",
+                );
+                insert_json_bool_if_present(
+                    &mut form,
+                    &extra,
+                    "resolve_sender_names",
+                    "resolveSenderNames",
+                );
+            }
+            "dingtalk" => {
+                insert_json_string_if_present(&mut form, &extra, "client_id", "clientId");
+                insert_json_string_if_present(&mut form, &extra, "client_secret", "clientSecret");
+                put_json_string_from_env(&mut form, env_values, "DINGTALK_CLIENT_ID", "clientId");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "DINGTALK_CLIENT_SECRET",
+                    "clientSecret",
+                );
+            }
+            "teams" => {
+                for (yaml_key_name, json_key_name) in [
+                    ("client_id", "clientId"),
+                    ("client_secret", "clientSecret"),
+                    ("tenant_id", "tenantId"),
+                    ("service_url", "serviceUrl"),
+                ] {
+                    insert_json_string_if_present(&mut form, &extra, yaml_key_name, json_key_name);
+                }
+                insert_json_scalar_string_if_present(&mut form, &extra, "port", "port");
+                insert_hermes_home_channel_if_present(&mut form, &entry);
+                put_json_string_from_env(&mut form, env_values, "TEAMS_CLIENT_ID", "clientId");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "TEAMS_CLIENT_SECRET",
+                    "clientSecret",
+                );
+                put_json_string_from_env(&mut form, env_values, "TEAMS_TENANT_ID", "tenantId");
+                put_json_string_from_env(&mut form, env_values, "TEAMS_PORT", "port");
+                put_json_string_from_env(&mut form, env_values, "TEAMS_SERVICE_URL", "serviceUrl");
+                put_json_string_from_env(&mut form, env_values, "TEAMS_ALLOWED_USERS", "allowFrom");
+                put_json_bool_from_env(
+                    &mut form,
+                    env_values,
+                    "TEAMS_ALLOW_ALL_USERS",
+                    "allowAllUsers",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "TEAMS_HOME_CHANNEL",
+                    "homeChannel",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "TEAMS_HOME_CHANNEL_NAME",
+                    "homeChannelName",
+                );
+            }
+            "google_chat" => {
+                for (yaml_key_name, json_key_name) in [
+                    ("project_id", "projectId"),
+                    ("subscription_name", "subscriptionName"),
+                    ("service_account_json", "serviceAccountJson"),
+                ] {
+                    insert_json_string_if_present(&mut form, &extra, yaml_key_name, json_key_name);
+                }
+                insert_hermes_home_channel_if_present(&mut form, &entry);
+                if let Some(value) = hermes_env_value(env_values, "GOOGLE_CHAT_PROJECT_ID")
+                    .or_else(|| hermes_env_value(env_values, "GOOGLE_CLOUD_PROJECT"))
+                {
+                    form.insert("projectId".to_string(), Value::String(value));
+                }
+                if let Some(value) = hermes_env_value(env_values, "GOOGLE_CHAT_SUBSCRIPTION_NAME")
+                    .or_else(|| hermes_env_value(env_values, "GOOGLE_CHAT_SUBSCRIPTION"))
+                {
+                    form.insert("subscriptionName".to_string(), Value::String(value));
+                }
+                if let Some(value) =
+                    hermes_env_value(env_values, "GOOGLE_CHAT_SERVICE_ACCOUNT_JSON")
+                        .or_else(|| hermes_env_value(env_values, "GOOGLE_APPLICATION_CREDENTIALS"))
+                {
+                    form.insert("serviceAccountJson".to_string(), Value::String(value));
+                }
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "GOOGLE_CHAT_ALLOWED_USERS",
+                    "allowFrom",
+                );
+                put_json_bool_from_env(
+                    &mut form,
+                    env_values,
+                    "GOOGLE_CHAT_ALLOW_ALL_USERS",
+                    "allowAllUsers",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "GOOGLE_CHAT_HOME_CHANNEL",
+                    "homeChannel",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "GOOGLE_CHAT_HOME_CHANNEL_NAME",
+                    "homeChannelName",
+                );
+            }
+            "irc" => {
+                for (yaml_key_name, json_key_name) in [
+                    ("server", "server"),
+                    ("channel", "channel"),
+                    ("nickname", "nickname"),
+                    ("server_password", "serverPassword"),
+                    ("nickserv_password", "nickservPassword"),
+                ] {
+                    insert_json_string_if_present(&mut form, &extra, yaml_key_name, json_key_name);
+                }
+                insert_json_scalar_string_if_present(&mut form, &extra, "port", "port");
+                insert_json_bool_if_present(&mut form, &extra, "use_tls", "useTls");
+                insert_json_csv_if_present(&mut form, &extra, "allowed_users", "allowFrom");
+                insert_hermes_home_channel_if_present(&mut form, &entry);
+                put_json_string_from_env(&mut form, env_values, "IRC_SERVER", "server");
+                put_json_string_from_env(&mut form, env_values, "IRC_CHANNEL", "channel");
+                put_json_string_from_env(&mut form, env_values, "IRC_NICKNAME", "nickname");
+                put_json_string_from_env(&mut form, env_values, "IRC_PORT", "port");
+                put_json_bool_from_env(&mut form, env_values, "IRC_USE_TLS", "useTls");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "IRC_SERVER_PASSWORD",
+                    "serverPassword",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "IRC_NICKSERV_PASSWORD",
+                    "nickservPassword",
+                );
+                put_json_string_from_env(&mut form, env_values, "IRC_ALLOWED_USERS", "allowFrom");
+                put_json_bool_from_env(
+                    &mut form,
+                    env_values,
+                    "IRC_ALLOW_ALL_USERS",
+                    "allowAllUsers",
+                );
+                put_json_string_from_env(&mut form, env_values, "IRC_HOME_CHANNEL", "homeChannel");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "IRC_HOME_CHANNEL_NAME",
+                    "homeChannelName",
+                );
+            }
+            "line" => {
+                for (yaml_key_name, json_key_name) in [
+                    ("channel_access_token", "channelAccessToken"),
+                    ("channel_secret", "channelSecret"),
+                    ("host", "host"),
+                    ("public_url", "publicUrl"),
+                    ("slow_response_threshold", "slowResponseThreshold"),
+                ] {
+                    insert_json_string_if_present(&mut form, &extra, yaml_key_name, json_key_name);
+                }
+                insert_json_scalar_string_if_present(&mut form, &extra, "port", "port");
+                insert_json_csv_if_present(&mut form, &extra, "allowed_users", "allowFrom");
+                insert_json_csv_if_present(&mut form, &extra, "allowed_groups", "allowedGroups");
+                insert_json_csv_if_present(&mut form, &extra, "allowed_rooms", "allowedRooms");
+                insert_hermes_home_channel_if_present(&mut form, &entry);
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "LINE_CHANNEL_ACCESS_TOKEN",
+                    "channelAccessToken",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "LINE_CHANNEL_SECRET",
+                    "channelSecret",
+                );
+                put_json_string_from_env(&mut form, env_values, "LINE_PORT", "port");
+                put_json_string_from_env(&mut form, env_values, "LINE_HOST", "host");
+                put_json_string_from_env(&mut form, env_values, "LINE_PUBLIC_URL", "publicUrl");
+                put_json_string_from_env(&mut form, env_values, "LINE_ALLOWED_USERS", "allowFrom");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "LINE_ALLOWED_GROUPS",
+                    "allowedGroups",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "LINE_ALLOWED_ROOMS",
+                    "allowedRooms",
+                );
+                put_json_bool_from_env(
+                    &mut form,
+                    env_values,
+                    "LINE_ALLOW_ALL_USERS",
+                    "allowAllUsers",
+                );
+                put_json_string_from_env(&mut form, env_values, "LINE_HOME_CHANNEL", "homeChannel");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "LINE_SLOW_RESPONSE_THRESHOLD",
+                    "slowResponseThreshold",
+                );
+            }
+            "simplex" => {
+                insert_json_string_if_present(&mut form, &extra, "ws_url", "wsUrl");
+                insert_json_csv_if_present(&mut form, &extra, "allowed_users", "allowFrom");
+                insert_hermes_home_channel_if_present(&mut form, &entry);
+                put_json_string_from_env(&mut form, env_values, "SIMPLEX_WS_URL", "wsUrl");
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "SIMPLEX_ALLOWED_USERS",
+                    "allowFrom",
+                );
+                put_json_bool_from_env(
+                    &mut form,
+                    env_values,
+                    "SIMPLEX_ALLOW_ALL_USERS",
+                    "allowAllUsers",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "SIMPLEX_HOME_CHANNEL",
+                    "homeChannel",
+                );
+                put_json_string_from_env(
+                    &mut form,
+                    env_values,
+                    "SIMPLEX_HOME_CHANNEL_NAME",
+                    "homeChannelName",
+                );
+            }
+            _ => {}
+        }
+
+        insert_json_string_if_present(&mut form, &extra, "dm_policy", "dmPolicy");
+        insert_json_string_if_present(&mut form, &extra, "group_policy", "groupPolicy");
+        insert_json_bool_if_present(&mut form, &extra, "require_mention", "requireMention");
+        if platform == "dingtalk" {
+            insert_json_csv_if_present(&mut form, &extra, "allowed_users", "allowFrom");
+            insert_json_csv_if_present(&mut form, &extra, "allowed_chats", "groupAllowFrom");
+        } else if ["irc", "line", "simplex"].contains(&platform) {
+            insert_json_csv_if_present(&mut form, &extra, "allowed_users", "allowFrom");
+        } else {
+            insert_json_csv_if_present(&mut form, &extra, "allow_from", "allowFrom");
+            insert_json_csv_if_present(&mut form, &extra, "group_allow_from", "groupAllowFrom");
+        }
+        insert_hermes_channel_display_fields(&mut form, config, platform);
+        values.insert(platform.to_string(), Value::Object(form));
+    }
+
+    Value::Object(values)
+}
+
+fn ensure_yaml_object(value: &mut serde_yaml::Value) -> Result<&mut serde_yaml::Mapping, String> {
+    if value.is_null() {
+        *value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    value
+        .as_mapping_mut()
+        .ok_or_else(|| "config.yaml 顶层必须是对象".to_string())
+}
+
+fn yaml_child_object<'a>(
+    parent: &'a mut serde_yaml::Mapping,
+    key: &str,
+) -> Result<&'a mut serde_yaml::Mapping, String> {
+    let key_value = yaml_key(key);
+    if !parent
+        .get(&key_value)
+        .map(|value| value.is_mapping())
+        .unwrap_or(false)
+    {
+        parent.insert(
+            key_value.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+    parent
+        .get_mut(&key_value)
+        .and_then(|value| value.as_mapping_mut())
+        .ok_or_else(|| format!("{key} 必须是对象"))
+}
+
+fn set_extra_string_if_present(entry: &mut serde_yaml::Mapping, key: &str, value: Option<String>) {
+    if let Some(value) = value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        if let Ok(extra) = yaml_child_object(entry, "extra") {
+            extra.insert(yaml_key(key), serde_yaml::Value::String(value));
+        }
+    }
+}
+
+fn set_extra_integer_if_present(entry: &mut serde_yaml::Mapping, key: &str, value: Option<i64>) {
+    if let Some(value) = value {
+        if let Ok(extra) = yaml_child_object(entry, "extra") {
+            extra.insert(yaml_key(key), serde_yaml::Value::Number(value.into()));
+        }
+    }
+}
+
+fn delete_yaml_key(entry: &mut serde_yaml::Mapping, key: &str) {
+    entry.remove(yaml_key(key));
+}
+
+fn delete_extra_key(entry: &mut serde_yaml::Mapping, key: &str) {
+    if let Some(extra) = entry
+        .get_mut(yaml_key("extra"))
+        .and_then(|value| value.as_mapping_mut())
+    {
+        extra.remove(yaml_key(key));
+    }
+}
+
+fn set_extra_bool(entry: &mut serde_yaml::Mapping, key: &str, value: bool) {
+    if let Ok(extra) = yaml_child_object(entry, "extra") {
+        extra.insert(yaml_key(key), serde_yaml::Value::Bool(value));
+    }
+}
+
+fn set_extra_string_array(entry: &mut serde_yaml::Mapping, key: &str, values: Vec<String>) {
+    if let Ok(extra) = yaml_child_object(entry, "extra") {
+        extra.insert(
+            yaml_key(key),
+            serde_yaml::Value::Sequence(
+                values
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+}
+
+fn form_string(form: &Value, key: &str) -> Option<String> {
+    form.get(key)
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+}
+
+fn form_i64(form: &Value, key: &str) -> Option<i64> {
+    let value = form.get(key)?;
+    if let Some(value) = value.as_i64() {
+        Some(value)
+    } else if let Some(value) = value.as_u64() {
+        i64::try_from(value).ok()
+    } else if let Some(value) = value.as_f64() {
+        if value.is_finite() {
+            Some(value as i64)
+        } else {
+            None
+        }
+    } else {
+        value
+            .as_str()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    }
+}
+
+fn form_f64(form: &Value, key: &str) -> Option<f64> {
+    let value = form.get(key)?;
+    if let Some(value) = value.as_f64() {
+        value.is_finite().then_some(value)
+    } else {
+        value
+            .as_str()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+    }
+}
+
+fn form_string_or_default(form: &Value, key: &str, default_value: &str) -> String {
+    form_string(form, key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_value.to_string())
+}
+
+fn form_bool(form: &Value, key: &str) -> Option<bool> {
+    form.get(key).and_then(|value| {
+        if let Some(b) = value.as_bool() {
+            Some(b)
+        } else {
+            value.as_str().map(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "true" | "on" | "1" | "yes"
+                )
+            })
+        }
+    })
+}
+
+fn form_string_array(form: &Value, key: &str) -> Option<Vec<String>> {
+    let value = form.get(key)?;
+    let items = if let Some(values) = value.as_array() {
+        values
+            .iter()
+            .filter_map(|item| item.as_str())
+            .flat_map(split_csv_items)
+            .collect()
+    } else if let Some(value) = value.as_str() {
+        split_csv_items(value)
+    } else {
+        Vec::new()
+    };
+    Some(items)
+}
+
+fn set_hermes_home_channel(entry: &mut serde_yaml::Mapping, form: &Value) {
+    if form.get("homeChannel").is_none() {
+        return;
+    }
+    let chat_id = form_string(form, "homeChannel")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(chat_id) = chat_id else {
+        delete_yaml_key(entry, "home_channel");
+        return;
+    };
+    let name = form_string(form, "homeChannelName")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| chat_id.clone());
+    let mut home = serde_yaml::Mapping::new();
+    home.insert(yaml_key("chat_id"), serde_yaml::Value::String(chat_id));
+    home.insert(yaml_key("name"), serde_yaml::Value::String(name));
+    entry.insert(yaml_key("home_channel"), serde_yaml::Value::Mapping(home));
+}
+
+fn merge_hermes_channel_display_config(
+    root: &mut serde_yaml::Mapping,
+    platform: &str,
+    form: &Value,
+) -> Result<(), String> {
+    let has_display_fields = [
+        "displayToolProgress",
+        "displayShowReasoning",
+        "displayToolPreviewLength",
+        "displayStreaming",
+        "displayCleanupProgress",
+    ]
+    .iter()
+    .any(|key| form.get(*key).is_some());
+    if !has_display_fields {
+        return Ok(());
+    }
+
+    let tool_progress = if form.get("displayToolProgress").is_some() {
+        Some(normalize_hermes_display_tool_progress(
+            form_string(form, "displayToolProgress"),
+            true,
+            &format!("display.platforms.{platform}.tool_progress"),
+        )?)
+    } else {
+        None
+    };
+    let show_reasoning = if form.get("displayShowReasoning").is_some() {
+        Some(form_bool(form, "displayShowReasoning").unwrap_or(false))
+    } else {
+        None
+    };
+    let tool_preview_length = if form.get("displayToolPreviewLength").is_some() {
+        Some(validate_hermes_i64(
+            form_i64(form, "displayToolPreviewLength"),
+            &format!("display.platforms.{platform}.tool_preview_length"),
+            0,
+            0,
+            200000,
+        )?)
+    } else {
+        None
+    };
+    let streaming = if form.get("displayStreaming").is_some() {
+        Some(normalize_hermes_display_streaming_json(
+            form.get("displayStreaming"),
+            true,
+            &format!("display.platforms.{platform}.streaming"),
+        )?)
+    } else {
+        None
+    };
+    let cleanup_progress = if form.get("displayCleanupProgress").is_some() {
+        Some(form_bool(form, "displayCleanupProgress").unwrap_or(false))
+    } else {
+        None
+    };
+
+    let display = yaml_child_object(root, "display")?;
+    let platforms = yaml_child_object(display, "platforms")?;
+    let platform_display = yaml_child_object(platforms, platform)?;
+    if let Some(value) = tool_progress {
+        platform_display.insert(yaml_key("tool_progress"), serde_yaml::Value::String(value));
+    }
+    if let Some(value) = show_reasoning {
+        platform_display.insert(yaml_key("show_reasoning"), serde_yaml::Value::Bool(value));
+    }
+    if let Some(value) = tool_preview_length {
+        platform_display.insert(
+            yaml_key("tool_preview_length"),
+            serde_yaml::Value::Number(value.into()),
+        );
+    }
+    if let Some(value) = streaming {
+        if value == "inherit" {
+            platform_display.remove(yaml_key("streaming"));
+        } else {
+            platform_display.insert(
+                yaml_key("streaming"),
+                serde_yaml::Value::Bool(value == "true"),
+            );
+        }
+    }
+    if let Some(value) = cleanup_progress {
+        platform_display.insert(yaml_key("cleanup_progress"), serde_yaml::Value::Bool(value));
+    }
+    Ok(())
+}
+
+fn split_csv_items(value: &str) -> Vec<String> {
+    value
+        .split([',', ';', '\n'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn normalize_hermes_dm_policy(value: Option<String>) -> String {
+    let value = value.unwrap_or_default().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "pairing" => "pair".to_string(),
+        "allow" => "open".to_string(),
+        "deny" => "disabled".to_string(),
+        "pair" | "open" | "allowlist" | "disabled" => value,
+        _ => "pair".to_string(),
+    }
+}
+
+fn normalize_hermes_group_policy(value: Option<String>) -> String {
+    let value = value.unwrap_or_default().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "all" | "mentioned" => "open".to_string(),
+        "deny" => "disabled".to_string(),
+        "open" | "allowlist" | "disabled" => value,
+        _ => "allowlist".to_string(),
+    }
+}
+
+fn yaml_i64_field(map: &serde_yaml::Mapping, key: &str) -> Option<i64> {
+    let value = yaml_get(map, key)?;
+    if let Some(value) = value.as_i64() {
+        Some(value)
+    } else if let Some(value) = value.as_u64() {
+        i64::try_from(value).ok()
+    } else if let Some(value) = value.as_f64() {
+        if value.is_finite() {
+            Some(value as i64)
+        } else {
+            None
+        }
+    } else {
+        value
+            .as_str()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    }
+}
+
+fn yaml_f64_field(map: &serde_yaml::Mapping, key: &str) -> Option<f64> {
+    let value = yaml_get(map, key)?;
+    if let Some(value) = value.as_f64() {
+        value.is_finite().then_some(value)
+    } else {
+        value
+            .as_str()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+    }
+}
+
+fn bounded_hermes_i64(value: Option<i64>, fallback: i64, min: i64, max: i64) -> i64 {
+    value
+        .filter(|value| *value >= min && *value <= max)
+        .unwrap_or(fallback)
+}
+
+fn bounded_hermes_f64(value: Option<f64>, fallback: f64, min: f64, max: f64) -> f64 {
+    value
+        .filter(|value| value.is_finite() && *value >= min && *value <= max)
+        .unwrap_or(fallback)
+}
+
+fn validate_hermes_i64(
+    value: Option<i64>,
+    key: &str,
+    fallback: i64,
+    min: i64,
+    max: i64,
+) -> Result<i64, String> {
+    let value = value.unwrap_or(fallback);
+    if value < min || value > max {
+        return Err(format!("{key} 必须在 {min}-{max} 范围内"));
+    }
+    Ok(value)
+}
+
+fn validate_hermes_f64(
+    value: Option<f64>,
+    key: &str,
+    fallback: f64,
+    min: f64,
+    max: f64,
+) -> Result<f64, String> {
+    let value = value.unwrap_or(fallback);
+    if !value.is_finite() || value < min || value > max {
+        return Err(format!("{key} 必须在 {min}-{max} 范围内"));
+    }
+    Ok((value * 10_000.0).round() / 10_000.0)
+}
+
+const HERMES_MODEL_CATALOG_DEFAULT_URL: &str =
+    "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json";
+
+fn normalize_hermes_http_url(
+    value: Option<String>,
+    key: &str,
+    fallback: &str,
+    strict: bool,
+) -> Result<String, String> {
+    let raw = value.unwrap_or_default().trim().to_string();
+    if raw.is_empty() {
+        if strict && fallback.is_empty() {
+            return Err(format!("{key} 不能为空"));
+        }
+        return Ok(fallback.to_string());
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Ok(raw);
+    }
+    if strict {
+        return Err(format!("{key} 必须是 http:// 或 https:// URL"));
+    }
+    Ok(fallback.to_string())
+}
+
+fn validate_hermes_model_catalog_providers(
+    value: &Value,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "model_catalog.providers 必须是 JSON object".to_string())?;
+    let mut normalized = serde_json::Map::new();
+    for (provider, raw_entry) in object {
+        if provider.is_empty()
+            || !provider
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(format!(
+                "model_catalog.providers.{provider} 名称只能包含字母、数字、下划线、点和短横线"
+            ));
+        }
+        let mut entry = raw_entry
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("model_catalog.providers.{provider} 必须是 object"))?;
+        if entry.contains_key("url") {
+            let url = normalize_hermes_http_url(
+                entry
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
+                &format!("model_catalog.providers.{provider}.url"),
+                "",
+                true,
+            )?;
+            if url.is_empty() {
+                entry.remove("url");
+            } else {
+                entry.insert("url".to_string(), Value::String(url));
+            }
+        }
+        normalized.insert(provider.to_string(), Value::Object(entry));
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_model_catalog_providers_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|err| format!("model_catalog.providers JSON 格式错误: {err}"))?;
+    validate_hermes_model_catalog_providers(&value)
+}
+
+fn build_hermes_compression_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let compression = root.and_then(|map| yaml_get_mapping(map, "compression"));
+    let enabled = compression
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(true);
+    let threshold = compression
+        .map(|map| bounded_hermes_f64(yaml_f64_field(map, "threshold"), 0.5, 0.1, 0.95))
+        .unwrap_or(0.5);
+    let target_ratio = compression
+        .map(|map| bounded_hermes_f64(yaml_f64_field(map, "target_ratio"), 0.2, 0.1, 0.8))
+        .unwrap_or(0.2);
+    let protect_last_n = compression
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "protect_last_n"), 20, 1, 500))
+        .unwrap_or(20);
+    let protect_first_n = compression
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "protect_first_n"), 3, 0, 100))
+        .unwrap_or(3);
+    let abort_on_summary_failure = compression
+        .and_then(|map| yaml_bool_field(map, "abort_on_summary_failure"))
+        .unwrap_or(false);
+
+    serde_json::json!({
+        "enabled": enabled,
+        "threshold": threshold,
+        "targetRatio": target_ratio,
+        "protectLastN": protect_last_n,
+        "protectFirstN": protect_first_n,
+        "abortOnSummaryFailure": abort_on_summary_failure,
+    })
+}
+
+fn merge_hermes_compression_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_compression_config_values(config);
+    let enabled =
+        form_bool(form, "enabled").unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(true));
+    let threshold = validate_hermes_f64(
+        if form.get("threshold").is_some() {
+            form_f64(form, "threshold")
+        } else {
+            Some(current["threshold"].as_f64().unwrap_or(0.5))
+        },
+        "compression.threshold",
+        0.5,
+        0.1,
+        0.95,
+    )?;
+    let target_ratio = validate_hermes_f64(
+        if form.get("targetRatio").is_some() {
+            form_f64(form, "targetRatio")
+        } else {
+            Some(current["targetRatio"].as_f64().unwrap_or(0.2))
+        },
+        "compression.target_ratio",
+        0.2,
+        0.1,
+        0.8,
+    )?;
+    let protect_last_n = validate_hermes_i64(
+        if form.get("protectLastN").is_some() {
+            form_i64(form, "protectLastN")
+        } else {
+            Some(current["protectLastN"].as_i64().unwrap_or(20))
+        },
+        "compression.protect_last_n",
+        20,
+        1,
+        500,
+    )?;
+    let protect_first_n = validate_hermes_i64(
+        if form.get("protectFirstN").is_some() {
+            form_i64(form, "protectFirstN")
+        } else {
+            Some(current["protectFirstN"].as_i64().unwrap_or(3))
+        },
+        "compression.protect_first_n",
+        3,
+        0,
+        100,
+    )?;
+    let abort_on_summary_failure = form_bool(form, "abortOnSummaryFailure")
+        .unwrap_or_else(|| current["abortOnSummaryFailure"].as_bool().unwrap_or(false));
+
+    let root = ensure_yaml_object(config)?;
+    let compression = yaml_child_object(root, "compression")?;
+    compression.insert(yaml_key("enabled"), serde_yaml::Value::Bool(enabled));
+    compression.insert(
+        yaml_key("threshold"),
+        serde_yaml::Value::Number(threshold.into()),
+    );
+    compression.insert(
+        yaml_key("target_ratio"),
+        serde_yaml::Value::Number(target_ratio.into()),
+    );
+    compression.insert(
+        yaml_key("protect_last_n"),
+        serde_yaml::Value::Number(protect_last_n.into()),
+    );
+    compression.insert(
+        yaml_key("protect_first_n"),
+        serde_yaml::Value::Number(protect_first_n.into()),
+    );
+    compression.insert(
+        yaml_key("abort_on_summary_failure"),
+        serde_yaml::Value::Bool(abort_on_summary_failure),
+    );
+    Ok(())
+}
+
+fn build_hermes_prompt_caching_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let prompt_caching = root.and_then(|map| yaml_get_mapping(map, "prompt_caching"));
+    serde_json::json!({
+        "promptCacheTtl": normalize_hermes_prompt_cache_ttl(
+            prompt_caching.and_then(|map| yaml_string_field(map, "cache_ttl")),
+            false,
+        ).unwrap_or_else(|_| "5m".to_string()),
+    })
+}
+
+fn merge_hermes_prompt_caching_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_prompt_caching_config_values(config);
+    let cache_ttl = normalize_hermes_prompt_cache_ttl(
+        form_string(form, "promptCacheTtl")
+            .or_else(|| current["promptCacheTtl"].as_str().map(ToString::to_string)),
+        true,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let prompt_caching = yaml_child_object(root, "prompt_caching")?;
+    prompt_caching.insert(yaml_key("cache_ttl"), serde_yaml::Value::String(cache_ttl));
+    Ok(())
+}
+
+fn build_hermes_openrouter_cache_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let openrouter = root.and_then(|map| yaml_get_mapping(map, "openrouter"));
+    serde_json::json!({
+        "openrouterResponseCache": openrouter.and_then(|map| yaml_bool_field(map, "response_cache")).unwrap_or(true),
+        "openrouterResponseCacheTtl": openrouter.map(|map| bounded_hermes_i64(yaml_i64_field(map, "response_cache_ttl"), 300, 1, 86400)).unwrap_or(300),
+    })
+}
+
+fn merge_hermes_openrouter_cache_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_openrouter_cache_config_values(config);
+    let response_cache = form_bool(form, "openrouterResponseCache")
+        .unwrap_or_else(|| current["openrouterResponseCache"].as_bool().unwrap_or(true));
+    let response_cache_ttl_input = if form.get("openrouterResponseCacheTtl").is_some() {
+        Some(
+            form_i64(form, "openrouterResponseCacheTtl")
+                .ok_or_else(|| "openrouter.response_cache_ttl 必须是整数".to_string())?,
+        )
+    } else {
+        Some(
+            current["openrouterResponseCacheTtl"]
+                .as_i64()
+                .unwrap_or(300),
+        )
+    };
+    let response_cache_ttl = validate_hermes_i64(
+        response_cache_ttl_input,
+        "openrouter.response_cache_ttl",
+        300,
+        1,
+        86400,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let openrouter = yaml_child_object(root, "openrouter")?;
+    openrouter.insert(
+        yaml_key("response_cache"),
+        serde_yaml::Value::Bool(response_cache),
+    );
+    openrouter.insert(
+        yaml_key("response_cache_ttl"),
+        serde_yaml::Value::Number(response_cache_ttl.into()),
+    );
+    Ok(())
+}
+
+fn provider_routing_list_from_yaml(
+    map: Option<&serde_yaml::Mapping>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let raw = map
+        .map(|map| yaml_string_sequence_field(map, key).join("\n"))
+        .unwrap_or_default();
+    normalize_hermes_provider_routing_list(Some(raw), &format!("provider_routing.{key}"))
+}
+
+fn build_hermes_provider_routing_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let provider_routing = root.and_then(|map| yaml_get_mapping(map, "provider_routing"));
+    let sort = normalize_hermes_provider_routing_sort(
+        provider_routing.and_then(|map| yaml_string_field(map, "sort")),
+        false,
+    )
+    .unwrap_or_else(|_| "price".to_string());
+    let data_collection = normalize_hermes_provider_routing_data_collection(
+        provider_routing.and_then(|map| yaml_string_field(map, "data_collection")),
+        false,
+    )
+    .unwrap_or_else(|_| "allow".to_string());
+    let only = provider_routing_list_from_yaml(provider_routing, "only").unwrap_or_default();
+    let ignore = provider_routing_list_from_yaml(provider_routing, "ignore").unwrap_or_default();
+    let order = provider_routing_list_from_yaml(provider_routing, "order").unwrap_or_default();
+
+    serde_json::json!({
+        "providerRoutingSort": sort,
+        "providerRoutingOnly": only.join("\n"),
+        "providerRoutingIgnore": ignore.join("\n"),
+        "providerRoutingOrder": order.join("\n"),
+        "providerRoutingRequireParameters": provider_routing.and_then(|map| yaml_bool_field(map, "require_parameters")).unwrap_or(false),
+        "providerRoutingDataCollection": data_collection,
+    })
+}
+
+fn merge_hermes_provider_routing_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_provider_routing_config_values(config);
+    let sort = normalize_hermes_provider_routing_sort(
+        if form.get("providerRoutingSort").is_some() {
+            form_string(form, "providerRoutingSort")
+        } else {
+            current["providerRoutingSort"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let data_collection = normalize_hermes_provider_routing_data_collection(
+        if form.get("providerRoutingDataCollection").is_some() {
+            form_string(form, "providerRoutingDataCollection")
+        } else {
+            current["providerRoutingDataCollection"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let require_parameters =
+        form_bool(form, "providerRoutingRequireParameters").unwrap_or_else(|| {
+            current["providerRoutingRequireParameters"]
+                .as_bool()
+                .unwrap_or(false)
+        });
+
+    let only = normalize_hermes_provider_routing_list(
+        form_string(form, "providerRoutingOnly").or_else(|| {
+            current["providerRoutingOnly"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "provider_routing.only",
+    )?;
+    let ignore = normalize_hermes_provider_routing_list(
+        form_string(form, "providerRoutingIgnore").or_else(|| {
+            current["providerRoutingIgnore"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "provider_routing.ignore",
+    )?;
+    let order = normalize_hermes_provider_routing_list(
+        form_string(form, "providerRoutingOrder").or_else(|| {
+            current["providerRoutingOrder"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "provider_routing.order",
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let provider_routing = yaml_child_object(root, "provider_routing")?;
+    provider_routing.insert(yaml_key("sort"), serde_yaml::Value::String(sort));
+    provider_routing.insert(
+        yaml_key("require_parameters"),
+        serde_yaml::Value::Bool(require_parameters),
+    );
+    provider_routing.insert(
+        yaml_key("data_collection"),
+        serde_yaml::Value::String(data_collection),
+    );
+
+    for (key, values) in [("only", only), ("ignore", ignore), ("order", order)] {
+        if values.is_empty() {
+            provider_routing.remove(yaml_key(key));
+        } else {
+            provider_routing.insert(
+                yaml_key(key),
+                serde_yaml::Value::Sequence(
+                    values.into_iter().map(serde_yaml::Value::String).collect(),
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn hermes_auxiliary_task<'a>(
+    root: Option<&'a serde_yaml::Mapping>,
+    key: &str,
+) -> Option<&'a serde_yaml::Mapping> {
+    root.and_then(|map| yaml_get_mapping(map, "auxiliary"))
+        .and_then(|map| yaml_get_mapping(map, key))
+}
+
+fn build_hermes_auxiliary_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let vision = hermes_auxiliary_task(root, "vision");
+    let web_extract = hermes_auxiliary_task(root, "web_extract");
+    let session_search = hermes_auxiliary_task(root, "session_search");
+
+    serde_json::json!({
+        "auxiliaryVisionProvider": normalize_hermes_auxiliary_provider(
+            vision.and_then(|map| yaml_string_field(map, "provider")),
+            "auxiliary.vision.provider",
+            false,
+        ).unwrap_or_else(|_| "auto".to_string()),
+        "auxiliaryVisionModel": normalize_hermes_auxiliary_model(
+            vision.and_then(|map| yaml_string_field(map, "model")),
+            "auxiliary.vision.model",
+            false,
+        ).unwrap_or_default(),
+        "auxiliaryVisionTimeout": vision.map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 30, 1, 3600)).unwrap_or(30),
+        "auxiliaryVisionDownloadTimeout": vision.map(|map| bounded_hermes_i64(yaml_i64_field(map, "download_timeout"), 30, 1, 3600)).unwrap_or(30),
+        "auxiliaryWebExtractProvider": normalize_hermes_auxiliary_provider(
+            web_extract.and_then(|map| yaml_string_field(map, "provider")),
+            "auxiliary.web_extract.provider",
+            false,
+        ).unwrap_or_else(|_| "auto".to_string()),
+        "auxiliaryWebExtractModel": normalize_hermes_auxiliary_model(
+            web_extract.and_then(|map| yaml_string_field(map, "model")),
+            "auxiliary.web_extract.model",
+            false,
+        ).unwrap_or_default(),
+        "auxiliarySessionSearchProvider": normalize_hermes_auxiliary_provider(
+            session_search.and_then(|map| yaml_string_field(map, "provider")),
+            "auxiliary.session_search.provider",
+            false,
+        ).unwrap_or_else(|_| "auto".to_string()),
+        "auxiliarySessionSearchModel": normalize_hermes_auxiliary_model(
+            session_search.and_then(|map| yaml_string_field(map, "model")),
+            "auxiliary.session_search.model",
+            false,
+        ).unwrap_or_default(),
+        "auxiliarySessionSearchTimeout": session_search.map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 30, 1, 3600)).unwrap_or(30),
+        "auxiliarySessionSearchMaxConcurrency": session_search.map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_concurrency"), 3, 1, 100)).unwrap_or(3),
+    })
+}
+
+fn merge_hermes_auxiliary_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_auxiliary_config_values(config);
+    let vision_provider = normalize_hermes_auxiliary_provider(
+        form_string(form, "auxiliaryVisionProvider").or_else(|| {
+            current["auxiliaryVisionProvider"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.vision.provider",
+        true,
+    )?;
+    let vision_model = normalize_hermes_auxiliary_model(
+        form_string(form, "auxiliaryVisionModel").or_else(|| {
+            current["auxiliaryVisionModel"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.vision.model",
+        true,
+    )?;
+    let vision_timeout = validate_hermes_i64(
+        if form.get("auxiliaryVisionTimeout").is_some() {
+            form_i64(form, "auxiliaryVisionTimeout")
+        } else {
+            Some(current["auxiliaryVisionTimeout"].as_i64().unwrap_or(30))
+        },
+        "auxiliary.vision.timeout",
+        30,
+        1,
+        3600,
+    )?;
+    let vision_download_timeout = validate_hermes_i64(
+        if form.get("auxiliaryVisionDownloadTimeout").is_some() {
+            form_i64(form, "auxiliaryVisionDownloadTimeout")
+        } else {
+            Some(
+                current["auxiliaryVisionDownloadTimeout"]
+                    .as_i64()
+                    .unwrap_or(30),
+            )
+        },
+        "auxiliary.vision.download_timeout",
+        30,
+        1,
+        3600,
+    )?;
+    let web_extract_provider = normalize_hermes_auxiliary_provider(
+        form_string(form, "auxiliaryWebExtractProvider").or_else(|| {
+            current["auxiliaryWebExtractProvider"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.web_extract.provider",
+        true,
+    )?;
+    let web_extract_model = normalize_hermes_auxiliary_model(
+        form_string(form, "auxiliaryWebExtractModel").or_else(|| {
+            current["auxiliaryWebExtractModel"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.web_extract.model",
+        true,
+    )?;
+    let session_search_provider = normalize_hermes_auxiliary_provider(
+        form_string(form, "auxiliarySessionSearchProvider").or_else(|| {
+            current["auxiliarySessionSearchProvider"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.session_search.provider",
+        true,
+    )?;
+    let session_search_model = normalize_hermes_auxiliary_model(
+        form_string(form, "auxiliarySessionSearchModel").or_else(|| {
+            current["auxiliarySessionSearchModel"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "auxiliary.session_search.model",
+        true,
+    )?;
+    let session_search_timeout = validate_hermes_i64(
+        if form.get("auxiliarySessionSearchTimeout").is_some() {
+            form_i64(form, "auxiliarySessionSearchTimeout")
+        } else {
+            Some(
+                current["auxiliarySessionSearchTimeout"]
+                    .as_i64()
+                    .unwrap_or(30),
+            )
+        },
+        "auxiliary.session_search.timeout",
+        30,
+        1,
+        3600,
+    )?;
+    let session_search_max_concurrency = validate_hermes_i64(
+        if form.get("auxiliarySessionSearchMaxConcurrency").is_some() {
+            form_i64(form, "auxiliarySessionSearchMaxConcurrency")
+        } else {
+            Some(
+                current["auxiliarySessionSearchMaxConcurrency"]
+                    .as_i64()
+                    .unwrap_or(3),
+            )
+        },
+        "auxiliary.session_search.max_concurrency",
+        3,
+        1,
+        100,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let auxiliary = yaml_child_object(root, "auxiliary")?;
+    let vision = yaml_child_object(auxiliary, "vision")?;
+    vision.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(vision_provider),
+    );
+    vision.insert(yaml_key("model"), serde_yaml::Value::String(vision_model));
+    vision.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(vision_timeout.into()),
+    );
+    vision.insert(
+        yaml_key("download_timeout"),
+        serde_yaml::Value::Number(vision_download_timeout.into()),
+    );
+
+    let web_extract = yaml_child_object(auxiliary, "web_extract")?;
+    web_extract.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(web_extract_provider),
+    );
+    web_extract.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(web_extract_model),
+    );
+
+    let session_search = yaml_child_object(auxiliary, "session_search")?;
+    session_search.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(session_search_provider),
+    );
+    session_search.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(session_search_model),
+    );
+    session_search.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(session_search_timeout.into()),
+    );
+    session_search.insert(
+        yaml_key("max_concurrency"),
+        serde_yaml::Value::Number(session_search_max_concurrency.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_tool_loop_guardrails_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let guardrails = root.and_then(|map| yaml_get_mapping(map, "tool_loop_guardrails"));
+    let warn_after = guardrails.and_then(|map| yaml_get_mapping(map, "warn_after"));
+    let hard_stop_after = guardrails.and_then(|map| yaml_get_mapping(map, "hard_stop_after"));
+
+    let warnings_enabled = guardrails
+        .and_then(|map| yaml_bool_field(map, "warnings_enabled"))
+        .unwrap_or(true);
+    let hard_stop_enabled = guardrails
+        .and_then(|map| yaml_bool_field(map, "hard_stop_enabled"))
+        .unwrap_or(false);
+    let warn_exact_failure = warn_after
+        .and_then(|map| yaml_i64_field(map, "exact_failure"))
+        .or_else(|| guardrails.and_then(|map| yaml_i64_field(map, "exact_failure_warn_after")));
+    let warn_same_tool_failure = warn_after
+        .and_then(|map| yaml_i64_field(map, "same_tool_failure"))
+        .or_else(|| guardrails.and_then(|map| yaml_i64_field(map, "same_tool_failure_warn_after")));
+    let warn_no_progress = warn_after
+        .and_then(|map| yaml_i64_field(map, "idempotent_no_progress"))
+        .or_else(|| guardrails.and_then(|map| yaml_i64_field(map, "no_progress_warn_after")));
+    let hard_stop_exact_failure = hard_stop_after
+        .and_then(|map| yaml_i64_field(map, "exact_failure"))
+        .or_else(|| guardrails.and_then(|map| yaml_i64_field(map, "exact_failure_block_after")));
+    let hard_stop_same_tool_failure = hard_stop_after
+        .and_then(|map| yaml_i64_field(map, "same_tool_failure"))
+        .or_else(|| guardrails.and_then(|map| yaml_i64_field(map, "same_tool_failure_halt_after")));
+    let hard_stop_no_progress = hard_stop_after
+        .and_then(|map| yaml_i64_field(map, "idempotent_no_progress"))
+        .or_else(|| guardrails.and_then(|map| yaml_i64_field(map, "no_progress_block_after")));
+
+    serde_json::json!({
+        "warningsEnabled": warnings_enabled,
+        "hardStopEnabled": hard_stop_enabled,
+        "warnExactFailure": bounded_hermes_i64(warn_exact_failure, 2, 1, 100),
+        "warnSameToolFailure": bounded_hermes_i64(warn_same_tool_failure, 3, 1, 100),
+        "warnNoProgress": bounded_hermes_i64(warn_no_progress, 2, 1, 100),
+        "hardStopExactFailure": bounded_hermes_i64(hard_stop_exact_failure, 5, 1, 100),
+        "hardStopSameToolFailure": bounded_hermes_i64(hard_stop_same_tool_failure, 8, 1, 100),
+        "hardStopNoProgress": bounded_hermes_i64(hard_stop_no_progress, 5, 1, 100),
+    })
+}
+
+fn merge_hermes_tool_loop_guardrails_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_tool_loop_guardrails_config_values(config);
+    let warnings_enabled = form_bool(form, "warningsEnabled")
+        .unwrap_or_else(|| current["warningsEnabled"].as_bool().unwrap_or(true));
+    let hard_stop_enabled = form_bool(form, "hardStopEnabled")
+        .unwrap_or_else(|| current["hardStopEnabled"].as_bool().unwrap_or(false));
+    let warn_exact_failure = validate_hermes_i64(
+        if form.get("warnExactFailure").is_some() {
+            form_i64(form, "warnExactFailure")
+        } else {
+            Some(current["warnExactFailure"].as_i64().unwrap_or(2))
+        },
+        "tool_loop_guardrails.warn_after.exact_failure",
+        2,
+        1,
+        100,
+    )?;
+    let warn_same_tool_failure = validate_hermes_i64(
+        if form.get("warnSameToolFailure").is_some() {
+            form_i64(form, "warnSameToolFailure")
+        } else {
+            Some(current["warnSameToolFailure"].as_i64().unwrap_or(3))
+        },
+        "tool_loop_guardrails.warn_after.same_tool_failure",
+        3,
+        1,
+        100,
+    )?;
+    let warn_no_progress = validate_hermes_i64(
+        if form.get("warnNoProgress").is_some() {
+            form_i64(form, "warnNoProgress")
+        } else {
+            Some(current["warnNoProgress"].as_i64().unwrap_or(2))
+        },
+        "tool_loop_guardrails.warn_after.idempotent_no_progress",
+        2,
+        1,
+        100,
+    )?;
+    let hard_stop_exact_failure = validate_hermes_i64(
+        if form.get("hardStopExactFailure").is_some() {
+            form_i64(form, "hardStopExactFailure")
+        } else {
+            Some(current["hardStopExactFailure"].as_i64().unwrap_or(5))
+        },
+        "tool_loop_guardrails.hard_stop_after.exact_failure",
+        5,
+        1,
+        100,
+    )?;
+    let hard_stop_same_tool_failure = validate_hermes_i64(
+        if form.get("hardStopSameToolFailure").is_some() {
+            form_i64(form, "hardStopSameToolFailure")
+        } else {
+            Some(current["hardStopSameToolFailure"].as_i64().unwrap_or(8))
+        },
+        "tool_loop_guardrails.hard_stop_after.same_tool_failure",
+        8,
+        1,
+        100,
+    )?;
+    let hard_stop_no_progress = validate_hermes_i64(
+        if form.get("hardStopNoProgress").is_some() {
+            form_i64(form, "hardStopNoProgress")
+        } else {
+            Some(current["hardStopNoProgress"].as_i64().unwrap_or(5))
+        },
+        "tool_loop_guardrails.hard_stop_after.idempotent_no_progress",
+        5,
+        1,
+        100,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let guardrails = yaml_child_object(root, "tool_loop_guardrails")?;
+    guardrails.insert(
+        yaml_key("warnings_enabled"),
+        serde_yaml::Value::Bool(warnings_enabled),
+    );
+    guardrails.insert(
+        yaml_key("hard_stop_enabled"),
+        serde_yaml::Value::Bool(hard_stop_enabled),
+    );
+    let warn_after = yaml_child_object(guardrails, "warn_after")?;
+    warn_after.insert(
+        yaml_key("exact_failure"),
+        serde_yaml::Value::Number(warn_exact_failure.into()),
+    );
+    warn_after.insert(
+        yaml_key("same_tool_failure"),
+        serde_yaml::Value::Number(warn_same_tool_failure.into()),
+    );
+    warn_after.insert(
+        yaml_key("idempotent_no_progress"),
+        serde_yaml::Value::Number(warn_no_progress.into()),
+    );
+    let hard_stop_after = yaml_child_object(guardrails, "hard_stop_after")?;
+    hard_stop_after.insert(
+        yaml_key("exact_failure"),
+        serde_yaml::Value::Number(hard_stop_exact_failure.into()),
+    );
+    hard_stop_after.insert(
+        yaml_key("same_tool_failure"),
+        serde_yaml::Value::Number(hard_stop_same_tool_failure.into()),
+    );
+    hard_stop_after.insert(
+        yaml_key("idempotent_no_progress"),
+        serde_yaml::Value::Number(hard_stop_no_progress.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_memory_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let memory = root.and_then(|map| yaml_get_mapping(map, "memory"));
+    let memory_enabled = memory
+        .and_then(|map| yaml_bool_field(map, "memory_enabled"))
+        .unwrap_or(true);
+    let user_profile_enabled = memory
+        .and_then(|map| yaml_bool_field(map, "user_profile_enabled"))
+        .unwrap_or(true);
+    let memory_char_limit = memory
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "memory_char_limit"), 2200, 100, 200000))
+        .unwrap_or(2200);
+    let user_char_limit = memory
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "user_char_limit"), 1375, 100, 200000))
+        .unwrap_or(1375);
+    let nudge_interval = memory
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "nudge_interval"), 10, 0, 1000))
+        .unwrap_or(10);
+    let flush_min_turns = memory
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "flush_min_turns"), 6, 0, 1000))
+        .unwrap_or(6);
+
+    serde_json::json!({
+        "memoryEnabled": memory_enabled,
+        "userProfileEnabled": user_profile_enabled,
+        "memoryCharLimit": memory_char_limit,
+        "userCharLimit": user_char_limit,
+        "nudgeInterval": nudge_interval,
+        "flushMinTurns": flush_min_turns,
+    })
+}
+
+fn merge_hermes_memory_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_memory_config_values(config);
+    let memory_enabled = form_bool(form, "memoryEnabled")
+        .unwrap_or_else(|| current["memoryEnabled"].as_bool().unwrap_or(true));
+    let user_profile_enabled = form_bool(form, "userProfileEnabled")
+        .unwrap_or_else(|| current["userProfileEnabled"].as_bool().unwrap_or(true));
+    let memory_char_limit = validate_hermes_i64(
+        if form.get("memoryCharLimit").is_some() {
+            form_i64(form, "memoryCharLimit")
+        } else {
+            Some(current["memoryCharLimit"].as_i64().unwrap_or(2200))
+        },
+        "memory.memory_char_limit",
+        2200,
+        100,
+        200000,
+    )?;
+    let user_char_limit = validate_hermes_i64(
+        if form.get("userCharLimit").is_some() {
+            form_i64(form, "userCharLimit")
+        } else {
+            Some(current["userCharLimit"].as_i64().unwrap_or(1375))
+        },
+        "memory.user_char_limit",
+        1375,
+        100,
+        200000,
+    )?;
+    let nudge_interval = validate_hermes_i64(
+        if form.get("nudgeInterval").is_some() {
+            form_i64(form, "nudgeInterval")
+        } else {
+            Some(current["nudgeInterval"].as_i64().unwrap_or(10))
+        },
+        "memory.nudge_interval",
+        10,
+        0,
+        1000,
+    )?;
+    let flush_min_turns = validate_hermes_i64(
+        if form.get("flushMinTurns").is_some() {
+            form_i64(form, "flushMinTurns")
+        } else {
+            Some(current["flushMinTurns"].as_i64().unwrap_or(6))
+        },
+        "memory.flush_min_turns",
+        6,
+        0,
+        1000,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let memory = yaml_child_object(root, "memory")?;
+    memory.insert(
+        yaml_key("memory_enabled"),
+        serde_yaml::Value::Bool(memory_enabled),
+    );
+    memory.insert(
+        yaml_key("user_profile_enabled"),
+        serde_yaml::Value::Bool(user_profile_enabled),
+    );
+    memory.insert(
+        yaml_key("memory_char_limit"),
+        serde_yaml::Value::Number(memory_char_limit.into()),
+    );
+    memory.insert(
+        yaml_key("user_char_limit"),
+        serde_yaml::Value::Number(user_char_limit.into()),
+    );
+    memory.insert(
+        yaml_key("nudge_interval"),
+        serde_yaml::Value::Number(nudge_interval.into()),
+    );
+    memory.insert(
+        yaml_key("flush_min_turns"),
+        serde_yaml::Value::Number(flush_min_turns.into()),
+    );
+    Ok(())
+}
+
+fn normalize_hermes_multiline_list(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn build_hermes_skills_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let skills = root.and_then(|map| yaml_get_mapping(map, "skills"));
+    let creation_nudge_interval = skills
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "creation_nudge_interval"), 15, 0, 10000))
+        .unwrap_or(15);
+    let external_dirs = skills
+        .map(|map| yaml_string_sequence_field(map, "external_dirs").join("\n"))
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "creationNudgeInterval": creation_nudge_interval,
+        "externalDirs": external_dirs,
+        "templateVars": skills.and_then(|map| yaml_bool_field(map, "template_vars")).unwrap_or(true),
+        "inlineShell": skills.and_then(|map| yaml_bool_field(map, "inline_shell")).unwrap_or(false),
+        "inlineShellTimeout": skills
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "inline_shell_timeout"), 10, 1, 86400))
+            .unwrap_or(10),
+        "guardAgentCreated": skills.and_then(|map| yaml_bool_field(map, "guard_agent_created")).unwrap_or(false),
+    })
+}
+
+fn merge_hermes_skills_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_skills_config_values(config);
+    let creation_nudge_interval = validate_hermes_i64(
+        if form.get("creationNudgeInterval").is_some() {
+            form_i64(form, "creationNudgeInterval")
+        } else {
+            Some(current["creationNudgeInterval"].as_i64().unwrap_or(15))
+        },
+        "skills.creation_nudge_interval",
+        15,
+        0,
+        10000,
+    )?;
+    let inline_shell_timeout = validate_hermes_i64(
+        if form.get("inlineShellTimeout").is_some() {
+            form_i64(form, "inlineShellTimeout")
+        } else {
+            Some(current["inlineShellTimeout"].as_i64().unwrap_or(10))
+        },
+        "skills.inline_shell_timeout",
+        10,
+        1,
+        86400,
+    )?;
+    let external_dirs = normalize_hermes_multiline_list(
+        form_string(form, "externalDirs")
+            .or_else(|| current["externalDirs"].as_str().map(ToString::to_string)),
+    );
+
+    let root = ensure_yaml_object(config)?;
+    let skills = yaml_child_object(root, "skills")?;
+    skills.insert(
+        yaml_key("creation_nudge_interval"),
+        serde_yaml::Value::Number(creation_nudge_interval.into()),
+    );
+    skills.insert(
+        yaml_key("template_vars"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "templateVars")
+                .unwrap_or_else(|| current["templateVars"].as_bool().unwrap_or(true)),
+        ),
+    );
+    skills.insert(
+        yaml_key("inline_shell"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "inlineShell")
+                .unwrap_or_else(|| current["inlineShell"].as_bool().unwrap_or(false)),
+        ),
+    );
+    skills.insert(
+        yaml_key("inline_shell_timeout"),
+        serde_yaml::Value::Number(inline_shell_timeout.into()),
+    );
+    skills.insert(
+        yaml_key("guard_agent_created"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "guardAgentCreated")
+                .unwrap_or_else(|| current["guardAgentCreated"].as_bool().unwrap_or(false)),
+        ),
+    );
+    if external_dirs.is_empty() {
+        skills.remove(yaml_key("external_dirs"));
+    } else {
+        skills.insert(
+            yaml_key("external_dirs"),
+            serde_yaml::Value::Sequence(
+                external_dirs
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn build_hermes_curator_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let curator = root.and_then(|map| yaml_get_mapping(map, "curator"));
+    let backup = curator.and_then(|map| yaml_get_mapping(map, "backup"));
+
+    serde_json::json!({
+        "curatorEnabled": curator.and_then(|map| yaml_bool_field(map, "enabled")).unwrap_or(true),
+        "curatorIntervalHours": curator
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "interval_hours"), 168, 1, 87600))
+            .unwrap_or(168),
+        "curatorMinIdleHours": curator
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "min_idle_hours"), 2, 0, 87600))
+            .unwrap_or(2),
+        "curatorStaleAfterDays": curator
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "stale_after_days"), 30, 1, 36500))
+            .unwrap_or(30),
+        "curatorArchiveAfterDays": curator
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "archive_after_days"), 90, 1, 36500))
+            .unwrap_or(90),
+        "curatorBackupEnabled": backup.and_then(|map| yaml_bool_field(map, "enabled")).unwrap_or(true),
+        "curatorBackupKeep": backup
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "keep"), 5, 0, 1000))
+            .unwrap_or(5),
+    })
+}
+
+fn merge_hermes_curator_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_curator_config_values(config);
+    let curator_interval_hours = validate_hermes_i64(
+        if form.get("curatorIntervalHours").is_some() {
+            form_i64(form, "curatorIntervalHours")
+        } else {
+            Some(current["curatorIntervalHours"].as_i64().unwrap_or(168))
+        },
+        "curator.interval_hours",
+        168,
+        1,
+        87600,
+    )?;
+    let curator_min_idle_hours = validate_hermes_i64(
+        if form.get("curatorMinIdleHours").is_some() {
+            form_i64(form, "curatorMinIdleHours")
+        } else {
+            Some(current["curatorMinIdleHours"].as_i64().unwrap_or(2))
+        },
+        "curator.min_idle_hours",
+        2,
+        0,
+        87600,
+    )?;
+    let curator_stale_after_days = validate_hermes_i64(
+        if form.get("curatorStaleAfterDays").is_some() {
+            form_i64(form, "curatorStaleAfterDays")
+        } else {
+            Some(current["curatorStaleAfterDays"].as_i64().unwrap_or(30))
+        },
+        "curator.stale_after_days",
+        30,
+        1,
+        36500,
+    )?;
+    let curator_archive_after_days = validate_hermes_i64(
+        if form.get("curatorArchiveAfterDays").is_some() {
+            form_i64(form, "curatorArchiveAfterDays")
+        } else {
+            Some(current["curatorArchiveAfterDays"].as_i64().unwrap_or(90))
+        },
+        "curator.archive_after_days",
+        90,
+        1,
+        36500,
+    )?;
+    if curator_archive_after_days < curator_stale_after_days {
+        return Err(
+            "curator.archive_after_days 必须大于或等于 curator.stale_after_days".to_string(),
+        );
+    }
+    let curator_backup_keep = validate_hermes_i64(
+        if form.get("curatorBackupKeep").is_some() {
+            form_i64(form, "curatorBackupKeep")
+        } else {
+            Some(current["curatorBackupKeep"].as_i64().unwrap_or(5))
+        },
+        "curator.backup.keep",
+        5,
+        0,
+        1000,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let curator = yaml_child_object(root, "curator")?;
+    curator.insert(
+        yaml_key("enabled"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "curatorEnabled")
+                .unwrap_or_else(|| current["curatorEnabled"].as_bool().unwrap_or(true)),
+        ),
+    );
+    curator.insert(
+        yaml_key("interval_hours"),
+        serde_yaml::Value::Number(curator_interval_hours.into()),
+    );
+    curator.insert(
+        yaml_key("min_idle_hours"),
+        serde_yaml::Value::Number(curator_min_idle_hours.into()),
+    );
+    curator.insert(
+        yaml_key("stale_after_days"),
+        serde_yaml::Value::Number(curator_stale_after_days.into()),
+    );
+    curator.insert(
+        yaml_key("archive_after_days"),
+        serde_yaml::Value::Number(curator_archive_after_days.into()),
+    );
+    let backup = yaml_child_object(curator, "backup")?;
+    backup.insert(
+        yaml_key("enabled"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "curatorBackupEnabled")
+                .unwrap_or_else(|| current["curatorBackupEnabled"].as_bool().unwrap_or(true)),
+        ),
+    );
+    backup.insert(
+        yaml_key("keep"),
+        serde_yaml::Value::Number(curator_backup_keep.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_quick_commands_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let quick_commands = root
+        .and_then(|map| yaml_get(map, "quick_commands"))
+        .and_then(|value| value.as_mapping())
+        .and_then(|mapping| serde_json::to_value(mapping).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let quick_commands_json =
+        serde_json::to_string_pretty(&quick_commands).unwrap_or_else(|_| "{}".to_string());
+
+    serde_json::json!({
+        "quickCommandsJson": quick_commands_json,
+    })
+}
+
+fn validate_hermes_quick_commands(value: Value) -> Result<serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "quick_commands 必须是 JSON 对象".to_string())?;
+    let mut normalized = serde_json::Map::new();
+    for (raw_name, raw_command) in object {
+        let name = raw_name.trim().trim_start_matches('/').to_string();
+        if name.is_empty() {
+            return Err("quick_commands 命令名不能为空".to_string());
+        }
+        let command_object = raw_command
+            .as_object()
+            .ok_or_else(|| format!("quick_commands.{name} 必须是对象"))?;
+        let mut command = command_object.clone();
+        let command_type = command
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(command_type.as_str(), "exec" | "alias") {
+            return Err(format!("quick_commands.{name}.type 必须是 exec 或 alias"));
+        }
+        command.insert("type".to_string(), Value::String(command_type.clone()));
+        if command_type == "exec" {
+            let shell_command = command
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if shell_command.is_empty() {
+                return Err(format!("quick_commands.{name}.command 不能为空"));
+            }
+            command.insert("command".to_string(), Value::String(shell_command));
+        }
+        if command_type == "alias" {
+            let target = command
+                .get("target")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !target.starts_with('/') {
+                return Err(format!("quick_commands.{name}.target 必须以 / 开头"));
+            }
+            command.insert("target".to_string(), Value::String(target));
+        }
+        normalized.insert(name, Value::Object(command));
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_quick_commands_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value =
+        serde_json::from_str(text).map_err(|err| format!("quick_commands JSON 格式错误: {err}"))?;
+    validate_hermes_quick_commands(value)
+}
+
+fn merge_hermes_quick_commands_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_quick_commands_config_values(config);
+    let quick_commands =
+        parse_hermes_quick_commands_json(form_string(form, "quickCommandsJson").or_else(|| {
+            current["quickCommandsJson"]
+                .as_str()
+                .map(ToString::to_string)
+        }))?;
+
+    let root = ensure_yaml_object(config)?;
+    if quick_commands.is_empty() {
+        root.remove(yaml_key("quick_commands"));
+    } else {
+        let json_value = Value::Object(quick_commands);
+        let yaml_value = serde_yaml::to_value(json_value)
+            .map_err(|err| format!("quick_commands 转换 YAML 失败: {err}"))?;
+        root.insert(yaml_key("quick_commands"), yaml_value);
+    }
+    Ok(())
+}
+
+fn normalize_hermes_model_config_string(
+    value: Option<String>,
+    key: &str,
+    required: bool,
+) -> Result<String, String> {
+    let text = value.unwrap_or_default().trim().to_string();
+    if text.is_empty() && required {
+        return Err(format!("{key} 不能为空"));
+    }
+    Ok(text)
+}
+
+fn hermes_model_form_string(
+    form: &Value,
+    form_key: &str,
+    yaml_key: &str,
+    current: &Value,
+) -> Result<Option<String>, String> {
+    if let Some(value) = form.get(form_key) {
+        if let Some(text) = value.as_str() {
+            return Ok(Some(text.to_string()));
+        }
+        return Err(format!("{yaml_key} 必须是字符串"));
+    }
+    Ok(current.as_str().map(ToString::to_string))
+}
+
+fn optional_hermes_model_i64_field(
+    form: &Value,
+    form_key: &str,
+    yaml_key_name: &str,
+    current: &Value,
+) -> Result<Option<i64>, String> {
+    let raw = if let Some(value) = form.get(form_key) {
+        if value.is_null() {
+            None
+        } else if let Some(text) = value.as_str() {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(
+                    text.parse::<i64>()
+                        .map_err(|_| format!("{yaml_key_name} 必须是整数"))?,
+                )
+            }
+        } else if let Some(value) = value.as_i64() {
+            Some(value)
+        } else if let Some(value) = value.as_u64() {
+            Some(i64::try_from(value).map_err(|_| format!("{yaml_key_name} 必须是整数"))?)
+        } else {
+            return Err(format!("{yaml_key_name} 必须是整数"));
+        }
+    } else if let Some(text) = current.as_str() {
+        let text = text.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(
+                text.parse::<i64>()
+                    .map_err(|_| format!("{yaml_key_name} 必须是整数"))?,
+            )
+        }
+    } else {
+        None
+    };
+
+    match raw {
+        Some(value) if (1..=10_000_000).contains(&value) => Ok(Some(value)),
+        Some(_) => Err(format!("{yaml_key_name} 必须在 1-10000000 范围内")),
+        None => Ok(None),
+    }
+}
+
+fn build_hermes_model_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let model = root
+        .and_then(|map| map.get(yaml_key("model")))
+        .and_then(|value| value.as_mapping());
+    let model_default = model
+        .and_then(|map| {
+            map.get(yaml_key("default"))
+                .or_else(|| map.get(yaml_key("model")))
+        })
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let provider = model
+        .and_then(|map| map.get(yaml_key("provider")))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+    let base_url = model
+        .and_then(|map| map.get(yaml_key("base_url")))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let context_length = model
+        .and_then(|map| yaml_i64_field(map, "context_length"))
+        .filter(|value| *value > 0)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let max_tokens = model
+        .and_then(|map| yaml_i64_field(map, "max_tokens"))
+        .filter(|value| *value > 0)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "modelDefault": model_default,
+        "modelProvider": provider,
+        "modelBaseUrl": base_url,
+        "modelContextLength": context_length,
+        "modelMaxTokens": max_tokens,
+    })
+}
+
+fn merge_hermes_model_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_model_config_values(config);
+    let model_default = normalize_hermes_model_config_string(
+        hermes_model_form_string(
+            form,
+            "modelDefault",
+            "model.default",
+            &current["modelDefault"],
+        )?,
+        "model.default",
+        true,
+    )?;
+    let provider = normalize_hermes_model_config_string(
+        hermes_model_form_string(
+            form,
+            "modelProvider",
+            "model.provider",
+            &current["modelProvider"],
+        )?,
+        "model.provider",
+        true,
+    )?;
+    let base_url = normalize_hermes_model_config_string(
+        hermes_model_form_string(
+            form,
+            "modelBaseUrl",
+            "model.base_url",
+            &current["modelBaseUrl"],
+        )?,
+        "model.base_url",
+        false,
+    )?;
+    let context_length = optional_hermes_model_i64_field(
+        form,
+        "modelContextLength",
+        "model.context_length",
+        &current["modelContextLength"],
+    )?;
+    let max_tokens = optional_hermes_model_i64_field(
+        form,
+        "modelMaxTokens",
+        "model.max_tokens",
+        &current["modelMaxTokens"],
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let mut model = root
+        .get(yaml_key("model"))
+        .and_then(|value| value.as_mapping())
+        .cloned()
+        .unwrap_or_default();
+    model.insert(
+        yaml_key("default"),
+        serde_yaml::Value::String(model_default),
+    );
+    model.insert(yaml_key("provider"), serde_yaml::Value::String(provider));
+    if base_url.is_empty() {
+        model.remove(yaml_key("base_url"));
+    } else {
+        model.insert(yaml_key("base_url"), serde_yaml::Value::String(base_url));
+    }
+    if let Some(context_length) = context_length {
+        model.insert(
+            yaml_key("context_length"),
+            serde_yaml::Value::Number(context_length.into()),
+        );
+    } else {
+        model.remove(yaml_key("context_length"));
+    }
+    if let Some(max_tokens) = max_tokens {
+        model.insert(
+            yaml_key("max_tokens"),
+            serde_yaml::Value::Number(max_tokens.into()),
+        );
+    } else {
+        model.remove(yaml_key("max_tokens"));
+    }
+    model.remove(yaml_key("model"));
+    root.insert(yaml_key("model"), serde_yaml::Value::Mapping(model));
+    Ok(())
+}
+
+fn is_hermes_model_alias_name(value: &str) -> bool {
+    let text = value.trim();
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+fn normalize_hermes_model_alias_string(
+    entry: &mut serde_json::Map<String, Value>,
+    field: &str,
+    key: &str,
+    required: bool,
+) -> Result<(), String> {
+    let empty = entry.get(field).is_none_or(|value| {
+        value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+    });
+    if empty {
+        if required {
+            return Err(format!("{key}.{field} 不能为空"));
+        }
+        entry.remove(field);
+        return Ok(());
+    }
+    let Some(value) = entry.get(field).and_then(|value| value.as_str()) else {
+        return Err(format!("{key}.{field} 必须是字符串"));
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        if required {
+            return Err(format!("{key}.{field} 不能为空"));
+        }
+        entry.remove(field);
+    } else {
+        entry.insert(field.to_string(), Value::String(value));
+    }
+    Ok(())
+}
+
+fn validate_hermes_model_aliases(value: &Value) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(object) = value.as_object() else {
+        return Err("model_aliases 必须是 JSON 对象".to_string());
+    };
+    let mut normalized = serde_json::Map::new();
+    for (raw_alias, raw_config) in object {
+        let alias = raw_alias.trim();
+        if !is_hermes_model_alias_name(alias) {
+            return Err(format!(
+                "model_aliases.{} 别名只能包含字母、数字、下划线、点和短横线",
+                if raw_alias.is_empty() {
+                    "<empty>"
+                } else {
+                    raw_alias
+                }
+            ));
+        }
+        let Some(config) = raw_config.as_object() else {
+            return Err(format!("model_aliases.{alias} 必须是 JSON 对象"));
+        };
+        let mut entry = config.clone();
+        let key = format!("model_aliases.{alias}");
+        normalize_hermes_model_alias_string(&mut entry, "model", &key, true)?;
+        normalize_hermes_model_alias_string(&mut entry, "provider", &key, false)?;
+        normalize_hermes_model_alias_string(&mut entry, "base_url", &key, false)?;
+        normalized.insert(alias.to_string(), Value::Object(entry));
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_model_aliases_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| format!("model_aliases JSON 格式错误: {err}"))?;
+    validate_hermes_model_aliases(&value)
+}
+
+fn build_hermes_model_aliases_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let model_aliases = root
+        .and_then(|map| map.get(yaml_key("model_aliases")))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_model_aliases(&value).ok())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "modelAliasesJson": serde_json::to_string_pretty(&Value::Object(model_aliases)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn merge_hermes_model_aliases_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_model_aliases_config_values(config);
+    let model_aliases =
+        parse_hermes_model_aliases_json(form_string(form, "modelAliasesJson").or_else(|| {
+            current["modelAliasesJson"]
+                .as_str()
+                .map(ToString::to_string)
+        }))?;
+
+    let root = ensure_yaml_object(config)?;
+    if model_aliases.is_empty() {
+        root.remove(yaml_key("model_aliases"));
+    } else {
+        let yaml_value = serde_yaml::to_value(Value::Object(model_aliases))
+            .map_err(|err| format!("model_aliases 转换 YAML 失败: {err}"))?;
+        root.insert(yaml_key("model_aliases"), yaml_value);
+    }
+    Ok(())
+}
+
+fn is_hermes_hook_event(value: &str) -> bool {
+    matches!(
+        value,
+        "pre_tool_call"
+            | "post_tool_call"
+            | "pre_llm_call"
+            | "post_llm_call"
+            | "pre_api_request"
+            | "post_api_request"
+            | "on_session_start"
+            | "on_session_end"
+            | "on_session_finalize"
+            | "on_session_reset"
+            | "subagent_stop"
+    )
+}
+
+fn normalize_hermes_hook_timeout(
+    entry: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<(), String> {
+    if !entry.contains_key("timeout")
+        || entry.get("timeout").is_some_and(|value| {
+            value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+        })
+    {
+        entry.remove("timeout");
+        return Ok(());
+    }
+    let value = entry.get("timeout").cloned().unwrap_or(Value::Null);
+    let parsed = if let Some(value) = value.as_i64() {
+        Some(value)
+    } else if let Some(value) = value.as_u64() {
+        i64::try_from(value).ok()
+    } else if let Some(value) = value.as_str() {
+        value.trim().parse::<i64>().ok()
+    } else {
+        None
+    };
+    let parsed = parsed.ok_or_else(|| format!("{key}.timeout 必须是整数"))?;
+    let parsed = validate_hermes_i64(Some(parsed), &format!("{key}.timeout"), 30, 1, 86400)?;
+    entry.insert("timeout".to_string(), Value::Number(parsed.into()));
+    Ok(())
+}
+
+fn validate_hermes_hooks(value: &Value) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(map) = value.as_object() else {
+        return Err("hooks 必须是 JSON 对象".to_string());
+    };
+    let mut normalized = serde_json::Map::new();
+    for (raw_event, raw_entries) in map {
+        let event = raw_event.trim();
+        if !is_hermes_hook_event(event) {
+            return Err(format!(
+                "hooks.{} 事件名不受支持",
+                if event.is_empty() {
+                    "<empty>"
+                } else {
+                    raw_event
+                }
+            ));
+        }
+        let Some(entries) = raw_entries.as_array() else {
+            return Err(format!("hooks.{event} 必须是数组"));
+        };
+        let mut normalized_entries = Vec::new();
+        for (index, raw_entry) in entries.iter().enumerate() {
+            let key = format!("hooks.{event}.{index}");
+            let Some(config) = raw_entry.as_object() else {
+                return Err(format!("{key} 必须是 JSON 对象"));
+            };
+            let mut entry = config.clone();
+            let command = entry
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if command.is_empty() {
+                return Err(format!("{key}.command 不能为空"));
+            }
+            entry.insert("command".to_string(), Value::String(command));
+            if let Some(matcher) = entry.get("matcher") {
+                let Some(matcher) = matcher.as_str() else {
+                    return Err(format!("{key}.matcher 必须是字符串"));
+                };
+                entry.insert(
+                    "matcher".to_string(),
+                    Value::String(matcher.trim().to_string()),
+                );
+            }
+            normalize_hermes_hook_timeout(&mut entry, &key)?;
+            normalized_entries.push(Value::Object(entry));
+        }
+        if !normalized_entries.is_empty() {
+            normalized.insert(event.to_string(), Value::Array(normalized_entries));
+        }
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_hooks_json(raw: Option<String>) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| format!("hooks JSON 格式错误: {err}"))?;
+    validate_hermes_hooks(&value)
+}
+
+fn build_hermes_hooks_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let hooks = root
+        .and_then(|map| map.get(yaml_key("hooks")))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_hooks(&value).ok())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "hooksAutoAccept": root.and_then(|map| yaml_bool_field(map, "hooks_auto_accept")).unwrap_or(false),
+        "hooksJson": serde_json::to_string_pretty(&Value::Object(hooks)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn merge_hermes_hooks_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_hooks_config_values(config);
+    let hooks = parse_hermes_hooks_json(
+        form_string(form, "hooksJson")
+            .or_else(|| current["hooksJson"].as_str().map(ToString::to_string)),
+    )?;
+    let hooks_auto_accept = form_bool(form, "hooksAutoAccept")
+        .unwrap_or_else(|| current["hooksAutoAccept"].as_bool().unwrap_or(false));
+
+    let root = ensure_yaml_object(config)?;
+    root.insert(
+        yaml_key("hooks_auto_accept"),
+        serde_yaml::Value::Bool(hooks_auto_accept),
+    );
+    if hooks.is_empty() {
+        root.remove(yaml_key("hooks"));
+    } else {
+        let yaml_value = serde_yaml::to_value(Value::Object(hooks))
+            .map_err(|err| format!("hooks 转换 YAML 失败: {err}"))?;
+        root.insert(yaml_key("hooks"), yaml_value);
+    }
+    Ok(())
+}
+
+fn is_hermes_mcp_server_name(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+fn normalize_hermes_json_string_array(value: &Value, key: &str) -> Result<Vec<Value>, String> {
+    let Some(items) = value.as_array() else {
+        return Err(format!("{key} 必须是字符串数组"));
+    };
+    let mut normalized = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(text) = item.as_str() else {
+            return Err(format!("{key}.{index} 必须是字符串"));
+        };
+        normalized.push(Value::String(text.to_string()));
+    }
+    Ok(normalized)
+}
+
+fn normalize_hermes_json_string_map(
+    value: &Value,
+    key: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(items) = value.as_object() else {
+        return Err(format!("{key} 必须是 JSON 对象"));
+    };
+    let mut normalized = serde_json::Map::new();
+    for (raw_key, raw_value) in items {
+        let item_key = raw_key.trim();
+        if item_key.is_empty() {
+            return Err(format!("{key} 键名不能为空"));
+        }
+        let Some(text) = raw_value.as_str() else {
+            return Err(format!("{key}.{item_key} 必须是字符串"));
+        };
+        normalized.insert(item_key.to_string(), Value::String(text.to_string()));
+    }
+    Ok(normalized)
+}
+
+fn normalize_hermes_mcp_timeout(
+    entry: &mut serde_json::Map<String, Value>,
+    field: &str,
+    key: &str,
+) -> Result<(), String> {
+    if !entry.contains_key(field)
+        || entry.get(field).is_some_and(|value| {
+            value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+        })
+    {
+        entry.remove(field);
+        return Ok(());
+    }
+    let value = entry.get(field).cloned().unwrap_or(Value::Null);
+    let parsed = if let Some(value) = value.as_i64() {
+        Some(value)
+    } else if let Some(value) = value.as_u64() {
+        i64::try_from(value).ok()
+    } else if let Some(value) = value.as_str() {
+        value.trim().parse::<i64>().ok()
+    } else {
+        None
+    };
+    let parsed = parsed.ok_or_else(|| format!("{key} 必须是整数"))?;
+    let parsed = validate_hermes_i64(Some(parsed), key, 120, 1, 86400)?;
+    entry.insert(field.to_string(), Value::Number(parsed.into()));
+    Ok(())
+}
+
+fn normalize_hermes_mcp_sampling(value: &Value, key: &str) -> Result<Value, String> {
+    let Some(config) = value.as_object() else {
+        return Err(format!("{key} 必须是 JSON 对象"));
+    };
+    let mut sampling = config.clone();
+
+    if let Some(enabled) = sampling.get("enabled") {
+        if !enabled.is_boolean() {
+            return Err(format!("{key}.enabled 必须是布尔值"));
+        }
+    }
+
+    if sampling.contains_key("model") {
+        let empty = sampling.get("model").is_some_and(|value| {
+            value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+        });
+        if empty {
+            sampling.remove("model");
+        } else {
+            let Some(model) = sampling.get("model").and_then(|value| value.as_str()) else {
+                return Err(format!("{key}.model 必须是字符串"));
+            };
+            sampling.insert("model".to_string(), Value::String(model.trim().to_string()));
+        }
+    }
+
+    for (field, fallback, min, max) in [
+        ("max_tokens_cap", 4096, 1, 1_000_000),
+        ("timeout", 30, 1, 86400),
+        ("max_rpm", 10, 1, 100000),
+        ("max_tool_rounds", 5, 0, 1000),
+    ] {
+        if let Some(raw) = sampling.get(field).cloned() {
+            let parsed = if let Some(value) = raw.as_i64() {
+                Some(value)
+            } else if let Some(value) = raw.as_u64() {
+                i64::try_from(value).ok()
+            } else if let Some(value) = raw.as_str() {
+                value.trim().parse::<i64>().ok()
+            } else {
+                None
+            };
+            let parsed = parsed.ok_or_else(|| format!("{key}.{field} 必须是整数"))?;
+            let parsed =
+                validate_hermes_i64(Some(parsed), &format!("{key}.{field}"), fallback, min, max)?;
+            sampling.insert(field.to_string(), Value::Number(parsed.into()));
+        }
+    }
+
+    if let Some(allowed_models) = sampling.get("allowed_models") {
+        let allowed_models =
+            normalize_hermes_json_string_array(allowed_models, &format!("{key}.allowed_models"))?;
+        sampling.insert("allowed_models".to_string(), Value::Array(allowed_models));
+    }
+
+    if sampling.contains_key("log_level") {
+        let empty = sampling.get("log_level").is_some_and(|value| {
+            value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+        });
+        if empty {
+            sampling.remove("log_level");
+        } else {
+            let Some(level) = sampling.get("log_level").and_then(|value| value.as_str()) else {
+                return Err(format!("{key}.log_level 必须是字符串"));
+            };
+            let level = level.trim().to_ascii_lowercase();
+            if !matches!(level.as_str(), "debug" | "info" | "warning" | "error") {
+                return Err(format!(
+                    "{key}.log_level 必须是 debug、info、warning 或 error"
+                ));
+            }
+            sampling.insert("log_level".to_string(), Value::String(level));
+        }
+    }
+
+    Ok(Value::Object(sampling))
+}
+
+fn validate_hermes_mcp_servers(value: &Value) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(map) = value.as_object() else {
+        return Err("mcp_servers 必须是 JSON 对象".to_string());
+    };
+    let mut normalized = serde_json::Map::new();
+    for (raw_name, raw_config) in map {
+        let name = raw_name.trim();
+        if !is_hermes_mcp_server_name(name) {
+            return Err(format!(
+                "mcp_servers.{} 服务名只能包含字母、数字、下划线、点和短横线",
+                if name.is_empty() { "<empty>" } else { raw_name }
+            ));
+        }
+        let Some(config) = raw_config.as_object() else {
+            return Err(format!("mcp_servers.{name} 必须是 JSON 对象"));
+        };
+        let mut entry = config.clone();
+        let command = entry
+            .get("command")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let url = entry
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let command_is_empty = command.is_empty();
+        let url_is_empty = url.is_empty();
+        if entry.contains_key("command") {
+            if command_is_empty {
+                return Err(format!("mcp_servers.{name}.command 不能为空"));
+            }
+            entry.insert("command".to_string(), Value::String(command));
+        }
+        if entry.contains_key("url") {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(format!(
+                    "mcp_servers.{name}.url 必须以 http:// 或 https:// 开头"
+                ));
+            }
+            entry.insert("url".to_string(), Value::String(url));
+        }
+        if command_is_empty && url_is_empty {
+            return Err(format!("mcp_servers.{name} 需要 command 或 url"));
+        }
+        if let Some(args) = entry.get("args") {
+            let args =
+                normalize_hermes_json_string_array(args, &format!("mcp_servers.{name}.args"))?;
+            entry.insert("args".to_string(), Value::Array(args));
+        }
+        if let Some(env) = entry.get("env") {
+            let env = normalize_hermes_json_string_map(env, &format!("mcp_servers.{name}.env"))?;
+            entry.insert("env".to_string(), Value::Object(env));
+        }
+        if let Some(headers) = entry.get("headers") {
+            let headers =
+                normalize_hermes_json_string_map(headers, &format!("mcp_servers.{name}.headers"))?;
+            entry.insert("headers".to_string(), Value::Object(headers));
+        }
+        normalize_hermes_mcp_timeout(
+            &mut entry,
+            "timeout",
+            &format!("mcp_servers.{name}.timeout"),
+        )?;
+        normalize_hermes_mcp_timeout(
+            &mut entry,
+            "connect_timeout",
+            &format!("mcp_servers.{name}.connect_timeout"),
+        )?;
+        if let Some(sampling) = entry.get("sampling").cloned() {
+            let sampling =
+                normalize_hermes_mcp_sampling(&sampling, &format!("mcp_servers.{name}.sampling"))?;
+            entry.insert("sampling".to_string(), sampling);
+        }
+        normalized.insert(name.to_string(), Value::Object(entry));
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_mcp_servers_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| format!("mcp_servers JSON 格式错误: {err}"))?;
+    validate_hermes_mcp_servers(&value)
+}
+
+fn build_hermes_mcp_servers_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let mcp_servers = root
+        .and_then(|map| map.get(yaml_key("mcp_servers")))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_mcp_servers(&value).ok())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "mcpServersJson": serde_json::to_string_pretty(&Value::Object(mcp_servers)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn merge_hermes_mcp_servers_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_mcp_servers_config_values(config);
+    let mcp_servers = parse_hermes_mcp_servers_json(
+        form_string(form, "mcpServersJson")
+            .or_else(|| current["mcpServersJson"].as_str().map(ToString::to_string)),
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    if mcp_servers.is_empty() {
+        root.remove(yaml_key("mcp_servers"));
+    } else {
+        let yaml_value = serde_yaml::to_value(Value::Object(mcp_servers))
+            .map_err(|err| format!("mcp_servers 转换 YAML 失败: {err}"))?;
+        root.insert(yaml_key("mcp_servers"), yaml_value);
+    }
+    Ok(())
+}
+
+fn is_hermes_provider_override_name(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+fn is_hermes_provider_model_name(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && !value.split('/').any(|part| part == "..")
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '@' | '+' | '-')
+        })
+}
+
+fn normalize_hermes_provider_timeout(
+    entry: &mut serde_json::Map<String, Value>,
+    field: &str,
+    key: &str,
+) -> Result<(), String> {
+    if !entry.contains_key(field) || entry.get(field).is_some_and(|value| value.is_null()) {
+        entry.remove(field);
+        return Ok(());
+    }
+    let value = entry.get(field).cloned().unwrap_or(Value::Null);
+    let parsed = if let Some(value) = value.as_i64() {
+        Some(value)
+    } else if let Some(value) = value.as_u64() {
+        i64::try_from(value).ok()
+    } else if let Some(value) = value.as_str() {
+        let text = value.trim();
+        if text.is_empty() {
+            None
+        } else {
+            text.parse::<i64>().ok()
+        }
+    } else {
+        None
+    };
+    let parsed = parsed.ok_or_else(|| format!("{key} 必须是整数"))?;
+    let parsed = validate_hermes_i64(Some(parsed), key, 300, 1, 86400)?;
+    entry.insert(field.to_string(), Value::Number(parsed.into()));
+    Ok(())
+}
+
+fn validate_hermes_provider_model_overrides(
+    value: &Value,
+    key: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(map) = value.as_object() else {
+        return Err(format!("{key} 必须是 JSON 对象"));
+    };
+    let mut normalized = serde_json::Map::new();
+    for (raw_model, raw_config) in map {
+        let model = raw_model.trim();
+        if !is_hermes_provider_model_name(model) {
+            return Err(format!(
+                "{key}.{model} 模型名只能包含字母、数字、下划线、点、斜杠、冒号、@、加号和短横线"
+            ));
+        }
+        let Some(config) = raw_config.as_object() else {
+            return Err(format!("{key}.{model} 必须是 JSON 对象"));
+        };
+        let mut entry = config.clone();
+        normalize_hermes_provider_timeout(
+            &mut entry,
+            "timeout_seconds",
+            &format!("{key}.{model}.timeout_seconds"),
+        )?;
+        normalize_hermes_provider_timeout(
+            &mut entry,
+            "stale_timeout_seconds",
+            &format!("{key}.{model}.stale_timeout_seconds"),
+        )?;
+        normalized.insert(model.to_string(), Value::Object(entry));
+    }
+    Ok(normalized)
+}
+
+fn validate_hermes_provider_overrides(
+    value: &Value,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(map) = value.as_object() else {
+        return Err("providers 必须是 JSON 对象".to_string());
+    };
+    let mut normalized = serde_json::Map::new();
+    for (raw_provider, raw_config) in map {
+        let provider = raw_provider.trim().to_ascii_lowercase();
+        if !is_hermes_provider_override_name(&provider) {
+            return Err(format!(
+                "providers.{raw_provider} provider 名只能包含字母、数字、下划线、点和短横线"
+            ));
+        }
+        let Some(config) = raw_config.as_object() else {
+            return Err(format!("providers.{provider} 必须是 JSON 对象"));
+        };
+        let mut entry = config.clone();
+        normalize_hermes_provider_timeout(
+            &mut entry,
+            "request_timeout_seconds",
+            &format!("providers.{provider}.request_timeout_seconds"),
+        )?;
+        normalize_hermes_provider_timeout(
+            &mut entry,
+            "stale_timeout_seconds",
+            &format!("providers.{provider}.stale_timeout_seconds"),
+        )?;
+        if let Some(models) = entry.get("models") {
+            let models = validate_hermes_provider_model_overrides(
+                models,
+                &format!("providers.{provider}.models"),
+            )?;
+            entry.insert("models".to_string(), Value::Object(models));
+        }
+        normalized.insert(provider, Value::Object(entry));
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_provider_overrides_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| format!("providers JSON 格式错误: {err}"))?;
+    validate_hermes_provider_overrides(&value)
+}
+
+fn build_hermes_provider_overrides_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let providers = root
+        .and_then(|map| map.get(yaml_key("providers")))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_provider_overrides(&value).ok())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "providerOverridesJson": serde_json::to_string_pretty(&Value::Object(providers)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn merge_hermes_provider_overrides_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_provider_overrides_config_values(config);
+    let providers = parse_hermes_provider_overrides_json(
+        form_string(form, "providerOverridesJson").or_else(|| {
+            current["providerOverridesJson"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    if providers.is_empty() {
+        root.remove(yaml_key("providers"));
+    } else {
+        let yaml_value = serde_yaml::to_value(Value::Object(providers))
+            .map_err(|err| format!("providers 转换 YAML 失败: {err}"))?;
+        root.insert(yaml_key("providers"), yaml_value);
+    }
+    Ok(())
+}
+
+fn normalize_hermes_toolset_list(raw: Option<String>) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for item in normalize_hermes_multiline_list(raw) {
+        if !item
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(
+                "agent.disabled_toolsets 只能包含字母、数字、下划线、点和短横线".to_string(),
+            );
+        }
+        if !normalized.iter().any(|existing| existing == &item) {
+            normalized.push(item);
+        }
+    }
+    Ok(normalized)
+}
+
+fn default_hermes_platform_toolsets() -> serde_json::Map<String, Value> {
+    let defaults = [
+        ("cli", "hermes-cli"),
+        ("telegram", "hermes-telegram"),
+        ("discord", "hermes-discord"),
+        ("whatsapp", "hermes-whatsapp"),
+        ("slack", "hermes-slack"),
+        ("signal", "hermes-signal"),
+        ("homeassistant", "hermes-homeassistant"),
+        ("qqbot", "hermes-qqbot"),
+        ("yuanbao", "hermes-yuanbao"),
+        ("teams", "hermes-teams"),
+        ("google_chat", "hermes-google_chat"),
+    ];
+    defaults
+        .into_iter()
+        .map(|(platform, toolset)| {
+            (
+                platform.to_string(),
+                Value::Array(vec![Value::String(toolset.to_string())]),
+            )
+        })
+        .collect()
+}
+
+fn normalize_hermes_toolset_values(value: &Value, field_name: &str) -> Result<Vec<String>, String> {
+    let Some(items) = value.as_array() else {
+        return Err(format!("{field_name} 必须是工具集数组"));
+    };
+    let mut normalized = Vec::new();
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(format!("{field_name} 只能包含字符串工具集"));
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(format!(
+                "{field_name} 只能包含字母、数字、下划线、点和短横线"
+            ));
+        }
+        if !normalized.iter().any(|existing| existing == text) {
+            normalized.push(text.to_string());
+        }
+    }
+    if normalized.is_empty() {
+        return Err(format!("{field_name} 至少需要一个工具集"));
+    }
+    Ok(normalized)
+}
+
+fn validate_hermes_platform_toolsets(
+    value: &Value,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(map) = value.as_object() else {
+        return Err("platform_toolsets 必须是 JSON 对象".to_string());
+    };
+    let mut normalized = serde_json::Map::new();
+    for (platform, toolsets) in map {
+        if platform.is_empty()
+            || !platform
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(format!(
+                "platform_toolsets.{platform} 平台名只能包含字母、数字、下划线、点和短横线"
+            ));
+        }
+        let values =
+            normalize_hermes_toolset_values(toolsets, &format!("platform_toolsets.{platform}"))?;
+        normalized.insert(
+            platform.clone(),
+            Value::Array(values.into_iter().map(Value::String).collect()),
+        );
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_platform_toolsets_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|err| format!("platform_toolsets JSON 格式错误: {err}"))?;
+    validate_hermes_platform_toolsets(&value)
+}
+
+fn build_hermes_agent_toolsets_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let disabled_toolsets = root
+        .and_then(|map| yaml_get_mapping(map, "agent"))
+        .map(|map| yaml_string_sequence_field(map, "disabled_toolsets").join("\n"))
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "disabledToolsets": disabled_toolsets,
+    })
+}
+
+fn build_hermes_platform_toolsets_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let platform_toolsets = root
+        .and_then(|map| map.get(yaml_key("platform_toolsets")))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_platform_toolsets(&value).ok())
+        .unwrap_or_else(default_hermes_platform_toolsets);
+
+    serde_json::json!({
+        "platformToolsetsJson": serde_json::to_string_pretty(&Value::Object(platform_toolsets)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn merge_hermes_platform_toolsets_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_platform_toolsets_config_values(config);
+    let platform_toolsets = parse_hermes_platform_toolsets_json(
+        form_string(form, "platformToolsetsJson").or_else(|| {
+            current["platformToolsetsJson"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+    )?;
+    let yaml_value = serde_yaml::to_value(Value::Object(platform_toolsets))
+        .map_err(|err| format!("platform_toolsets 转换 YAML 失败: {err}"))?;
+
+    let root = ensure_yaml_object(config)?;
+    root.insert(yaml_key("platform_toolsets"), yaml_value);
+    Ok(())
+}
+
+fn merge_hermes_agent_toolsets_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_agent_toolsets_config_values(config);
+    let disabled_toolsets =
+        normalize_hermes_toolset_list(form_string(form, "disabledToolsets").or_else(|| {
+            current["disabledToolsets"]
+                .as_str()
+                .map(ToString::to_string)
+        }))?;
+
+    let root = ensure_yaml_object(config)?;
+    let agent = yaml_child_object(root, "agent")?;
+    agent.insert(
+        yaml_key("disabled_toolsets"),
+        serde_yaml::Value::Sequence(
+            disabled_toolsets
+                .into_iter()
+                .map(serde_yaml::Value::String)
+                .collect(),
+        ),
+    );
+    Ok(())
+}
+
+fn normalize_hermes_image_input_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "auto".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "auto" | "native" | "text") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("agent.image_input_mode 必须是 auto、native 或 text".to_string())
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_reasoning_effort(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let effort = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let effort = if effort.is_empty() {
+        "medium".to_string()
+    } else {
+        effort
+    };
+    if matches!(
+        effort.as_str(),
+        "xhigh" | "high" | "medium" | "low" | "minimal" | "none"
+    ) {
+        return Ok(effort);
+    }
+    if strict {
+        Err("agent.reasoning_effort 必须是 xhigh、high、medium、low、minimal 或 none".to_string())
+    } else {
+        Ok("medium".to_string())
+    }
+}
+
+fn validate_hermes_personalities(value: &Value) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(map) = value.as_object() else {
+        return Err("agent.personalities 必须是 JSON 对象".to_string());
+    };
+    let mut normalized = serde_json::Map::new();
+    for (raw_name, raw_prompt) in map {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return Err("agent.personalities 名称不能为空".to_string());
+        }
+        if !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(format!(
+                "agent.personalities.{name} 名称只能包含字母、数字、下划线、点和短横线"
+            ));
+        }
+        let Some(prompt) = raw_prompt.as_str() else {
+            return Err(format!("agent.personalities.{name} 必须是字符串"));
+        };
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(format!("agent.personalities.{name} 不能为空"));
+        }
+        normalized.insert(name.to_string(), Value::String(prompt.to_string()));
+    }
+    Ok(normalized)
+}
+
+fn parse_hermes_personalities_json(
+    raw: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let text = raw.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|err| format!("agent.personalities JSON 格式错误: {err}"))?;
+    validate_hermes_personalities(&value)
+}
+
+fn build_hermes_agent_runtime_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let agent = root.and_then(|map| yaml_get_mapping(map, "agent"));
+
+    let image_input_mode = normalize_hermes_image_input_mode(
+        agent.and_then(|map| yaml_string_field(map, "image_input_mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "auto".to_string());
+    let reasoning_effort = normalize_hermes_reasoning_effort(
+        agent.and_then(|map| yaml_string_field(map, "reasoning_effort")),
+        false,
+    )
+    .unwrap_or_else(|_| "medium".to_string());
+    let personalities = agent
+        .and_then(|map| yaml_get(map, "personalities"))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_personalities(&value).ok())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "agentMaxTurns": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_turns"), 90, 1, 10000)).unwrap_or(90),
+        "gatewayTimeout": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "gateway_timeout"), 1800, 0, 604800)).unwrap_or(1800),
+        "restartDrainTimeout": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "restart_drain_timeout"), 180, 0, 86400)).unwrap_or(180),
+        "apiMaxRetries": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "api_max_retries"), 3, 1, 20)).unwrap_or(3),
+        "gatewayTimeoutWarning": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "gateway_timeout_warning"), 900, 0, 604800)).unwrap_or(900),
+        "clarifyTimeout": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "clarify_timeout"), 600, 0, 86400)).unwrap_or(600),
+        "gatewayNotifyInterval": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "gateway_notify_interval"), 180, 0, 86400)).unwrap_or(180),
+        "gatewayAutoContinueFreshness": agent.map(|map| bounded_hermes_i64(yaml_i64_field(map, "gateway_auto_continue_freshness"), 3600, 0, 604800)).unwrap_or(3600),
+        "imageInputMode": image_input_mode,
+        "agentVerbose": agent.and_then(|map| yaml_bool_field(map, "verbose")).unwrap_or(false),
+        "reasoningEffort": reasoning_effort,
+        "personalitiesJson": serde_json::to_string_pretty(&Value::Object(personalities)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn agent_runtime_i64_value(
+    form: &Value,
+    current: &Value,
+    form_key: &str,
+    default_value: i64,
+) -> Option<i64> {
+    if form.get(form_key).is_some() {
+        form_i64(form, form_key)
+    } else {
+        Some(current[form_key].as_i64().unwrap_or(default_value))
+    }
+}
+
+fn merge_hermes_agent_runtime_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_agent_runtime_config_values(config);
+    let agent_max_turns = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "agentMaxTurns", 90),
+        "agent.max_turns",
+        90,
+        1,
+        10000,
+    )?;
+    let gateway_timeout = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "gatewayTimeout", 1800),
+        "agent.gateway_timeout",
+        1800,
+        0,
+        604800,
+    )?;
+    let restart_drain_timeout = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "restartDrainTimeout", 180),
+        "agent.restart_drain_timeout",
+        180,
+        0,
+        86400,
+    )?;
+    let api_max_retries = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "apiMaxRetries", 3),
+        "agent.api_max_retries",
+        3,
+        1,
+        20,
+    )?;
+    let gateway_timeout_warning = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "gatewayTimeoutWarning", 900),
+        "agent.gateway_timeout_warning",
+        900,
+        0,
+        604800,
+    )?;
+    let clarify_timeout = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "clarifyTimeout", 600),
+        "agent.clarify_timeout",
+        600,
+        0,
+        86400,
+    )?;
+    let gateway_notify_interval = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "gatewayNotifyInterval", 180),
+        "agent.gateway_notify_interval",
+        180,
+        0,
+        86400,
+    )?;
+    let gateway_auto_continue_freshness = validate_hermes_i64(
+        agent_runtime_i64_value(form, &current, "gatewayAutoContinueFreshness", 3600),
+        "agent.gateway_auto_continue_freshness",
+        3600,
+        0,
+        604800,
+    )?;
+    let image_input_mode = normalize_hermes_image_input_mode(
+        if form.get("imageInputMode").is_some() {
+            form_string(form, "imageInputMode")
+        } else {
+            current["imageInputMode"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let agent_verbose = form_bool(form, "agentVerbose")
+        .unwrap_or_else(|| current["agentVerbose"].as_bool().unwrap_or(false));
+    let reasoning_effort = normalize_hermes_reasoning_effort(
+        if form.get("reasoningEffort").is_some() {
+            form_string(form, "reasoningEffort")
+        } else {
+            current["reasoningEffort"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let personalities =
+        parse_hermes_personalities_json(form_string(form, "personalitiesJson").or_else(|| {
+            current["personalitiesJson"]
+                .as_str()
+                .map(ToString::to_string)
+        }))?;
+
+    let root = ensure_yaml_object(config)?;
+    let agent = yaml_child_object(root, "agent")?;
+    agent.insert(
+        yaml_key("max_turns"),
+        serde_yaml::Value::Number(agent_max_turns.into()),
+    );
+    agent.insert(
+        yaml_key("gateway_timeout"),
+        serde_yaml::Value::Number(gateway_timeout.into()),
+    );
+    agent.insert(
+        yaml_key("restart_drain_timeout"),
+        serde_yaml::Value::Number(restart_drain_timeout.into()),
+    );
+    agent.insert(
+        yaml_key("api_max_retries"),
+        serde_yaml::Value::Number(api_max_retries.into()),
+    );
+    agent.insert(
+        yaml_key("gateway_timeout_warning"),
+        serde_yaml::Value::Number(gateway_timeout_warning.into()),
+    );
+    agent.insert(
+        yaml_key("clarify_timeout"),
+        serde_yaml::Value::Number(clarify_timeout.into()),
+    );
+    agent.insert(
+        yaml_key("gateway_notify_interval"),
+        serde_yaml::Value::Number(gateway_notify_interval.into()),
+    );
+    agent.insert(
+        yaml_key("gateway_auto_continue_freshness"),
+        serde_yaml::Value::Number(gateway_auto_continue_freshness.into()),
+    );
+    agent.insert(
+        yaml_key("image_input_mode"),
+        serde_yaml::Value::String(image_input_mode),
+    );
+    agent.insert(yaml_key("verbose"), serde_yaml::Value::Bool(agent_verbose));
+    agent.insert(
+        yaml_key("reasoning_effort"),
+        serde_yaml::Value::String(reasoning_effort),
+    );
+    if personalities.is_empty() {
+        agent.remove(yaml_key("personalities"));
+    } else {
+        let yaml_value = serde_yaml::to_value(Value::Object(personalities))
+            .map_err(|err| format!("agent.personalities 转换 YAML 失败: {err}"))?;
+        agent.insert(yaml_key("personalities"), yaml_value);
+    }
+    Ok(())
+}
+
+fn normalize_hermes_unauthorized_dm_behavior(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let behavior = value.unwrap_or_default().trim().to_ascii_lowercase();
+    if matches!(behavior.as_str(), "pair" | "ignore") {
+        return Ok(behavior);
+    }
+    if strict {
+        Err("unauthorized_dm_behavior 必须是 pair 或 ignore".to_string())
+    } else {
+        Ok("pair".to_string())
+    }
+}
+
+fn build_hermes_unauthorized_dm_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let behavior = root
+        .and_then(|map| yaml_string_field(map, "unauthorized_dm_behavior"))
+        .and_then(|value| normalize_hermes_unauthorized_dm_behavior(Some(value), false).ok())
+        .unwrap_or_else(|| "pair".to_string());
+
+    serde_json::json!({
+        "unauthorizedDmBehavior": behavior,
+    })
+}
+
+fn merge_hermes_unauthorized_dm_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_unauthorized_dm_config_values(config);
+    let behavior = normalize_hermes_unauthorized_dm_behavior(
+        form_string(form, "unauthorizedDmBehavior").or_else(|| {
+            current["unauthorizedDmBehavior"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        true,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    root.insert(
+        yaml_key("unauthorized_dm_behavior"),
+        serde_yaml::Value::String(behavior),
+    );
+    Ok(())
+}
+
+fn build_hermes_security_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let security = root.and_then(|map| yaml_get_mapping(map, "security"));
+
+    let tirith_enabled = security
+        .and_then(|map| yaml_bool_field(map, "tirith_enabled"))
+        .unwrap_or(true);
+    let tirith_path = security
+        .and_then(|map| yaml_string_field(map, "tirith_path"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "tirith".to_string());
+    let tirith_timeout = security
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "tirith_timeout"), 5, 1, 300))
+        .unwrap_or(5);
+    let tirith_fail_open = security
+        .and_then(|map| yaml_bool_field(map, "tirith_fail_open"))
+        .unwrap_or(true);
+
+    serde_json::json!({
+        "tirithEnabled": tirith_enabled,
+        "tirithPath": tirith_path,
+        "tirithTimeout": tirith_timeout,
+        "tirithFailOpen": tirith_fail_open,
+    })
+}
+
+fn merge_hermes_security_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_security_config_values(config);
+    let tirith_path = form_string(form, "tirithPath")
+        .or_else(|| current["tirithPath"].as_str().map(ToString::to_string))
+        .unwrap_or_else(|| "tirith".to_string())
+        .trim()
+        .to_string();
+    if tirith_path.is_empty() {
+        return Err("security.tirith_path 不能为空".to_string());
+    }
+
+    let root = ensure_yaml_object(config)?;
+    let tirith_timeout = validate_hermes_i64(
+        if form.get("tirithTimeout").is_some() {
+            form_i64(form, "tirithTimeout")
+        } else {
+            Some(current["tirithTimeout"].as_i64().unwrap_or(5))
+        },
+        "security.tirith_timeout",
+        5,
+        1,
+        300,
+    )?;
+    let security = yaml_child_object(root, "security")?;
+    security.insert(
+        yaml_key("tirith_enabled"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "tirithEnabled")
+                .unwrap_or_else(|| current["tirithEnabled"].as_bool().unwrap_or(true)),
+        ),
+    );
+    security.insert(
+        yaml_key("tirith_path"),
+        serde_yaml::Value::String(tirith_path),
+    );
+    security.insert(
+        yaml_key("tirith_timeout"),
+        serde_yaml::Value::Number(tirith_timeout.into()),
+    );
+    security.insert(
+        yaml_key("tirith_fail_open"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "tirithFailOpen")
+                .unwrap_or_else(|| current["tirithFailOpen"].as_bool().unwrap_or(true)),
+        ),
+    );
+    Ok(())
+}
+
+fn normalize_hermes_human_delay_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "off".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "off" | "natural" | "custom") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("human_delay.mode 必须是 off、natural 或 custom".to_string())
+    } else {
+        Ok("off".to_string())
+    }
+}
+
+const HERMES_DISPLAY_LANGUAGE_VALUES: &[&str] = &[
+    "en", "zh", "zh-hant", "ja", "de", "es", "fr", "tr", "uk", "af", "ko", "it", "ga", "pt", "ru",
+    "hu",
+];
+
+const HERMES_DISPLAY_BUSY_INPUT_MODES: &[&str] = &["interrupt", "queue", "steer"];
+const HERMES_DISPLAY_BACKGROUND_PROCESS_NOTIFICATIONS: &[&str] = &["off", "result", "error", "all"];
+const HERMES_DISPLAY_FINAL_RESPONSE_MARKDOWN_VALUES: &[&str] = &["render", "strip", "raw"];
+const HERMES_TUI_STATUS_INDICATORS: &[&str] = &["kaomoji", "emoji", "unicode", "ascii"];
+const HERMES_COPY_SHORTCUTS: &[&str] = &["auto", "ctrl_c", "ctrl_shift_c", "disabled"];
+const HERMES_DISPLAY_SKINS: &[&str] = &[
+    "default",
+    "ares",
+    "mono",
+    "slate",
+    "daylight",
+    "warm-lightmode",
+    "poseidon",
+    "sisyphus",
+    "charizard",
+];
+
+const HERMES_RUNTIME_FOOTER_FIELDS: &[&str] =
+    &["model", "context_pct", "cwd", "duration", "tokens", "cost"];
+
+fn normalize_hermes_display_language(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let language = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let language = if language.is_empty() {
+        "en".to_string()
+    } else {
+        language
+    };
+    if HERMES_DISPLAY_LANGUAGE_VALUES.contains(&language.as_str()) {
+        Ok(language)
+    } else if strict {
+        Err("display.language 不在支持列表中".to_string())
+    } else {
+        Ok("en".to_string())
+    }
+}
+
+fn normalize_hermes_display_skin(value: Option<String>, strict: bool) -> Result<String, String> {
+    let skin = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let skin = if skin.is_empty() {
+        "default".to_string()
+    } else {
+        skin
+    };
+    if HERMES_DISPLAY_SKINS.contains(&skin.as_str()) {
+        Ok(skin)
+    } else if strict {
+        Err("display.skin 必须是内置皮肤 default、ares、mono、slate、daylight、warm-lightmode、poseidon、sisyphus 或 charizard".to_string())
+    } else {
+        Ok("default".to_string())
+    }
+}
+
+fn normalize_hermes_display_resume(value: Option<String>, strict: bool) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "full".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "full" | "minimal") {
+        Ok(mode)
+    } else if strict {
+        Err("display.resume_display 必须是 full 或 minimal".to_string())
+    } else {
+        Ok("full".to_string())
+    }
+}
+
+fn normalize_hermes_display_busy_input_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "interrupt".to_string()
+    } else {
+        mode
+    };
+    if HERMES_DISPLAY_BUSY_INPUT_MODES.contains(&mode.as_str()) {
+        Ok(mode)
+    } else if strict {
+        Err("display.busy_input_mode 必须是 interrupt、queue 或 steer".to_string())
+    } else {
+        Ok("interrupt".to_string())
+    }
+}
+
+fn normalize_hermes_display_background_process_notifications(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "all".to_string()
+    } else {
+        mode
+    };
+    if HERMES_DISPLAY_BACKGROUND_PROCESS_NOTIFICATIONS.contains(&mode.as_str()) {
+        Ok(mode)
+    } else if strict {
+        Err("display.background_process_notifications 必须是 off、result、error 或 all".to_string())
+    } else {
+        Ok("all".to_string())
+    }
+}
+
+fn normalize_hermes_display_final_response_markdown(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "strip".to_string()
+    } else {
+        mode
+    };
+    if HERMES_DISPLAY_FINAL_RESPONSE_MARKDOWN_VALUES.contains(&mode.as_str()) {
+        Ok(mode)
+    } else if strict {
+        Err("display.final_response_markdown 必须是 render、strip 或 raw".to_string())
+    } else {
+        Ok("strip".to_string())
+    }
+}
+
+fn normalize_hermes_tui_status_indicator(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "kaomoji".to_string()
+    } else {
+        mode
+    };
+    if HERMES_TUI_STATUS_INDICATORS.contains(&mode.as_str()) {
+        Ok(mode)
+    } else if strict {
+        Err("display.tui_status_indicator 必须是 kaomoji、emoji、unicode 或 ascii".to_string())
+    } else {
+        Ok("kaomoji".to_string())
+    }
+}
+
+fn normalize_hermes_copy_shortcut(value: Option<String>, strict: bool) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "auto".to_string()
+    } else {
+        mode
+    };
+    if HERMES_COPY_SHORTCUTS.contains(&mode.as_str()) {
+        Ok(mode)
+    } else if strict {
+        Err("display.copy_shortcut 必须是 auto、ctrl_c、ctrl_shift_c 或 disabled".to_string())
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_runtime_footer_fields_text(
+    value: Option<String>,
+    strict: bool,
+) -> Result<Vec<String>, String> {
+    let fields = match value {
+        Some(value) => {
+            let text = value.trim().to_string();
+            if text.contains('\n') || text.contains(',') {
+                text.split(['\n', ','])
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            } else if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text]
+            }
+        }
+        None => Vec::new(),
+    };
+    let fields = if fields.is_empty() {
+        vec![
+            "model".to_string(),
+            "context_pct".to_string(),
+            "cwd".to_string(),
+        ]
+    } else {
+        fields
+    };
+    if let Some(invalid) = fields
+        .iter()
+        .find(|item| !HERMES_RUNTIME_FOOTER_FIELDS.contains(&item.as_str()))
+    {
+        if strict {
+            return Err(format!(
+                "display.runtime_footer.fields 包含不支持的字段: {invalid}"
+            ));
+        }
+        return Ok(vec![
+            "model".to_string(),
+            "context_pct".to_string(),
+            "cwd".to_string(),
+        ]);
+    }
+    Ok(fields)
+}
+
+fn normalize_hermes_runtime_footer_fields(
+    value: Option<&serde_yaml::Value>,
+    strict: bool,
+) -> Result<Vec<String>, String> {
+    let fields = match value {
+        Some(serde_yaml::Value::Sequence(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::trim))
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        Some(serde_yaml::Value::String(text)) => text
+            .split(['\n', ','])
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    normalize_hermes_runtime_footer_fields_text(
+        if fields.is_empty() {
+            None
+        } else {
+            Some(fields.join("\n"))
+        },
+        strict,
+    )
+}
+
+fn build_hermes_display_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let display = root.and_then(|map| yaml_get_mapping(map, "display"));
+    let dashboard = root.and_then(|map| yaml_get_mapping(map, "dashboard"));
+    let runtime_footer = display.and_then(|map| yaml_get_mapping(map, "runtime_footer"));
+    let user_message_preview =
+        display.and_then(|map| yaml_get_mapping(map, "user_message_preview"));
+    let runtime_footer_fields = normalize_hermes_runtime_footer_fields(
+        runtime_footer.and_then(|map| yaml_get(map, "fields")),
+        false,
+    )
+    .unwrap_or_else(|_| {
+        vec![
+            "model".to_string(),
+            "context_pct".to_string(),
+            "cwd".to_string(),
+        ]
+    });
+
+    serde_json::json!({
+        "displayCompact": display.and_then(|map| yaml_bool_field(map, "compact")).unwrap_or(false),
+        "displaySkin": normalize_hermes_display_skin(
+            display.and_then(|map| yaml_string_field(map, "skin")),
+            false,
+        ).unwrap_or_else(|_| "default".to_string()),
+        "displayToolPrefix": normalize_hermes_display_tool_prefix(
+            display.and_then(|map| yaml_string_field(map, "tool_prefix")),
+            false,
+        ).unwrap_or_else(|_| "┊".to_string()),
+        "displayToolProgress": normalize_hermes_display_tool_progress(
+            display.and_then(|map| yaml_string_field(map, "tool_progress")),
+            false,
+            "display.tool_progress",
+        ).unwrap_or_else(|_| "all".to_string()),
+        "displayShowReasoning": display.and_then(|map| yaml_bool_field(map, "show_reasoning")).unwrap_or(false),
+        "displayToolPreviewLength": display
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "tool_preview_length"), 0, 0, 200000))
+            .unwrap_or(0),
+        "displayCleanupProgress": display.and_then(|map| yaml_bool_field(map, "cleanup_progress")).unwrap_or(false),
+        "displayToolProgressCommand": display.and_then(|map| yaml_bool_field(map, "tool_progress_command")).unwrap_or(false),
+        "displayInterimAssistantMessages": display.and_then(|map| yaml_bool_field(map, "interim_assistant_messages")).unwrap_or(true),
+        "displayRuntimeFooterEnabled": runtime_footer.and_then(|map| yaml_bool_field(map, "enabled")).unwrap_or(false),
+        "displayRuntimeFooterFields": runtime_footer_fields.join("\n"),
+        "displayFileMutationVerifier": display.and_then(|map| yaml_bool_field(map, "file_mutation_verifier")).unwrap_or(true),
+        "displayShowCost": display.and_then(|map| yaml_bool_field(map, "show_cost")).unwrap_or(false),
+        "dashboardShowTokenAnalytics": dashboard.and_then(|map| yaml_bool_field(map, "show_token_analytics")).unwrap_or(false),
+        "displayLanguage": normalize_hermes_display_language(
+            display.and_then(|map| yaml_string_field(map, "language")),
+            false,
+        ).unwrap_or_else(|_| "en".to_string()),
+        "displayResumeDisplay": normalize_hermes_display_resume(
+            display.and_then(|map| yaml_string_field(map, "resume_display")),
+            false,
+        ).unwrap_or_else(|_| "full".to_string()),
+        "displayBusyInputMode": normalize_hermes_display_busy_input_mode(
+            display.and_then(|map| yaml_string_field(map, "busy_input_mode")),
+            false,
+        ).unwrap_or_else(|_| "interrupt".to_string()),
+        "displayBackgroundProcessNotifications": normalize_hermes_display_background_process_notifications(
+            display.and_then(|map| yaml_string_field(map, "background_process_notifications")),
+            false,
+        ).unwrap_or_else(|_| "all".to_string()),
+        "displayFinalResponseMarkdown": normalize_hermes_display_final_response_markdown(
+            display.and_then(|map| yaml_string_field(map, "final_response_markdown")),
+            false,
+        ).unwrap_or_else(|_| "strip".to_string()),
+        "displayTimestamps": display.and_then(|map| yaml_bool_field(map, "timestamps")).unwrap_or(false),
+        "displayBellOnComplete": display.and_then(|map| yaml_bool_field(map, "bell_on_complete")).unwrap_or(false),
+        "displayPersistentOutput": display.and_then(|map| yaml_bool_field(map, "persistent_output")).unwrap_or(true),
+        "displayPersistentOutputMaxLines": display
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "persistent_output_max_lines"), 200, 0, 100000))
+            .unwrap_or(200),
+        "displayInlineDiffs": display.and_then(|map| yaml_bool_field(map, "inline_diffs")).unwrap_or(true),
+        "displayTuiAutoResumeRecent": display.and_then(|map| yaml_bool_field(map, "tui_auto_resume_recent")).unwrap_or(false),
+        "displayTuiStatusIndicator": normalize_hermes_tui_status_indicator(
+            display.and_then(|map| yaml_string_field(map, "tui_status_indicator")),
+            false,
+        ).unwrap_or_else(|_| "kaomoji".to_string()),
+        "displayUserMessagePreviewFirstLines": user_message_preview
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "first_lines"), 2, 1, 100))
+            .unwrap_or(2),
+        "displayUserMessagePreviewLastLines": user_message_preview
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "last_lines"), 2, 0, 100))
+            .unwrap_or(2),
+        "displayEphemeralSystemTtl": display
+            .map(|map| bounded_hermes_i64(yaml_i64_field(map, "ephemeral_system_ttl"), 0, 0, 86400))
+            .unwrap_or(0),
+        "displayCopyShortcut": normalize_hermes_copy_shortcut(
+            display.and_then(|map| yaml_string_field(map, "copy_shortcut")),
+            false,
+        ).unwrap_or_else(|_| "auto".to_string()),
+    })
+}
+
+fn merge_hermes_display_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_display_config_values(config);
+    let tool_progress = normalize_hermes_display_tool_progress(
+        form_string(form, "displayToolProgress").or_else(|| {
+            current["displayToolProgress"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        true,
+        "display.tool_progress",
+    )?;
+    let runtime_footer_fields = normalize_hermes_runtime_footer_fields_text(
+        form.get("displayRuntimeFooterFields")
+            .and_then(|value| value.as_str().map(ToString::to_string))
+            .or_else(|| {
+                current["displayRuntimeFooterFields"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+        true,
+    )?;
+    let final_response_markdown = normalize_hermes_display_final_response_markdown(
+        form_string(form, "displayFinalResponseMarkdown").or_else(|| {
+            current["displayFinalResponseMarkdown"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        true,
+    )?;
+    let persistent_output_max_lines = validate_hermes_i64(
+        form_i64(form, "displayPersistentOutputMaxLines")
+            .or_else(|| current["displayPersistentOutputMaxLines"].as_i64()),
+        "display.persistent_output_max_lines",
+        200,
+        0,
+        100000,
+    )?;
+    let user_message_preview_first_lines = validate_hermes_i64(
+        form_i64(form, "displayUserMessagePreviewFirstLines")
+            .or_else(|| current["displayUserMessagePreviewFirstLines"].as_i64()),
+        "display.user_message_preview.first_lines",
+        2,
+        1,
+        100,
+    )?;
+    let user_message_preview_last_lines = validate_hermes_i64(
+        form_i64(form, "displayUserMessagePreviewLastLines")
+            .or_else(|| current["displayUserMessagePreviewLastLines"].as_i64()),
+        "display.user_message_preview.last_lines",
+        2,
+        0,
+        100,
+    )?;
+    let ephemeral_system_ttl = validate_hermes_i64(
+        form_i64(form, "displayEphemeralSystemTtl")
+            .or_else(|| current["displayEphemeralSystemTtl"].as_i64()),
+        "display.ephemeral_system_ttl",
+        0,
+        0,
+        86400,
+    )?;
+    let tool_preview_length = validate_hermes_i64(
+        form_i64(form, "displayToolPreviewLength")
+            .or_else(|| current["displayToolPreviewLength"].as_i64()),
+        "display.tool_preview_length",
+        0,
+        0,
+        200000,
+    )?;
+
+    let display = yaml_child_object(ensure_yaml_object(config)?, "display")?;
+    display.insert(
+        yaml_key("compact"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayCompact")
+                .unwrap_or_else(|| current["displayCompact"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
+        yaml_key("skin"),
+        serde_yaml::Value::String(normalize_hermes_display_skin(
+            form_string(form, "displaySkin")
+                .or_else(|| current["displaySkin"].as_str().map(ToString::to_string)),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("tool_prefix"),
+        serde_yaml::Value::String(normalize_hermes_display_tool_prefix(
+            form_string(form, "displayToolPrefix").or_else(|| {
+                current["displayToolPrefix"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("tool_progress"),
+        serde_yaml::Value::String(tool_progress),
+    );
+    display.insert(
+        yaml_key("show_reasoning"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayShowReasoning")
+                .unwrap_or_else(|| current["displayShowReasoning"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
+        yaml_key("tool_preview_length"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(tool_preview_length)),
+    );
+    display.insert(
+        yaml_key("cleanup_progress"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayCleanupProgress")
+                .unwrap_or_else(|| current["displayCleanupProgress"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
+        yaml_key("tool_progress_command"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayToolProgressCommand").unwrap_or_else(|| {
+                current["displayToolProgressCommand"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+        ),
+    );
+    display.insert(
+        yaml_key("interim_assistant_messages"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayInterimAssistantMessages").unwrap_or_else(|| {
+                current["displayInterimAssistantMessages"]
+                    .as_bool()
+                    .unwrap_or(true)
+            }),
+        ),
+    );
+    display.insert(
+        yaml_key("file_mutation_verifier"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayFileMutationVerifier").unwrap_or_else(|| {
+                current["displayFileMutationVerifier"]
+                    .as_bool()
+                    .unwrap_or(true)
+            }),
+        ),
+    );
+    display.insert(
+        yaml_key("show_cost"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayShowCost")
+                .unwrap_or_else(|| current["displayShowCost"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
+        yaml_key("language"),
+        serde_yaml::Value::String(normalize_hermes_display_language(
+            form_string(form, "displayLanguage")
+                .or_else(|| current["displayLanguage"].as_str().map(ToString::to_string)),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("resume_display"),
+        serde_yaml::Value::String(normalize_hermes_display_resume(
+            form_string(form, "displayResumeDisplay").or_else(|| {
+                current["displayResumeDisplay"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("busy_input_mode"),
+        serde_yaml::Value::String(normalize_hermes_display_busy_input_mode(
+            form_string(form, "displayBusyInputMode").or_else(|| {
+                current["displayBusyInputMode"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("background_process_notifications"),
+        serde_yaml::Value::String(normalize_hermes_display_background_process_notifications(
+            form_string(form, "displayBackgroundProcessNotifications").or_else(|| {
+                current["displayBackgroundProcessNotifications"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("final_response_markdown"),
+        serde_yaml::Value::String(final_response_markdown),
+    );
+    display.insert(
+        yaml_key("timestamps"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayTimestamps")
+                .unwrap_or_else(|| current["displayTimestamps"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
+        yaml_key("bell_on_complete"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayBellOnComplete")
+                .unwrap_or_else(|| current["displayBellOnComplete"].as_bool().unwrap_or(false)),
+        ),
+    );
+    display.insert(
+        yaml_key("persistent_output"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayPersistentOutput")
+                .unwrap_or_else(|| current["displayPersistentOutput"].as_bool().unwrap_or(true)),
+        ),
+    );
+    display.insert(
+        yaml_key("persistent_output_max_lines"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(persistent_output_max_lines)),
+    );
+    display.insert(
+        yaml_key("inline_diffs"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayInlineDiffs")
+                .unwrap_or_else(|| current["displayInlineDiffs"].as_bool().unwrap_or(true)),
+        ),
+    );
+    display.insert(
+        yaml_key("tui_auto_resume_recent"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayTuiAutoResumeRecent").unwrap_or_else(|| {
+                current["displayTuiAutoResumeRecent"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+        ),
+    );
+    display.insert(
+        yaml_key("tui_status_indicator"),
+        serde_yaml::Value::String(normalize_hermes_tui_status_indicator(
+            form_string(form, "displayTuiStatusIndicator").or_else(|| {
+                current["displayTuiStatusIndicator"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+            true,
+        )?),
+    );
+    display.insert(
+        yaml_key("ephemeral_system_ttl"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(ephemeral_system_ttl)),
+    );
+    display.insert(
+        yaml_key("copy_shortcut"),
+        serde_yaml::Value::String(normalize_hermes_copy_shortcut(
+            form_string(form, "displayCopyShortcut").or_else(|| {
+                current["displayCopyShortcut"]
+                    .as_str()
+                    .map(ToString::to_string)
+            }),
+            true,
+        )?),
+    );
+    let user_message_preview = yaml_child_object(display, "user_message_preview")?;
+    user_message_preview.insert(
+        yaml_key("first_lines"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(user_message_preview_first_lines)),
+    );
+    user_message_preview.insert(
+        yaml_key("last_lines"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(user_message_preview_last_lines)),
+    );
+    let runtime_footer = yaml_child_object(display, "runtime_footer")?;
+    runtime_footer.insert(
+        yaml_key("enabled"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "displayRuntimeFooterEnabled").unwrap_or_else(|| {
+                current["displayRuntimeFooterEnabled"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+        ),
+    );
+    runtime_footer.insert(
+        yaml_key("fields"),
+        serde_yaml::Value::Sequence(
+            runtime_footer_fields
+                .into_iter()
+                .map(serde_yaml::Value::String)
+                .collect(),
+        ),
+    );
+    let dashboard = yaml_child_object(ensure_yaml_object(config)?, "dashboard")?;
+    dashboard.insert(
+        yaml_key("show_token_analytics"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "dashboardShowTokenAnalytics").unwrap_or_else(|| {
+                current["dashboardShowTokenAnalytics"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+        ),
+    );
+    Ok(())
+}
+
+fn build_hermes_human_delay_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let human_delay = root.and_then(|map| yaml_get_mapping(map, "human_delay"));
+    let mode = human_delay
+        .and_then(|map| yaml_string_field(map, "mode"))
+        .and_then(|value| normalize_hermes_human_delay_mode(Some(value), false).ok())
+        .unwrap_or_else(|| "off".to_string());
+    let min_ms = human_delay
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "min_ms"), 800, 0, 60000))
+        .unwrap_or(800);
+    let max_ms = human_delay
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_ms"), 2500, 0, 60000))
+        .unwrap_or(2500)
+        .max(min_ms);
+
+    serde_json::json!({
+        "humanDelayMode": mode,
+        "humanDelayMinMs": min_ms,
+        "humanDelayMaxMs": max_ms,
+    })
+}
+
+fn build_hermes_kanban_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let kanban = root.and_then(|map| yaml_get_mapping(map, "kanban"));
+    serde_json::json!({
+        "dispatchInGateway": kanban
+            .and_then(|map| yaml_bool_field(map, "dispatch_in_gateway"))
+            .unwrap_or(true),
+        "dispatchIntervalSeconds": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "dispatch_interval_seconds"),
+                60,
+                1,
+                86400,
+            ))
+            .unwrap_or(60),
+        "maxSpawn": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "max_spawn"),
+                0,
+                0,
+                1000,
+            ))
+            .unwrap_or(0),
+        "maxInProgress": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "max_in_progress"),
+                0,
+                0,
+                1000,
+            ))
+            .unwrap_or(0),
+        "failureLimit": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "failure_limit"),
+                2,
+                1,
+                100,
+            ))
+            .unwrap_or(2),
+        "autoDecompose": kanban
+            .and_then(|map| yaml_bool_field(map, "auto_decompose"))
+            .unwrap_or(true),
+        "autoDecomposePerTick": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "auto_decompose_per_tick"),
+                3,
+                1,
+                1000,
+            ))
+            .unwrap_or(3),
+        "workerLogRotateBytes": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "worker_log_rotate_bytes"),
+                2097152,
+                1,
+                1073741824,
+            ))
+            .unwrap_or(2097152),
+        "workerLogBackupCount": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "worker_log_backup_count"),
+                1,
+                0,
+                100,
+            ))
+            .unwrap_or(1),
+        "orchestratorProfile": kanban
+            .and_then(|map| yaml_string_field(map, "orchestrator_profile"))
+            .unwrap_or_default(),
+        "defaultAssignee": kanban
+            .and_then(|map| yaml_string_field(map, "default_assignee"))
+            .unwrap_or_default(),
+        "dispatchStaleTimeoutSeconds": kanban
+            .map(|map| bounded_hermes_i64(
+                yaml_i64_field(map, "dispatch_stale_timeout_seconds"),
+                14400,
+                0,
+                604800,
+            ))
+            .unwrap_or(14400),
+    })
+}
+
+fn merge_hermes_kanban_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_kanban_config_values(config);
+    let dispatch_in_gateway = form_bool(form, "dispatchInGateway")
+        .or_else(|| current["dispatchInGateway"].as_bool())
+        .unwrap_or(true);
+    let dispatch_interval_seconds = validate_hermes_i64(
+        form_i64(form, "dispatchIntervalSeconds")
+            .or_else(|| current["dispatchIntervalSeconds"].as_i64()),
+        "kanban.dispatch_interval_seconds",
+        60,
+        1,
+        86400,
+    )?;
+    let max_spawn = validate_hermes_i64(
+        form_i64(form, "maxSpawn").or_else(|| current["maxSpawn"].as_i64()),
+        "kanban.max_spawn",
+        0,
+        0,
+        1000,
+    )?;
+    let max_in_progress = validate_hermes_i64(
+        form_i64(form, "maxInProgress").or_else(|| current["maxInProgress"].as_i64()),
+        "kanban.max_in_progress",
+        0,
+        0,
+        1000,
+    )?;
+    let failure_limit = validate_hermes_i64(
+        form_i64(form, "failureLimit").or_else(|| current["failureLimit"].as_i64()),
+        "kanban.failure_limit",
+        2,
+        1,
+        100,
+    )?;
+    let auto_decompose = form_bool(form, "autoDecompose")
+        .or_else(|| current["autoDecompose"].as_bool())
+        .unwrap_or(true);
+    let auto_decompose_per_tick = validate_hermes_i64(
+        form_i64(form, "autoDecomposePerTick").or_else(|| current["autoDecomposePerTick"].as_i64()),
+        "kanban.auto_decompose_per_tick",
+        3,
+        1,
+        1000,
+    )?;
+    let worker_log_rotate_bytes = validate_hermes_i64(
+        form_i64(form, "workerLogRotateBytes").or_else(|| current["workerLogRotateBytes"].as_i64()),
+        "kanban.worker_log_rotate_bytes",
+        2097152,
+        1,
+        1073741824,
+    )?;
+    let worker_log_backup_count = validate_hermes_i64(
+        form_i64(form, "workerLogBackupCount").or_else(|| current["workerLogBackupCount"].as_i64()),
+        "kanban.worker_log_backup_count",
+        1,
+        0,
+        100,
+    )?;
+    let orchestrator_profile = if form.get("orchestratorProfile").is_some() {
+        form_string(form, "orchestratorProfile")
+            .ok_or_else(|| "kanban.orchestrator_profile must be a string".to_string())?
+            .trim()
+            .to_string()
+    } else {
+        current["orchestratorProfile"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let default_assignee = if form.get("defaultAssignee").is_some() {
+        form_string(form, "defaultAssignee")
+            .ok_or_else(|| "kanban.default_assignee must be a string".to_string())?
+            .trim()
+            .to_string()
+    } else {
+        current["defaultAssignee"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let stale_timeout = validate_hermes_i64(
+        form_i64(form, "dispatchStaleTimeoutSeconds")
+            .or_else(|| current["dispatchStaleTimeoutSeconds"].as_i64()),
+        "kanban.dispatch_stale_timeout_seconds",
+        14400,
+        0,
+        604800,
+    )?;
+
+    let kanban = yaml_child_object(ensure_yaml_object(config)?, "kanban")?;
+    kanban.insert(
+        yaml_key("dispatch_in_gateway"),
+        serde_yaml::Value::Bool(dispatch_in_gateway),
+    );
+    kanban.insert(
+        yaml_key("dispatch_interval_seconds"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(dispatch_interval_seconds)),
+    );
+    if max_spawn > 0 {
+        kanban.insert(
+            yaml_key("max_spawn"),
+            serde_yaml::Value::Number(serde_yaml::Number::from(max_spawn)),
+        );
+    } else {
+        kanban.remove(yaml_key("max_spawn"));
+    }
+    if max_in_progress > 0 {
+        kanban.insert(
+            yaml_key("max_in_progress"),
+            serde_yaml::Value::Number(serde_yaml::Number::from(max_in_progress)),
+        );
+    } else {
+        kanban.remove(yaml_key("max_in_progress"));
+    }
+    kanban.insert(
+        yaml_key("failure_limit"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(failure_limit)),
+    );
+    kanban.insert(
+        yaml_key("auto_decompose"),
+        serde_yaml::Value::Bool(auto_decompose),
+    );
+    kanban.insert(
+        yaml_key("auto_decompose_per_tick"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(auto_decompose_per_tick)),
+    );
+    kanban.insert(
+        yaml_key("worker_log_rotate_bytes"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(worker_log_rotate_bytes)),
+    );
+    kanban.insert(
+        yaml_key("worker_log_backup_count"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(worker_log_backup_count)),
+    );
+    set_optional_yaml_string(kanban, "orchestrator_profile", orchestrator_profile);
+    set_optional_yaml_string(kanban, "default_assignee", default_assignee);
+    kanban.insert(
+        yaml_key("dispatch_stale_timeout_seconds"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(stale_timeout)),
+    );
+    Ok(())
+}
+
+fn merge_hermes_human_delay_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_human_delay_config_values(config);
+    let mode = normalize_hermes_human_delay_mode(
+        form_string(form, "humanDelayMode")
+            .or_else(|| current["humanDelayMode"].as_str().map(ToString::to_string)),
+        true,
+    )?;
+    let min_ms = validate_hermes_i64(
+        if form.get("humanDelayMinMs").is_some() {
+            form_i64(form, "humanDelayMinMs")
+        } else {
+            Some(current["humanDelayMinMs"].as_i64().unwrap_or(800))
+        },
+        "human_delay.min_ms",
+        800,
+        0,
+        60000,
+    )?;
+    let max_ms = validate_hermes_i64(
+        if form.get("humanDelayMaxMs").is_some() {
+            form_i64(form, "humanDelayMaxMs")
+        } else {
+            Some(current["humanDelayMaxMs"].as_i64().unwrap_or(2500))
+        },
+        "human_delay.max_ms",
+        2500,
+        0,
+        60000,
+    )?;
+    if max_ms < min_ms {
+        return Err("human_delay.max_ms 不能小于 min_ms".to_string());
+    }
+
+    let root = ensure_yaml_object(config)?;
+    let human_delay = yaml_child_object(root, "human_delay")?;
+    human_delay.insert(yaml_key("mode"), serde_yaml::Value::String(mode));
+    human_delay.insert(yaml_key("min_ms"), serde_yaml::Value::Number(min_ms.into()));
+    human_delay.insert(yaml_key("max_ms"), serde_yaml::Value::Number(max_ms.into()));
+    Ok(())
+}
+
+fn normalize_hermes_streaming_transport(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let transport = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let transport = if transport.is_empty() {
+        "edit".to_string()
+    } else {
+        transport
+    };
+    if matches!(transport.as_str(), "auto" | "draft" | "edit" | "off") {
+        return Ok(transport);
+    }
+    if strict {
+        Err("streaming.transport 必须是 auto、draft、edit 或 off".to_string())
+    } else {
+        Ok("edit".to_string())
+    }
+}
+
+fn normalize_hermes_code_execution_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "project".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "project" | "strict") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("code_execution.mode 必须是 project 或 strict".to_string())
+    } else {
+        Ok("project".to_string())
+    }
+}
+
+fn normalize_hermes_terminal_backend(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let backend = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let backend = if backend.is_empty() {
+        "local".to_string()
+    } else {
+        backend
+    };
+    if matches!(
+        backend.as_str(),
+        "local" | "ssh" | "docker" | "singularity" | "modal" | "daytona" | "vercel_sandbox"
+    ) {
+        return Ok(backend);
+    }
+    if strict {
+        Err("terminal.backend 必须是 local、ssh、docker、singularity、modal、daytona 或 vercel_sandbox"
+            .to_string())
+    } else {
+        Ok("local".to_string())
+    }
+}
+
+fn normalize_hermes_terminal_modal_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "auto".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "auto" | "managed" | "direct") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("terminal.modal_mode 必须是 auto、managed 或 direct".to_string())
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_terminal_vercel_runtime(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let runtime = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let runtime = if runtime.is_empty() {
+        "node24".to_string()
+    } else {
+        runtime
+    };
+    if matches!(runtime.as_str(), "node24" | "node22" | "python3.13") {
+        return Ok(runtime);
+    }
+    if strict {
+        Err("terminal.vercel_runtime 必须是 node24、node22 或 python3.13".to_string())
+    } else {
+        Ok("node24".to_string())
+    }
+}
+
+fn normalize_hermes_browser_engine(value: Option<String>, strict: bool) -> Result<String, String> {
+    let engine = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let engine = if engine.is_empty() {
+        "auto".to_string()
+    } else {
+        engine
+    };
+    if matches!(engine.as_str(), "auto" | "lightpanda" | "chrome") {
+        return Ok(engine);
+    }
+    if strict {
+        Err("browser.engine 必须是 auto、lightpanda 或 chrome".to_string())
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_browser_dialog_policy(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let policy = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let policy = if policy.is_empty() {
+        "must_respond".to_string()
+    } else {
+        policy
+    };
+    if matches!(
+        policy.as_str(),
+        "must_respond" | "auto_dismiss" | "auto_accept"
+    ) {
+        return Ok(policy);
+    }
+    if strict {
+        Err("browser.dialog_policy 必须是 must_respond、auto_dismiss 或 auto_accept".to_string())
+    } else {
+        Ok("must_respond".to_string())
+    }
+}
+
+fn normalize_hermes_web_backend(
+    value: Option<String>,
+    key: &str,
+    strict: bool,
+) -> Result<String, String> {
+    let backend = value.unwrap_or_default().trim().to_ascii_lowercase();
+    if backend.is_empty() {
+        return Ok(String::new());
+    }
+    if matches!(
+        backend.as_str(),
+        "tavily"
+            | "firecrawl"
+            | "parallel"
+            | "exa"
+            | "searxng"
+            | "brave"
+            | "brave_free"
+            | "ddgs"
+            | "xai"
+            | "native"
+    ) {
+        return Ok(backend);
+    }
+    if strict {
+        Err(format!("{key} 必须为空或 tavily、firecrawl、parallel、exa、searxng、brave、brave_free、ddgs、xai、native"))
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn normalize_hermes_lsp_wait_mode(value: Option<String>, strict: bool) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "document".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "document" | "full") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("lsp.wait_mode 必须是 document 或 full".to_string())
+    } else {
+        Ok("document".to_string())
+    }
+}
+
+fn normalize_hermes_lsp_install_strategy(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let strategy = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let strategy = if strategy.is_empty() {
+        "auto".to_string()
+    } else {
+        strategy
+    };
+    if matches!(strategy.as_str(), "auto" | "manual" | "off") {
+        return Ok(strategy);
+    }
+    if strict {
+        Err("lsp.install_strategy 必须是 auto、manual 或 off".to_string())
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_stt_provider(value: Option<String>, strict: bool) -> Result<String, String> {
+    let provider = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let provider = if provider.is_empty() {
+        "auto".to_string()
+    } else {
+        provider
+    };
+    if matches!(
+        provider.as_str(),
+        "auto" | "local" | "groq" | "openai" | "mistral"
+    ) {
+        return Ok(provider);
+    }
+    if strict {
+        Err("stt.provider 必须是 auto、local、groq、openai 或 mistral".to_string())
+    } else {
+        Ok("auto".to_string())
+    }
+}
+
+fn normalize_hermes_stt_local_model(value: Option<String>, strict: bool) -> Result<String, String> {
+    let model = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let model = if model.is_empty() {
+        "base".to_string()
+    } else {
+        model
+    };
+    if matches!(
+        model.as_str(),
+        "tiny" | "base" | "small" | "medium" | "large-v3" | "turbo"
+    ) {
+        return Ok(model);
+    }
+    if strict {
+        Err("stt.local.model 必须是 tiny、base、small、medium、large-v3 或 turbo".to_string())
+    } else {
+        Ok("base".to_string())
+    }
+}
+
+fn normalize_hermes_stt_openai_model(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let model = value.unwrap_or_default().trim().to_string();
+    let model = if model.is_empty() {
+        "whisper-1".to_string()
+    } else {
+        model
+    };
+    if matches!(
+        model.as_str(),
+        "whisper-1" | "gpt-4o-mini-transcribe" | "gpt-4o-transcribe"
+    ) {
+        return Ok(model);
+    }
+    if strict {
+        Err(
+            "stt.openai.model 必须是 whisper-1、gpt-4o-mini-transcribe 或 gpt-4o-transcribe"
+                .to_string(),
+        )
+    } else {
+        Ok("whisper-1".to_string())
+    }
+}
+
+fn normalize_hermes_stt_mistral_model(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let model = value.unwrap_or_default().trim().to_string();
+    let model = if model.is_empty() {
+        "voxtral-mini-latest".to_string()
+    } else {
+        model
+    };
+    if matches!(model.as_str(), "voxtral-mini-latest" | "voxtral-mini-2602") {
+        return Ok(model);
+    }
+    if strict {
+        Err("stt.mistral.model 必须是 voxtral-mini-latest 或 voxtral-mini-2602".to_string())
+    } else {
+        Ok("voxtral-mini-latest".to_string())
+    }
+}
+
+fn normalize_hermes_stt_language(value: Option<String>, strict: bool) -> Result<String, String> {
+    let language = value.unwrap_or_default().trim().to_string();
+    if language.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parts = language.split('-');
+    let Some(first) = parts.next() else {
+        return Ok(String::new());
+    };
+    let first_valid =
+        (2..=3).contains(&first.len()) && first.chars().all(|ch| ch.is_ascii_lowercase());
+    let rest_valid =
+        parts.all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()));
+    if first_valid && rest_valid {
+        return Ok(language);
+    }
+    if strict {
+        Err("stt.local.language 必须为空或合法语言标签，例如 zh、en、pt-BR".to_string())
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn normalize_hermes_tts_provider(value: Option<String>, strict: bool) -> Result<String, String> {
+    let provider = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let provider = if provider.is_empty() {
+        "edge".to_string()
+    } else {
+        provider
+    };
+    if matches!(
+        provider.as_str(),
+        "edge"
+            | "elevenlabs"
+            | "openai"
+            | "xai"
+            | "minimax"
+            | "mistral"
+            | "gemini"
+            | "neutts"
+            | "kittentts"
+            | "piper"
+    ) {
+        return Ok(provider);
+    }
+    if strict {
+        Err("tts.provider 必须是 edge、elevenlabs、openai、xai、minimax、mistral、gemini、neutts、kittentts 或 piper".to_string())
+    } else {
+        Ok("edge".to_string())
+    }
+}
+
+fn normalize_hermes_tts_openai_voice(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let voice = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let voice = if voice.is_empty() {
+        "alloy".to_string()
+    } else {
+        voice
+    };
+    if matches!(
+        voice.as_str(),
+        "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer"
+    ) {
+        return Ok(voice);
+    }
+    if strict {
+        Err("tts.openai.voice 必须是 alloy、echo、fable、onyx、nova 或 shimmer".to_string())
+    } else {
+        Ok("alloy".to_string())
+    }
+}
+
+fn normalize_hermes_voice_language(
+    value: Option<String>,
+    strict: bool,
+    key: &str,
+) -> Result<String, String> {
+    let language = value.unwrap_or_default().trim().to_string();
+    if language.is_empty() {
+        return Ok("en".to_string());
+    }
+    let mut parts = language.split('-');
+    let Some(first) = parts.next() else {
+        return Ok("en".to_string());
+    };
+    let first_valid =
+        (2..=3).contains(&first.len()) && first.chars().all(|ch| ch.is_ascii_lowercase());
+    let rest_valid =
+        parts.all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()));
+    if first_valid && rest_valid {
+        return Ok(language);
+    }
+    if strict {
+        Err(format!("{key} 必须是合法语言标签，例如 en、zh、pt-BR"))
+    } else {
+        Ok("en".to_string())
+    }
+}
+
+fn normalize_hermes_approval_mode(value: Option<String>, strict: bool) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "manual".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "manual" | "smart" | "off") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("approvals.mode 必须是 manual、smart 或 off".to_string())
+    } else {
+        Ok("manual".to_string())
+    }
+}
+
+fn normalize_hermes_approval_cron_mode(
+    value: Option<String>,
+    strict: bool,
+) -> Result<String, String> {
+    let mode = value.unwrap_or_default().trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "deny".to_string()
+    } else {
+        mode
+    };
+    if matches!(mode.as_str(), "deny" | "approve") {
+        return Ok(mode);
+    }
+    if strict {
+        Err("approvals.cron_mode 必须是 deny 或 approve".to_string())
+    } else {
+        Ok("deny".to_string())
+    }
+}
+
+fn normalize_hermes_logging_level(value: Option<String>, strict: bool) -> Result<String, String> {
+    let level = value.unwrap_or_default().trim().to_ascii_uppercase();
+    let level = if level.is_empty() {
+        "INFO".to_string()
+    } else {
+        level
+    };
+    if matches!(level.as_str(), "DEBUG" | "INFO" | "WARNING") {
+        return Ok(level);
+    }
+    if strict {
+        Err("logging.level 必须是 DEBUG、INFO 或 WARNING".to_string())
+    } else {
+        Ok("INFO".to_string())
+    }
+}
+
+fn hermes_streaming_config_source(config: &serde_yaml::Value) -> Option<&serde_yaml::Mapping> {
+    let root = config.as_mapping()?;
+    if let Some(streaming) = yaml_get_mapping(root, "streaming") {
+        return Some(streaming);
+    }
+    let gateway = yaml_get_mapping(root, "gateway")?;
+    yaml_get_mapping(gateway, "streaming")
+}
+
+fn build_hermes_streaming_config_values(config: &serde_yaml::Value) -> Value {
+    let streaming = hermes_streaming_config_source(config);
+    let enabled = streaming
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(false);
+    let transport = normalize_hermes_streaming_transport(
+        streaming.and_then(|map| yaml_string_field(map, "transport")),
+        false,
+    )
+    .unwrap_or_else(|_| "edit".to_string());
+    let edit_interval = streaming
+        .map(|map| bounded_hermes_f64(yaml_f64_field(map, "edit_interval"), 0.8, 0.05, 60.0))
+        .unwrap_or(0.8);
+    let buffer_threshold = streaming
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "buffer_threshold"), 24, 1, 5000))
+        .unwrap_or(24);
+    let cursor = streaming
+        .and_then(|map| yaml_string_field(map, "cursor"))
+        .unwrap_or_else(|| " ▉".to_string());
+    let fresh_final_after_seconds = streaming
+        .map(|map| {
+            bounded_hermes_f64(
+                yaml_f64_field(map, "fresh_final_after_seconds"),
+                60.0,
+                0.0,
+                86400.0,
+            )
+        })
+        .unwrap_or(60.0);
+
+    serde_json::json!({
+        "enabled": enabled,
+        "transport": transport,
+        "editInterval": edit_interval,
+        "bufferThreshold": buffer_threshold,
+        "cursor": cursor,
+        "freshFinalAfterSeconds": fresh_final_after_seconds,
+    })
+}
+
+fn merge_hermes_streaming_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_streaming_config_values(config);
+    let enabled =
+        form_bool(form, "enabled").unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(false));
+    let transport = normalize_hermes_streaming_transport(
+        if form.get("transport").is_some() {
+            form_string(form, "transport")
+        } else {
+            current["transport"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let edit_interval = validate_hermes_f64(
+        if form.get("editInterval").is_some() {
+            form_f64(form, "editInterval")
+        } else {
+            Some(current["editInterval"].as_f64().unwrap_or(0.8))
+        },
+        "streaming.edit_interval",
+        0.8,
+        0.05,
+        60.0,
+    )?;
+    let buffer_threshold = validate_hermes_i64(
+        if form.get("bufferThreshold").is_some() {
+            form_i64(form, "bufferThreshold")
+        } else {
+            Some(current["bufferThreshold"].as_i64().unwrap_or(24))
+        },
+        "streaming.buffer_threshold",
+        24,
+        1,
+        5000,
+    )?;
+    let cursor = if form.get("cursor").is_some() {
+        form_string(form, "cursor").unwrap_or_default()
+    } else {
+        current["cursor"].as_str().unwrap_or(" ▉").to_string()
+    };
+    let fresh_final_after_seconds = validate_hermes_f64(
+        if form.get("freshFinalAfterSeconds").is_some() {
+            form_f64(form, "freshFinalAfterSeconds")
+        } else {
+            Some(current["freshFinalAfterSeconds"].as_f64().unwrap_or(60.0))
+        },
+        "streaming.fresh_final_after_seconds",
+        60.0,
+        0.0,
+        86400.0,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let streaming = yaml_child_object(root, "streaming")?;
+    streaming.insert(yaml_key("enabled"), serde_yaml::Value::Bool(enabled));
+    streaming.insert(yaml_key("transport"), serde_yaml::Value::String(transport));
+    streaming.insert(
+        yaml_key("edit_interval"),
+        serde_yaml::Value::Number(edit_interval.into()),
+    );
+    streaming.insert(
+        yaml_key("buffer_threshold"),
+        serde_yaml::Value::Number(buffer_threshold.into()),
+    );
+    streaming.insert(yaml_key("cursor"), serde_yaml::Value::String(cursor));
+    streaming.insert(
+        yaml_key("fresh_final_after_seconds"),
+        serde_yaml::Value::Number(fresh_final_after_seconds.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_execution_limits_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let code_execution = root.and_then(|map| yaml_get_mapping(map, "code_execution"));
+    let delegation = root.and_then(|map| yaml_get_mapping(map, "delegation"));
+    let code_execution_mode = normalize_hermes_code_execution_mode(
+        code_execution.and_then(|map| yaml_string_field(map, "mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "project".to_string());
+    let code_execution_timeout = code_execution
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 300, 1, 86400))
+        .unwrap_or(300);
+    let code_execution_max_tool_calls = code_execution
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_tool_calls"), 50, 1, 10000))
+        .unwrap_or(50);
+    let delegation_max_iterations = delegation
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_iterations"), 50, 1, 1000))
+        .unwrap_or(50);
+    let delegation_child_timeout_seconds = delegation
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "child_timeout_seconds"), 600, 30, 86400))
+        .unwrap_or(600);
+    let delegation_max_concurrent_children = delegation
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_concurrent_children"), 3, 1, 100))
+        .unwrap_or(3);
+    let delegation_max_spawn_depth = delegation
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_spawn_depth"), 1, 1, 3))
+        .unwrap_or(1);
+    let delegation_orchestrator_enabled = delegation
+        .and_then(|map| yaml_bool_field(map, "orchestrator_enabled"))
+        .unwrap_or(true);
+    let delegation_subagent_auto_approve = delegation
+        .and_then(|map| yaml_bool_field(map, "subagent_auto_approve"))
+        .unwrap_or(false);
+    let delegation_inherit_mcp_toolsets = delegation
+        .and_then(|map| yaml_bool_field(map, "inherit_mcp_toolsets"))
+        .unwrap_or(true);
+    let delegation_model = delegation
+        .and_then(|map| yaml_string_field(map, "model"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let delegation_provider = delegation
+        .and_then(|map| yaml_string_field(map, "provider"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "codeExecutionMode": code_execution_mode,
+        "codeExecutionTimeout": code_execution_timeout,
+        "codeExecutionMaxToolCalls": code_execution_max_tool_calls,
+        "delegationMaxIterations": delegation_max_iterations,
+        "delegationChildTimeoutSeconds": delegation_child_timeout_seconds,
+        "delegationMaxConcurrentChildren": delegation_max_concurrent_children,
+        "delegationMaxSpawnDepth": delegation_max_spawn_depth,
+        "delegationOrchestratorEnabled": delegation_orchestrator_enabled,
+        "delegationSubagentAutoApprove": delegation_subagent_auto_approve,
+        "delegationInheritMcpToolsets": delegation_inherit_mcp_toolsets,
+        "delegationModel": delegation_model,
+        "delegationProvider": delegation_provider,
+    })
+}
+
+fn build_hermes_io_safety_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let tool_output = root.and_then(|map| yaml_get_mapping(map, "tool_output"));
+    let file_read_max_chars = root
+        .map(|map| {
+            bounded_hermes_i64(
+                yaml_i64_field(map, "file_read_max_chars"),
+                100000,
+                1000,
+                1000000,
+            )
+        })
+        .unwrap_or(100000);
+    let tool_output_max_bytes = tool_output
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_bytes"), 50000, 1000, 1000000))
+        .unwrap_or(50000);
+    let tool_output_max_lines = tool_output
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_lines"), 2000, 1, 100000))
+        .unwrap_or(2000);
+    let tool_output_max_line_length = tool_output
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_line_length"), 2000, 1, 100000))
+        .unwrap_or(2000);
+
+    serde_json::json!({
+        "fileReadMaxChars": file_read_max_chars,
+        "toolOutputMaxBytes": tool_output_max_bytes,
+        "toolOutputMaxLines": tool_output_max_lines,
+        "toolOutputMaxLineLength": tool_output_max_line_length,
+    })
+}
+
+fn merge_hermes_io_safety_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_io_safety_config_values(config);
+    let file_read_max_chars = validate_hermes_i64(
+        if form.get("fileReadMaxChars").is_some() {
+            form_i64(form, "fileReadMaxChars")
+        } else {
+            Some(current["fileReadMaxChars"].as_i64().unwrap_or(100000))
+        },
+        "file_read_max_chars",
+        100000,
+        1000,
+        1000000,
+    )?;
+    let tool_output_max_bytes = validate_hermes_i64(
+        if form.get("toolOutputMaxBytes").is_some() {
+            form_i64(form, "toolOutputMaxBytes")
+        } else {
+            Some(current["toolOutputMaxBytes"].as_i64().unwrap_or(50000))
+        },
+        "tool_output.max_bytes",
+        50000,
+        1000,
+        1000000,
+    )?;
+    let tool_output_max_lines = validate_hermes_i64(
+        if form.get("toolOutputMaxLines").is_some() {
+            form_i64(form, "toolOutputMaxLines")
+        } else {
+            Some(current["toolOutputMaxLines"].as_i64().unwrap_or(2000))
+        },
+        "tool_output.max_lines",
+        2000,
+        1,
+        100000,
+    )?;
+    let tool_output_max_line_length = validate_hermes_i64(
+        if form.get("toolOutputMaxLineLength").is_some() {
+            form_i64(form, "toolOutputMaxLineLength")
+        } else {
+            Some(current["toolOutputMaxLineLength"].as_i64().unwrap_or(2000))
+        },
+        "tool_output.max_line_length",
+        2000,
+        1,
+        100000,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    root.insert(
+        yaml_key("file_read_max_chars"),
+        serde_yaml::Value::Number(file_read_max_chars.into()),
+    );
+    let tool_output = yaml_child_object(root, "tool_output")?;
+    tool_output.insert(
+        yaml_key("max_bytes"),
+        serde_yaml::Value::Number(tool_output_max_bytes.into()),
+    );
+    tool_output.insert(
+        yaml_key("max_lines"),
+        serde_yaml::Value::Number(tool_output_max_lines.into()),
+    );
+    tool_output.insert(
+        yaml_key("max_line_length"),
+        serde_yaml::Value::Number(tool_output_max_line_length.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_checkpoints_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let checkpoints = root.and_then(|map| yaml_get_mapping(map, "checkpoints"));
+    let checkpoints_enabled = checkpoints
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(false);
+    let checkpoint_max_snapshots = checkpoints
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_snapshots"), 20, 1, 10000))
+        .unwrap_or(20);
+    let checkpoint_max_total_size_mb = checkpoints
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_total_size_mb"), 500, 0, 10485760))
+        .unwrap_or(500);
+    let checkpoint_max_file_size_mb = checkpoints
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_file_size_mb"), 10, 0, 1048576))
+        .unwrap_or(10);
+    let checkpoint_auto_prune = checkpoints
+        .and_then(|map| yaml_bool_field(map, "auto_prune"))
+        .unwrap_or(true);
+    let checkpoint_retention_days = checkpoints
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "retention_days"), 7, 1, 3650))
+        .unwrap_or(7);
+    let checkpoint_delete_orphans = checkpoints
+        .and_then(|map| yaml_bool_field(map, "delete_orphans"))
+        .unwrap_or(true);
+    let checkpoint_min_interval_hours = checkpoints
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "min_interval_hours"), 24, 0, 8760))
+        .unwrap_or(24);
+
+    serde_json::json!({
+        "checkpointsEnabled": checkpoints_enabled,
+        "checkpointMaxSnapshots": checkpoint_max_snapshots,
+        "checkpointMaxTotalSizeMb": checkpoint_max_total_size_mb,
+        "checkpointMaxFileSizeMb": checkpoint_max_file_size_mb,
+        "checkpointAutoPrune": checkpoint_auto_prune,
+        "checkpointRetentionDays": checkpoint_retention_days,
+        "checkpointDeleteOrphans": checkpoint_delete_orphans,
+        "checkpointMinIntervalHours": checkpoint_min_interval_hours,
+    })
+}
+
+fn merge_hermes_checkpoints_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_checkpoints_config_values(config);
+    let checkpoints_enabled = form_bool(form, "checkpointsEnabled")
+        .unwrap_or_else(|| current["checkpointsEnabled"].as_bool().unwrap_or(false));
+    let checkpoint_max_snapshots = validate_hermes_i64(
+        if form.get("checkpointMaxSnapshots").is_some() {
+            form_i64(form, "checkpointMaxSnapshots")
+        } else {
+            Some(current["checkpointMaxSnapshots"].as_i64().unwrap_or(20))
+        },
+        "checkpoints.max_snapshots",
+        20,
+        1,
+        10000,
+    )?;
+    let checkpoint_max_total_size_mb = validate_hermes_i64(
+        if form.get("checkpointMaxTotalSizeMb").is_some() {
+            form_i64(form, "checkpointMaxTotalSizeMb")
+        } else {
+            Some(current["checkpointMaxTotalSizeMb"].as_i64().unwrap_or(500))
+        },
+        "checkpoints.max_total_size_mb",
+        500,
+        0,
+        10485760,
+    )?;
+    let checkpoint_max_file_size_mb = validate_hermes_i64(
+        if form.get("checkpointMaxFileSizeMb").is_some() {
+            form_i64(form, "checkpointMaxFileSizeMb")
+        } else {
+            Some(current["checkpointMaxFileSizeMb"].as_i64().unwrap_or(10))
+        },
+        "checkpoints.max_file_size_mb",
+        10,
+        0,
+        1048576,
+    )?;
+    let checkpoint_auto_prune = form_bool(form, "checkpointAutoPrune")
+        .unwrap_or_else(|| current["checkpointAutoPrune"].as_bool().unwrap_or(true));
+    let checkpoint_retention_days = validate_hermes_i64(
+        if form.get("checkpointRetentionDays").is_some() {
+            form_i64(form, "checkpointRetentionDays")
+        } else {
+            Some(current["checkpointRetentionDays"].as_i64().unwrap_or(7))
+        },
+        "checkpoints.retention_days",
+        7,
+        1,
+        3650,
+    )?;
+    let checkpoint_delete_orphans = form_bool(form, "checkpointDeleteOrphans")
+        .unwrap_or_else(|| current["checkpointDeleteOrphans"].as_bool().unwrap_or(true));
+    let checkpoint_min_interval_hours = validate_hermes_i64(
+        if form.get("checkpointMinIntervalHours").is_some() {
+            form_i64(form, "checkpointMinIntervalHours")
+        } else {
+            Some(current["checkpointMinIntervalHours"].as_i64().unwrap_or(24))
+        },
+        "checkpoints.min_interval_hours",
+        24,
+        0,
+        8760,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let checkpoints = yaml_child_object(root, "checkpoints")?;
+    checkpoints.insert(
+        yaml_key("enabled"),
+        serde_yaml::Value::Bool(checkpoints_enabled),
+    );
+    checkpoints.insert(
+        yaml_key("max_snapshots"),
+        serde_yaml::Value::Number(checkpoint_max_snapshots.into()),
+    );
+    checkpoints.insert(
+        yaml_key("max_total_size_mb"),
+        serde_yaml::Value::Number(checkpoint_max_total_size_mb.into()),
+    );
+    checkpoints.insert(
+        yaml_key("max_file_size_mb"),
+        serde_yaml::Value::Number(checkpoint_max_file_size_mb.into()),
+    );
+    checkpoints.insert(
+        yaml_key("auto_prune"),
+        serde_yaml::Value::Bool(checkpoint_auto_prune),
+    );
+    checkpoints.insert(
+        yaml_key("retention_days"),
+        serde_yaml::Value::Number(checkpoint_retention_days.into()),
+    );
+    checkpoints.insert(
+        yaml_key("delete_orphans"),
+        serde_yaml::Value::Bool(checkpoint_delete_orphans),
+    );
+    checkpoints.insert(
+        yaml_key("min_interval_hours"),
+        serde_yaml::Value::Number(checkpoint_min_interval_hours.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_cron_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let cron = root.and_then(|map| yaml_get_mapping(map, "cron"));
+    let cron_wrap_response = cron
+        .and_then(|map| yaml_bool_field(map, "wrap_response"))
+        .unwrap_or(true);
+    let cron_max_parallel_jobs = cron
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_parallel_jobs"), 0, 0, 10000))
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "cronWrapResponse": cron_wrap_response,
+        "cronMaxParallelJobs": cron_max_parallel_jobs,
+    })
+}
+
+fn merge_hermes_cron_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_cron_config_values(config);
+    let cron_wrap_response = form_bool(form, "cronWrapResponse")
+        .unwrap_or_else(|| current["cronWrapResponse"].as_bool().unwrap_or(true));
+    let cron_max_parallel_jobs = validate_hermes_i64(
+        if form.get("cronMaxParallelJobs").is_some() {
+            form_i64(form, "cronMaxParallelJobs")
+        } else {
+            Some(current["cronMaxParallelJobs"].as_i64().unwrap_or(0))
+        },
+        "cron.max_parallel_jobs",
+        0,
+        0,
+        10000,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let cron = yaml_child_object(root, "cron")?;
+    cron.insert(
+        yaml_key("wrap_response"),
+        serde_yaml::Value::Bool(cron_wrap_response),
+    );
+    cron.insert(
+        yaml_key("max_parallel_jobs"),
+        if cron_max_parallel_jobs == 0 {
+            serde_yaml::Value::Null
+        } else {
+            serde_yaml::Value::Number(cron_max_parallel_jobs.into())
+        },
+    );
+    Ok(())
+}
+
+fn build_hermes_sessions_maintenance_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let sessions = root.and_then(|map| yaml_get_mapping(map, "sessions"));
+    let sessions_auto_prune = sessions
+        .and_then(|map| yaml_bool_field(map, "auto_prune"))
+        .unwrap_or(false);
+    let sessions_retention_days = sessions
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "retention_days"), 90, 1, 36500))
+        .unwrap_or(90);
+    let sessions_vacuum_after_prune = sessions
+        .and_then(|map| yaml_bool_field(map, "vacuum_after_prune"))
+        .unwrap_or(true);
+    let sessions_min_interval_hours = sessions
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "min_interval_hours"), 24, 0, 87600))
+        .unwrap_or(24);
+    let sessions_write_json_snapshots = sessions
+        .and_then(|map| yaml_bool_field(map, "write_json_snapshots"))
+        .unwrap_or(false);
+
+    serde_json::json!({
+        "sessionsAutoPrune": sessions_auto_prune,
+        "sessionsRetentionDays": sessions_retention_days,
+        "sessionsVacuumAfterPrune": sessions_vacuum_after_prune,
+        "sessionsMinIntervalHours": sessions_min_interval_hours,
+        "sessionsWriteJsonSnapshots": sessions_write_json_snapshots,
+    })
+}
+
+fn merge_hermes_sessions_maintenance_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_sessions_maintenance_config_values(config);
+    let sessions_retention_days = validate_hermes_i64(
+        if form.get("sessionsRetentionDays").is_some() {
+            form_i64(form, "sessionsRetentionDays")
+        } else {
+            Some(current["sessionsRetentionDays"].as_i64().unwrap_or(90))
+        },
+        "sessions.retention_days",
+        90,
+        1,
+        36500,
+    )?;
+    let sessions_min_interval_hours = validate_hermes_i64(
+        if form.get("sessionsMinIntervalHours").is_some() {
+            form_i64(form, "sessionsMinIntervalHours")
+        } else {
+            Some(current["sessionsMinIntervalHours"].as_i64().unwrap_or(24))
+        },
+        "sessions.min_interval_hours",
+        24,
+        0,
+        87600,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let sessions = yaml_child_object(root, "sessions")?;
+    sessions.insert(
+        yaml_key("auto_prune"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "sessionsAutoPrune")
+                .unwrap_or_else(|| current["sessionsAutoPrune"].as_bool().unwrap_or(false)),
+        ),
+    );
+    sessions.insert(
+        yaml_key("retention_days"),
+        serde_yaml::Value::Number(sessions_retention_days.into()),
+    );
+    sessions.insert(
+        yaml_key("vacuum_after_prune"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "sessionsVacuumAfterPrune").unwrap_or_else(|| {
+                current["sessionsVacuumAfterPrune"]
+                    .as_bool()
+                    .unwrap_or(true)
+            }),
+        ),
+    );
+    sessions.insert(
+        yaml_key("min_interval_hours"),
+        serde_yaml::Value::Number(sessions_min_interval_hours.into()),
+    );
+    sessions.insert(
+        yaml_key("write_json_snapshots"),
+        serde_yaml::Value::Bool(
+            form_bool(form, "sessionsWriteJsonSnapshots").unwrap_or_else(|| {
+                current["sessionsWriteJsonSnapshots"]
+                    .as_bool()
+                    .unwrap_or(false)
+            }),
+        ),
+    );
+    Ok(())
+}
+
+fn build_hermes_updates_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let updates = root.and_then(|map| yaml_get_mapping(map, "updates"));
+    let updates_pre_update_backup = updates
+        .and_then(|map| yaml_bool_field(map, "pre_update_backup"))
+        .unwrap_or(false);
+    let updates_backup_keep = updates
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "backup_keep"), 5, 1, 1000))
+        .unwrap_or(5);
+
+    serde_json::json!({
+        "updatesPreUpdateBackup": updates_pre_update_backup,
+        "updatesBackupKeep": updates_backup_keep,
+    })
+}
+
+fn merge_hermes_updates_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_updates_config_values(config);
+    let updates_pre_update_backup = form_bool(form, "updatesPreUpdateBackup")
+        .unwrap_or_else(|| current["updatesPreUpdateBackup"].as_bool().unwrap_or(false));
+    let updates_backup_keep = validate_hermes_i64(
+        if form.get("updatesBackupKeep").is_some() {
+            form_i64(form, "updatesBackupKeep")
+        } else {
+            Some(current["updatesBackupKeep"].as_i64().unwrap_or(5))
+        },
+        "updates.backup_keep",
+        5,
+        1,
+        1000,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let updates = yaml_child_object(root, "updates")?;
+    updates.insert(
+        yaml_key("pre_update_backup"),
+        serde_yaml::Value::Bool(updates_pre_update_backup),
+    );
+    updates.insert(
+        yaml_key("backup_keep"),
+        serde_yaml::Value::Number(updates_backup_keep.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_logging_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let logging = root.and_then(|map| yaml_get_mapping(map, "logging"));
+    let memory_monitor = logging.and_then(|map| yaml_get_mapping(map, "memory_monitor"));
+    let logging_level = normalize_hermes_logging_level(
+        logging.and_then(|map| yaml_string_field(map, "level")),
+        false,
+    )
+    .unwrap_or_else(|_| "INFO".to_string());
+    let logging_max_size_mb = logging
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_size_mb"), 5, 1, 102400))
+        .unwrap_or(5);
+    let logging_backup_count = logging
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "backup_count"), 3, 0, 1000))
+        .unwrap_or(3);
+    let logging_memory_monitor_enabled = memory_monitor
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(true);
+    let logging_memory_monitor_interval_seconds = memory_monitor
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "interval_seconds"), 300, 1, 86400))
+        .unwrap_or(300);
+
+    serde_json::json!({
+        "loggingLevel": logging_level,
+        "loggingMaxSizeMb": logging_max_size_mb,
+        "loggingBackupCount": logging_backup_count,
+        "loggingMemoryMonitorEnabled": logging_memory_monitor_enabled,
+        "loggingMemoryMonitorIntervalSeconds": logging_memory_monitor_interval_seconds,
+    })
+}
+
+fn merge_hermes_logging_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_logging_config_values(config);
+    let logging_level = normalize_hermes_logging_level(
+        if form.get("loggingLevel").is_some() {
+            form_string(form, "loggingLevel")
+        } else {
+            current["loggingLevel"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let logging_max_size_mb = validate_hermes_i64(
+        if form.get("loggingMaxSizeMb").is_some() {
+            form_i64(form, "loggingMaxSizeMb")
+        } else {
+            Some(current["loggingMaxSizeMb"].as_i64().unwrap_or(5))
+        },
+        "logging.max_size_mb",
+        5,
+        1,
+        102400,
+    )?;
+    let logging_backup_count = validate_hermes_i64(
+        if form.get("loggingBackupCount").is_some() {
+            form_i64(form, "loggingBackupCount")
+        } else {
+            Some(current["loggingBackupCount"].as_i64().unwrap_or(3))
+        },
+        "logging.backup_count",
+        3,
+        0,
+        1000,
+    )?;
+    let logging_memory_monitor_enabled = form_bool(form, "loggingMemoryMonitorEnabled")
+        .unwrap_or_else(|| {
+            current["loggingMemoryMonitorEnabled"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+    let logging_memory_monitor_interval_seconds = validate_hermes_i64(
+        if form.get("loggingMemoryMonitorIntervalSeconds").is_some() {
+            form_i64(form, "loggingMemoryMonitorIntervalSeconds")
+        } else {
+            Some(
+                current["loggingMemoryMonitorIntervalSeconds"]
+                    .as_i64()
+                    .unwrap_or(300),
+            )
+        },
+        "logging.memory_monitor.interval_seconds",
+        300,
+        1,
+        86400,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let logging = yaml_child_object(root, "logging")?;
+    logging.insert(yaml_key("level"), serde_yaml::Value::String(logging_level));
+    logging.insert(
+        yaml_key("max_size_mb"),
+        serde_yaml::Value::Number(logging_max_size_mb.into()),
+    );
+    logging.insert(
+        yaml_key("backup_count"),
+        serde_yaml::Value::Number(logging_backup_count.into()),
+    );
+    let memory_monitor = yaml_child_object(logging, "memory_monitor")?;
+    memory_monitor.insert(
+        yaml_key("enabled"),
+        serde_yaml::Value::Bool(logging_memory_monitor_enabled),
+    );
+    memory_monitor.insert(
+        yaml_key("interval_seconds"),
+        serde_yaml::Value::Number(logging_memory_monitor_interval_seconds.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_approvals_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let approvals = root.and_then(|map| yaml_get_mapping(map, "approvals"));
+    let approval_mode = normalize_hermes_approval_mode(
+        approvals.and_then(|map| yaml_string_field(map, "mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "manual".to_string());
+    let approval_timeout = approvals
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 60, 1, 86400))
+        .unwrap_or(60);
+    let approval_cron_mode = normalize_hermes_approval_cron_mode(
+        approvals.and_then(|map| yaml_string_field(map, "cron_mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "deny".to_string());
+    let approval_mcp_reload_confirm = approvals
+        .and_then(|map| yaml_bool_field(map, "mcp_reload_confirm"))
+        .unwrap_or(true);
+    let approval_destructive_slash_confirm = approvals
+        .and_then(|map| yaml_bool_field(map, "destructive_slash_confirm"))
+        .unwrap_or(true);
+
+    serde_json::json!({
+        "approvalMode": approval_mode,
+        "approvalTimeout": approval_timeout,
+        "approvalCronMode": approval_cron_mode,
+        "approvalMcpReloadConfirm": approval_mcp_reload_confirm,
+        "approvalDestructiveSlashConfirm": approval_destructive_slash_confirm,
+    })
+}
+
+fn merge_hermes_approvals_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_approvals_config_values(config);
+    let approval_mode = normalize_hermes_approval_mode(
+        if form.get("approvalMode").is_some() {
+            form_string(form, "approvalMode")
+        } else {
+            current["approvalMode"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let approval_timeout = validate_hermes_i64(
+        if form.get("approvalTimeout").is_some() {
+            form_i64(form, "approvalTimeout")
+        } else {
+            Some(current["approvalTimeout"].as_i64().unwrap_or(60))
+        },
+        "approvals.timeout",
+        60,
+        1,
+        86400,
+    )?;
+    let approval_cron_mode = normalize_hermes_approval_cron_mode(
+        if form.get("approvalCronMode").is_some() {
+            form_string(form, "approvalCronMode")
+        } else {
+            current["approvalCronMode"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let approval_mcp_reload_confirm =
+        form_bool(form, "approvalMcpReloadConfirm").unwrap_or_else(|| {
+            current["approvalMcpReloadConfirm"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+    let approval_destructive_slash_confirm = form_bool(form, "approvalDestructiveSlashConfirm")
+        .unwrap_or_else(|| {
+            current["approvalDestructiveSlashConfirm"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+
+    let root = ensure_yaml_object(config)?;
+    let approvals = yaml_child_object(root, "approvals")?;
+    approvals.insert(yaml_key("mode"), serde_yaml::Value::String(approval_mode));
+    approvals.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(approval_timeout.into()),
+    );
+    approvals.insert(
+        yaml_key("cron_mode"),
+        serde_yaml::Value::String(approval_cron_mode),
+    );
+    approvals.insert(
+        yaml_key("mcp_reload_confirm"),
+        serde_yaml::Value::Bool(approval_mcp_reload_confirm),
+    );
+    approvals.insert(
+        yaml_key("destructive_slash_confirm"),
+        serde_yaml::Value::Bool(approval_destructive_slash_confirm),
+    );
+    Ok(())
+}
+
+fn build_hermes_privacy_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let privacy = root.and_then(|map| yaml_get_mapping(map, "privacy"));
+    let redact_pii = privacy
+        .and_then(|map| yaml_bool_field(map, "redact_pii"))
+        .unwrap_or(false);
+
+    serde_json::json!({
+        "redactPii": redact_pii,
+    })
+}
+
+fn merge_hermes_privacy_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_privacy_config_values(config);
+    let redact_pii = form_bool(form, "redactPii")
+        .unwrap_or_else(|| current["redactPii"].as_bool().unwrap_or(false));
+
+    let root = ensure_yaml_object(config)?;
+    let privacy = yaml_child_object(root, "privacy")?;
+    privacy.insert(yaml_key("redact_pii"), serde_yaml::Value::Bool(redact_pii));
+    Ok(())
+}
+
+fn build_hermes_browser_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let browser = root.and_then(|map| yaml_get_mapping(map, "browser"));
+    let browser_inactivity_timeout = browser
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "inactivity_timeout"), 120, 1, 86400))
+        .unwrap_or(120);
+    let browser_command_timeout = browser
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "command_timeout"), 30, 5, 3600))
+        .unwrap_or(30);
+    let browser_record_sessions = browser
+        .and_then(|map| yaml_bool_field(map, "record_sessions"))
+        .unwrap_or(false);
+    let browser_engine = normalize_hermes_browser_engine(
+        browser.and_then(|map| yaml_string_field(map, "engine")),
+        false,
+    )
+    .unwrap_or_else(|_| "auto".to_string());
+    let browser_allow_private_urls = browser
+        .and_then(|map| yaml_bool_field(map, "allow_private_urls"))
+        .unwrap_or(false);
+    let browser_auto_local_for_private_urls = browser
+        .and_then(|map| yaml_bool_field(map, "auto_local_for_private_urls"))
+        .unwrap_or(true);
+    let browser_cdp_url = browser
+        .and_then(|map| yaml_string_field(map, "cdp_url"))
+        .unwrap_or_default();
+    let camofox = browser.and_then(|map| yaml_get_mapping(map, "camofox"));
+    let browser_camofox_managed_persistence = camofox
+        .and_then(|map| yaml_bool_field(map, "managed_persistence"))
+        .unwrap_or(false);
+    let browser_camofox_user_id = normalize_hermes_camofox_identity(
+        camofox.and_then(|map| yaml_string_field(map, "user_id")),
+        "browser.camofox.user_id",
+    )
+    .unwrap_or_default();
+    let browser_camofox_session_key = normalize_hermes_camofox_identity(
+        camofox.and_then(|map| yaml_string_field(map, "session_key")),
+        "browser.camofox.session_key",
+    )
+    .unwrap_or_default();
+    let browser_camofox_adopt_existing_tab = camofox
+        .and_then(|map| yaml_bool_field(map, "adopt_existing_tab"))
+        .unwrap_or(false);
+    let browser_dialog_policy = normalize_hermes_browser_dialog_policy(
+        browser.and_then(|map| yaml_string_field(map, "dialog_policy")),
+        false,
+    )
+    .unwrap_or_else(|_| "must_respond".to_string());
+    let browser_dialog_timeout = browser
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "dialog_timeout_s"), 300, 1, 86400))
+        .unwrap_or(300);
+
+    serde_json::json!({
+        "browserInactivityTimeout": browser_inactivity_timeout,
+        "browserCommandTimeout": browser_command_timeout,
+        "browserRecordSessions": browser_record_sessions,
+        "browserEngine": browser_engine,
+        "browserAllowPrivateUrls": browser_allow_private_urls,
+        "browserAutoLocalForPrivateUrls": browser_auto_local_for_private_urls,
+        "browserCdpUrl": browser_cdp_url,
+        "browserCamofoxManagedPersistence": browser_camofox_managed_persistence,
+        "browserCamofoxUserId": browser_camofox_user_id,
+        "browserCamofoxSessionKey": browser_camofox_session_key,
+        "browserCamofoxAdoptExistingTab": browser_camofox_adopt_existing_tab,
+        "browserDialogPolicy": browser_dialog_policy,
+        "browserDialogTimeout": browser_dialog_timeout,
+    })
+}
+
+fn merge_hermes_browser_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_browser_config_values(config);
+    let browser_inactivity_timeout = validate_hermes_i64(
+        if form.get("browserInactivityTimeout").is_some() {
+            form_i64(form, "browserInactivityTimeout")
+        } else {
+            Some(current["browserInactivityTimeout"].as_i64().unwrap_or(120))
+        },
+        "browser.inactivity_timeout",
+        120,
+        1,
+        86400,
+    )?;
+    let browser_command_timeout = validate_hermes_i64(
+        if form.get("browserCommandTimeout").is_some() {
+            form_i64(form, "browserCommandTimeout")
+        } else {
+            Some(current["browserCommandTimeout"].as_i64().unwrap_or(30))
+        },
+        "browser.command_timeout",
+        30,
+        5,
+        3600,
+    )?;
+    let browser_record_sessions = form_bool(form, "browserRecordSessions")
+        .unwrap_or_else(|| current["browserRecordSessions"].as_bool().unwrap_or(false));
+    let browser_engine = normalize_hermes_browser_engine(
+        if form.get("browserEngine").is_some() {
+            form_string(form, "browserEngine")
+        } else {
+            current["browserEngine"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let browser_allow_private_urls =
+        form_bool(form, "browserAllowPrivateUrls").unwrap_or_else(|| {
+            current["browserAllowPrivateUrls"]
+                .as_bool()
+                .unwrap_or(false)
+        });
+    let browser_auto_local_for_private_urls = form_bool(form, "browserAutoLocalForPrivateUrls")
+        .unwrap_or_else(|| {
+            current["browserAutoLocalForPrivateUrls"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+    let browser_cdp_url = if form.get("browserCdpUrl").is_some() {
+        form_string(form, "browserCdpUrl")
+            .ok_or_else(|| "browser.cdp_url 必须是字符串".to_string())?
+            .trim()
+            .to_string()
+    } else {
+        current["browserCdpUrl"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let browser_camofox_managed_persistence = form_bool(form, "browserCamofoxManagedPersistence")
+        .unwrap_or_else(|| {
+            current["browserCamofoxManagedPersistence"]
+                .as_bool()
+                .unwrap_or(false)
+        });
+    let browser_camofox_user_id = normalize_hermes_camofox_identity(
+        if form.get("browserCamofoxUserId").is_some() {
+            Some(
+                form_string(form, "browserCamofoxUserId")
+                    .ok_or_else(|| "browser.camofox.user_id 必须是字符串".to_string())?,
+            )
+        } else {
+            current["browserCamofoxUserId"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        "browser.camofox.user_id",
+    )?;
+    let browser_camofox_session_key = normalize_hermes_camofox_identity(
+        if form.get("browserCamofoxSessionKey").is_some() {
+            Some(
+                form_string(form, "browserCamofoxSessionKey")
+                    .ok_or_else(|| "browser.camofox.session_key 必须是字符串".to_string())?,
+            )
+        } else {
+            current["browserCamofoxSessionKey"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        "browser.camofox.session_key",
+    )?;
+    let browser_camofox_adopt_existing_tab = form_bool(form, "browserCamofoxAdoptExistingTab")
+        .unwrap_or_else(|| {
+            current["browserCamofoxAdoptExistingTab"]
+                .as_bool()
+                .unwrap_or(false)
+        });
+    let browser_dialog_policy = normalize_hermes_browser_dialog_policy(
+        if form.get("browserDialogPolicy").is_some() {
+            form_string(form, "browserDialogPolicy")
+        } else {
+            current["browserDialogPolicy"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let browser_dialog_timeout = validate_hermes_i64(
+        if form.get("browserDialogTimeout").is_some() {
+            form_i64(form, "browserDialogTimeout")
+        } else {
+            Some(current["browserDialogTimeout"].as_i64().unwrap_or(300))
+        },
+        "browser.dialog_timeout_s",
+        300,
+        1,
+        86400,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let browser = yaml_child_object(root, "browser")?;
+    browser.insert(
+        yaml_key("inactivity_timeout"),
+        serde_yaml::Value::Number(browser_inactivity_timeout.into()),
+    );
+    browser.insert(
+        yaml_key("command_timeout"),
+        serde_yaml::Value::Number(browser_command_timeout.into()),
+    );
+    browser.insert(
+        yaml_key("record_sessions"),
+        serde_yaml::Value::Bool(browser_record_sessions),
+    );
+    browser.insert(
+        yaml_key("engine"),
+        serde_yaml::Value::String(browser_engine),
+    );
+    browser.insert(
+        yaml_key("allow_private_urls"),
+        serde_yaml::Value::Bool(browser_allow_private_urls),
+    );
+    browser.insert(
+        yaml_key("auto_local_for_private_urls"),
+        serde_yaml::Value::Bool(browser_auto_local_for_private_urls),
+    );
+    set_optional_yaml_string(browser, "cdp_url", browser_cdp_url);
+    let camofox = yaml_child_object(browser, "camofox")?;
+    camofox.insert(
+        yaml_key("managed_persistence"),
+        serde_yaml::Value::Bool(browser_camofox_managed_persistence),
+    );
+    set_optional_yaml_string(camofox, "user_id", browser_camofox_user_id);
+    set_optional_yaml_string(camofox, "session_key", browser_camofox_session_key);
+    camofox.insert(
+        yaml_key("adopt_existing_tab"),
+        serde_yaml::Value::Bool(browser_camofox_adopt_existing_tab),
+    );
+    browser.insert(
+        yaml_key("dialog_policy"),
+        serde_yaml::Value::String(browser_dialog_policy),
+    );
+    browser.insert(
+        yaml_key("dialog_timeout_s"),
+        serde_yaml::Value::Number(browser_dialog_timeout.into()),
+    );
+    Ok(())
+}
+
+fn build_hermes_web_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let web = root.and_then(|map| yaml_get_mapping(map, "web"));
+    let web_backend = normalize_hermes_web_backend(
+        web.and_then(|map| yaml_string_field(map, "backend")),
+        "web.backend",
+        false,
+    )
+    .unwrap_or_default();
+    let web_search_backend = normalize_hermes_web_backend(
+        web.and_then(|map| yaml_string_field(map, "search_backend")),
+        "web.search_backend",
+        false,
+    )
+    .unwrap_or_default();
+    let web_extract_backend = normalize_hermes_web_backend(
+        web.and_then(|map| yaml_string_field(map, "extract_backend")),
+        "web.extract_backend",
+        false,
+    )
+    .unwrap_or_default();
+
+    serde_json::json!({
+        "webBackend": web_backend,
+        "webSearchBackend": web_search_backend,
+        "webExtractBackend": web_extract_backend,
+    })
+}
+
+fn merge_hermes_web_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_web_config_values(config);
+    let web_backend = normalize_hermes_web_backend(
+        if form.get("webBackend").is_some() {
+            form_string(form, "webBackend")
+        } else {
+            current["webBackend"].as_str().map(ToString::to_string)
+        },
+        "web.backend",
+        true,
+    )?;
+    let web_search_backend = normalize_hermes_web_backend(
+        if form.get("webSearchBackend").is_some() {
+            form_string(form, "webSearchBackend")
+        } else {
+            current["webSearchBackend"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        "web.search_backend",
+        true,
+    )?;
+    let web_extract_backend = normalize_hermes_web_backend(
+        if form.get("webExtractBackend").is_some() {
+            form_string(form, "webExtractBackend")
+        } else {
+            current["webExtractBackend"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        "web.extract_backend",
+        true,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let web = yaml_child_object(root, "web")?;
+    set_optional_yaml_string(web, "backend", web_backend);
+    set_optional_yaml_string(web, "search_backend", web_search_backend);
+    set_optional_yaml_string(web, "extract_backend", web_extract_backend);
+    Ok(())
+}
+
+fn build_hermes_model_catalog_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let model_catalog = root.and_then(|map| yaml_get_mapping(map, "model_catalog"));
+    let enabled = model_catalog
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(true);
+    let url = normalize_hermes_http_url(
+        model_catalog.and_then(|map| yaml_string_field(map, "url")),
+        "model_catalog.url",
+        HERMES_MODEL_CATALOG_DEFAULT_URL,
+        false,
+    )
+    .unwrap_or_else(|_| HERMES_MODEL_CATALOG_DEFAULT_URL.to_string());
+    let ttl_hours = model_catalog
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "ttl_hours"), 24, 1, 8760))
+        .unwrap_or(24);
+    let providers = model_catalog
+        .and_then(|map| yaml_get(map, "providers"))
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| validate_hermes_model_catalog_providers(&value).ok())
+        .unwrap_or_default();
+    serde_json::json!({
+        "modelCatalogEnabled": enabled,
+        "modelCatalogUrl": url,
+        "modelCatalogTtlHours": ttl_hours,
+        "modelCatalogProvidersJson": serde_json::to_string_pretty(&Value::Object(providers)).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn merge_hermes_model_catalog_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_model_catalog_config_values(config);
+    let enabled = form_bool(form, "modelCatalogEnabled")
+        .unwrap_or_else(|| current["modelCatalogEnabled"].as_bool().unwrap_or(true));
+    let url = normalize_hermes_http_url(
+        if form.get("modelCatalogUrl").is_some() {
+            form_string(form, "modelCatalogUrl")
+        } else {
+            current["modelCatalogUrl"].as_str().map(ToString::to_string)
+        },
+        "model_catalog.url",
+        HERMES_MODEL_CATALOG_DEFAULT_URL,
+        true,
+    )?;
+    let ttl_hours = validate_hermes_i64(
+        if form.get("modelCatalogTtlHours").is_some() {
+            form_i64(form, "modelCatalogTtlHours")
+        } else {
+            current["modelCatalogTtlHours"].as_i64()
+        },
+        "model_catalog.ttl_hours",
+        24,
+        1,
+        8760,
+    )?;
+    let providers = parse_hermes_model_catalog_providers_json(
+        if form.get("modelCatalogProvidersJson").is_some() {
+            form_string(form, "modelCatalogProvidersJson")
+        } else {
+            current["modelCatalogProvidersJson"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let model_catalog = yaml_child_object(root, "model_catalog")?;
+    model_catalog.insert(yaml_key("enabled"), serde_yaml::Value::Bool(enabled));
+    model_catalog.insert(yaml_key("url"), serde_yaml::Value::String(url));
+    model_catalog.insert(
+        yaml_key("ttl_hours"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(ttl_hours)),
+    );
+    if providers.is_empty() {
+        model_catalog.remove(yaml_key("providers"));
+    } else {
+        let yaml_value = serde_yaml::to_value(Value::Object(providers))
+            .map_err(|err| format!("model_catalog.providers 序列化失败: {err}"))?;
+        model_catalog.insert(yaml_key("providers"), yaml_value);
+    }
+    Ok(())
+}
+
+fn normalize_hermes_x_search_model(value: Option<String>, strict: bool) -> Result<String, String> {
+    let text = value.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        if strict {
+            return Err("x_search.model 不能为空".to_string());
+        }
+        return Ok("grok-4.20-reasoning".to_string());
+    }
+    if text
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '/' | '-'))
+    {
+        return Ok(text);
+    }
+    if strict {
+        return Err(
+            "x_search.model 只能包含字母、数字、下划线、点、斜杠、冒号和短横线".to_string(),
+        );
+    }
+    Ok("grok-4.20-reasoning".to_string())
+}
+
+fn build_hermes_x_search_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let x_search = root.and_then(|map| yaml_get_mapping(map, "x_search"));
+    let model = normalize_hermes_x_search_model(
+        x_search.and_then(|map| yaml_string_field(map, "model")),
+        false,
+    )
+    .unwrap_or_else(|_| "grok-4.20-reasoning".to_string());
+    let timeout_seconds = x_search
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout_seconds"), 180, 30, 3600))
+        .unwrap_or(180);
+    let retries = x_search
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "retries"), 2, 0, 20))
+        .unwrap_or(2);
+
+    serde_json::json!({
+        "xSearchModel": model,
+        "xSearchTimeoutSeconds": timeout_seconds,
+        "xSearchRetries": retries,
+    })
+}
+
+fn merge_hermes_x_search_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_x_search_config_values(config);
+    let model = normalize_hermes_x_search_model(
+        if form.get("xSearchModel").is_some() {
+            form_string(form, "xSearchModel")
+        } else {
+            current["xSearchModel"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let timeout_seconds = validate_hermes_i64(
+        if form.get("xSearchTimeoutSeconds").is_some() {
+            form_i64(form, "xSearchTimeoutSeconds")
+        } else {
+            current["xSearchTimeoutSeconds"].as_i64()
+        },
+        "x_search.timeout_seconds",
+        180,
+        30,
+        3600,
+    )?;
+    let retries = validate_hermes_i64(
+        if form.get("xSearchRetries").is_some() {
+            form_i64(form, "xSearchRetries")
+        } else {
+            current["xSearchRetries"].as_i64()
+        },
+        "x_search.retries",
+        2,
+        0,
+        20,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let x_search = yaml_child_object(root, "x_search")?;
+    x_search.insert(yaml_key("model"), serde_yaml::Value::String(model));
+    x_search.insert(
+        yaml_key("timeout_seconds"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(timeout_seconds)),
+    );
+    x_search.insert(
+        yaml_key("retries"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(retries)),
+    );
+    Ok(())
+}
+
+fn normalize_hermes_context_engine(value: Option<String>, strict: bool) -> Result<String, String> {
+    let text = value.unwrap_or_default().trim().to_string();
+    if text.is_empty() {
+        if strict {
+            return Err("context.engine 不能为空".to_string());
+        }
+        return Ok("compressor".to_string());
+    }
+    if text
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+    {
+        return Ok(text);
+    }
+    if strict {
+        return Err("context.engine 只能包含字母、数字、下划线、点和短横线".to_string());
+    }
+    Ok("compressor".to_string())
+}
+
+fn build_hermes_context_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let context = root.and_then(|map| yaml_get_mapping(map, "context"));
+    let engine = normalize_hermes_context_engine(
+        context.and_then(|map| yaml_string_field(map, "engine")),
+        false,
+    )
+    .unwrap_or_else(|_| "compressor".to_string());
+
+    serde_json::json!({
+        "contextEngine": engine,
+    })
+}
+
+fn merge_hermes_context_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_context_config_values(config);
+    let engine = normalize_hermes_context_engine(
+        if form.get("contextEngine").is_some() {
+            form_string(form, "contextEngine")
+        } else {
+            current["contextEngine"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let context = yaml_child_object(root, "context")?;
+    context.insert(yaml_key("engine"), serde_yaml::Value::String(engine));
+    Ok(())
+}
+
+fn build_hermes_lsp_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let lsp = root.and_then(|map| yaml_get_mapping(map, "lsp"));
+    let lsp_enabled = lsp
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(true);
+    let lsp_wait_mode = normalize_hermes_lsp_wait_mode(
+        lsp.and_then(|map| yaml_string_field(map, "wait_mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "document".to_string());
+    let lsp_wait_timeout = lsp
+        .map(|map| bounded_hermes_f64(yaml_f64_field(map, "wait_timeout"), 5.0, 0.1, 120.0))
+        .unwrap_or(5.0);
+    let lsp_install_strategy = normalize_hermes_lsp_install_strategy(
+        lsp.and_then(|map| yaml_string_field(map, "install_strategy")),
+        false,
+    )
+    .unwrap_or_else(|_| "auto".to_string());
+
+    serde_json::json!({
+        "lspEnabled": lsp_enabled,
+        "lspWaitMode": lsp_wait_mode,
+        "lspWaitTimeout": lsp_wait_timeout,
+        "lspInstallStrategy": lsp_install_strategy,
+    })
+}
+
+fn merge_hermes_lsp_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_lsp_config_values(config);
+    let lsp_enabled = form_bool(form, "lspEnabled")
+        .unwrap_or_else(|| current["lspEnabled"].as_bool().unwrap_or(true));
+    let lsp_wait_mode = normalize_hermes_lsp_wait_mode(
+        if form.get("lspWaitMode").is_some() {
+            form_string(form, "lspWaitMode")
+        } else {
+            current["lspWaitMode"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let lsp_wait_timeout = validate_hermes_f64(
+        if form.get("lspWaitTimeout").is_some() {
+            form_f64(form, "lspWaitTimeout")
+        } else {
+            current["lspWaitTimeout"].as_f64()
+        },
+        "lsp.wait_timeout",
+        5.0,
+        0.1,
+        120.0,
+    )?;
+    let lsp_install_strategy = normalize_hermes_lsp_install_strategy(
+        if form.get("lspInstallStrategy").is_some() {
+            form_string(form, "lspInstallStrategy")
+        } else {
+            current["lspInstallStrategy"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let lsp = yaml_child_object(root, "lsp")?;
+    lsp.insert(yaml_key("enabled"), serde_yaml::Value::Bool(lsp_enabled));
+    lsp.insert(
+        yaml_key("wait_mode"),
+        serde_yaml::Value::String(lsp_wait_mode),
+    );
+    lsp.insert(
+        yaml_key("wait_timeout"),
+        serde_yaml::Value::Number(serde_yaml::Number::from(lsp_wait_timeout)),
+    );
+    lsp.insert(
+        yaml_key("install_strategy"),
+        serde_yaml::Value::String(lsp_install_strategy),
+    );
+    Ok(())
+}
+
+fn build_hermes_stt_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let stt = root.and_then(|map| yaml_get_mapping(map, "stt"));
+    let local = stt.and_then(|map| yaml_get_mapping(map, "local"));
+    let openai = stt.and_then(|map| yaml_get_mapping(map, "openai"));
+    let mistral = stt.and_then(|map| yaml_get_mapping(map, "mistral"));
+    let stt_enabled = stt
+        .and_then(|map| yaml_bool_field(map, "enabled"))
+        .unwrap_or(true);
+    let stt_provider = normalize_hermes_stt_provider(
+        stt.and_then(|map| yaml_string_field(map, "provider")),
+        false,
+    )
+    .unwrap_or_else(|_| "auto".to_string());
+    let stt_local_model = normalize_hermes_stt_local_model(
+        local.and_then(|map| yaml_string_field(map, "model")),
+        false,
+    )
+    .unwrap_or_else(|_| "base".to_string());
+    let stt_local_language = normalize_hermes_stt_language(
+        local.and_then(|map| yaml_string_field(map, "language")),
+        false,
+    )
+    .unwrap_or_else(|_| String::new());
+    let stt_openai_model = normalize_hermes_stt_openai_model(
+        openai.and_then(|map| yaml_string_field(map, "model")),
+        false,
+    )
+    .unwrap_or_else(|_| "whisper-1".to_string());
+    let stt_mistral_model = normalize_hermes_stt_mistral_model(
+        mistral.and_then(|map| yaml_string_field(map, "model")),
+        false,
+    )
+    .unwrap_or_else(|_| "voxtral-mini-latest".to_string());
+
+    serde_json::json!({
+        "sttEnabled": stt_enabled,
+        "sttProvider": stt_provider,
+        "sttLocalModel": stt_local_model,
+        "sttLocalLanguage": stt_local_language,
+        "sttOpenaiModel": stt_openai_model,
+        "sttMistralModel": stt_mistral_model,
+    })
+}
+
+fn merge_hermes_stt_config(config: &mut serde_yaml::Value, form: &Value) -> Result<(), String> {
+    let current = build_hermes_stt_config_values(config);
+    let stt_enabled = form_bool(form, "sttEnabled")
+        .unwrap_or_else(|| current["sttEnabled"].as_bool().unwrap_or(true));
+    let stt_provider = normalize_hermes_stt_provider(
+        if form.get("sttProvider").is_some() {
+            form_string(form, "sttProvider")
+        } else {
+            current["sttProvider"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let stt_local_model = normalize_hermes_stt_local_model(
+        if form.get("sttLocalModel").is_some() {
+            form_string(form, "sttLocalModel")
+        } else {
+            current["sttLocalModel"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let stt_local_language = normalize_hermes_stt_language(
+        if form.get("sttLocalLanguage").is_some() {
+            form_string(form, "sttLocalLanguage")
+        } else {
+            current["sttLocalLanguage"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let stt_openai_model = normalize_hermes_stt_openai_model(
+        if form.get("sttOpenaiModel").is_some() {
+            form_string(form, "sttOpenaiModel")
+        } else {
+            current["sttOpenaiModel"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let stt_mistral_model = normalize_hermes_stt_mistral_model(
+        if form.get("sttMistralModel").is_some() {
+            form_string(form, "sttMistralModel")
+        } else {
+            current["sttMistralModel"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let stt = yaml_child_object(root, "stt")?;
+    stt.insert(yaml_key("enabled"), serde_yaml::Value::Bool(stt_enabled));
+    stt.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(stt_provider),
+    );
+
+    let local = yaml_child_object(stt, "local")?;
+    local.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(stt_local_model),
+    );
+    local.insert(
+        yaml_key("language"),
+        serde_yaml::Value::String(stt_local_language),
+    );
+
+    let openai = yaml_child_object(stt, "openai")?;
+    openai.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(stt_openai_model),
+    );
+
+    let mistral = yaml_child_object(stt, "mistral")?;
+    mistral.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(stt_mistral_model),
+    );
+    Ok(())
+}
+
+fn build_hermes_tts_voice_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let tts = root.and_then(|map| yaml_get_mapping(map, "tts"));
+    let edge = tts.and_then(|map| yaml_get_mapping(map, "edge"));
+    let openai = tts.and_then(|map| yaml_get_mapping(map, "openai"));
+    let elevenlabs = tts.and_then(|map| yaml_get_mapping(map, "elevenlabs"));
+    let xai = tts.and_then(|map| yaml_get_mapping(map, "xai"));
+    let mistral = tts.and_then(|map| yaml_get_mapping(map, "mistral"));
+    let piper = tts.and_then(|map| yaml_get_mapping(map, "piper"));
+    let voice = root.and_then(|map| yaml_get_mapping(map, "voice"));
+    let tts_string = |section: Option<&serde_yaml::Mapping>, key: &str, fallback: &str| {
+        section
+            .and_then(|map| yaml_string_field(map, key))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    serde_json::json!({
+        "ttsProvider": normalize_hermes_tts_provider(tts.and_then(|map| yaml_string_field(map, "provider")), false).unwrap_or_else(|_| "edge".to_string()),
+        "ttsEdgeVoice": tts_string(edge, "voice", "en-US-AriaNeural"),
+        "ttsOpenaiModel": tts_string(openai, "model", "gpt-4o-mini-tts"),
+        "ttsOpenaiVoice": normalize_hermes_tts_openai_voice(openai.and_then(|map| yaml_string_field(map, "voice")), false).unwrap_or_else(|_| "alloy".to_string()),
+        "ttsElevenlabsVoiceId": tts_string(elevenlabs, "voice_id", "pNInz6obpgDQGcFmaJgB"),
+        "ttsElevenlabsModelId": tts_string(elevenlabs, "model_id", "eleven_multilingual_v2"),
+        "ttsXaiVoiceId": tts_string(xai, "voice_id", "eve"),
+        "ttsXaiLanguage": normalize_hermes_voice_language(xai.and_then(|map| yaml_string_field(map, "language")), false, "tts.xai.language").unwrap_or_else(|_| "en".to_string()),
+        "ttsXaiSampleRate": xai.map(|map| bounded_hermes_i64(yaml_i64_field(map, "sample_rate"), 24000, 8000, 192000)).unwrap_or(24000),
+        "ttsXaiBitRate": xai.map(|map| bounded_hermes_i64(yaml_i64_field(map, "bit_rate"), 128000, 16000, 512000)).unwrap_or(128000),
+        "ttsMistralModel": tts_string(mistral, "model", "voxtral-mini-tts-2603"),
+        "ttsMistralVoiceId": tts_string(mistral, "voice_id", "c69964a6-ab8b-4f8a-9465-ec0925096ec8"),
+        "ttsPiperVoice": tts_string(piper, "voice", "en_US-lessac-medium"),
+        "voiceRecordKey": voice.and_then(|map| yaml_string_field(map, "record_key")).map(|value| value.trim().to_string()).unwrap_or_else(|| "ctrl+b".to_string()),
+        "voiceMaxRecordingSeconds": voice.map(|map| bounded_hermes_i64(yaml_i64_field(map, "max_recording_seconds"), 120, 1, 3600)).unwrap_or(120),
+        "voiceAutoTts": voice.and_then(|map| yaml_bool_field(map, "auto_tts")).unwrap_or(false),
+        "voiceBeepEnabled": voice.and_then(|map| yaml_bool_field(map, "beep_enabled")).unwrap_or(true),
+        "voiceSilenceThreshold": voice.map(|map| bounded_hermes_i64(yaml_i64_field(map, "silence_threshold"), 200, 0, 32767)).unwrap_or(200),
+        "voiceSilenceDuration": voice.map(|map| bounded_hermes_f64(yaml_f64_field(map, "silence_duration"), 3.0, 0.1, 60.0)).unwrap_or(3.0),
+    })
+}
+
+fn merge_hermes_tts_voice_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_tts_voice_config_values(config);
+    let form_or_current_string = |key: &str| {
+        if form.get(key).is_some() {
+            form_string(form, key)
+        } else {
+            current[key].as_str().map(ToString::to_string)
+        }
+    };
+    let tts_provider = normalize_hermes_tts_provider(form_or_current_string("ttsProvider"), true)?;
+    let tts_edge_voice = form_or_current_string("ttsEdgeVoice")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let tts_openai_model = form_or_current_string("ttsOpenaiModel")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "gpt-4o-mini-tts".to_string());
+    let tts_openai_voice =
+        normalize_hermes_tts_openai_voice(form_or_current_string("ttsOpenaiVoice"), true)?;
+    let tts_elevenlabs_voice_id = form_or_current_string("ttsElevenlabsVoiceId")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let tts_elevenlabs_model_id = form_or_current_string("ttsElevenlabsModelId")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let tts_xai_voice_id = form_or_current_string("ttsXaiVoiceId")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "eve".to_string());
+    let tts_xai_language = normalize_hermes_voice_language(
+        form_or_current_string("ttsXaiLanguage"),
+        true,
+        "tts.xai.language",
+    )?;
+    let tts_xai_sample_rate = validate_hermes_i64(
+        if form.get("ttsXaiSampleRate").is_some() {
+            form_i64(form, "ttsXaiSampleRate")
+        } else {
+            current["ttsXaiSampleRate"].as_i64()
+        },
+        "tts.xai.sample_rate",
+        24000,
+        8000,
+        192000,
+    )?;
+    let tts_xai_bit_rate = validate_hermes_i64(
+        if form.get("ttsXaiBitRate").is_some() {
+            form_i64(form, "ttsXaiBitRate")
+        } else {
+            current["ttsXaiBitRate"].as_i64()
+        },
+        "tts.xai.bit_rate",
+        128000,
+        16000,
+        512000,
+    )?;
+    let tts_mistral_model = form_or_current_string("ttsMistralModel")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "voxtral-mini-tts-2603".to_string());
+    let tts_mistral_voice_id = form_or_current_string("ttsMistralVoiceId")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let tts_piper_voice = form_or_current_string("ttsPiperVoice")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let voice_record_key = form_or_current_string("voiceRecordKey")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let voice_max_recording_seconds = validate_hermes_i64(
+        if form.get("voiceMaxRecordingSeconds").is_some() {
+            form_i64(form, "voiceMaxRecordingSeconds")
+        } else {
+            current["voiceMaxRecordingSeconds"].as_i64()
+        },
+        "voice.max_recording_seconds",
+        120,
+        1,
+        3600,
+    )?;
+    let voice_auto_tts = form_bool(form, "voiceAutoTts")
+        .unwrap_or_else(|| current["voiceAutoTts"].as_bool().unwrap_or(false));
+    let voice_beep_enabled = form_bool(form, "voiceBeepEnabled")
+        .unwrap_or_else(|| current["voiceBeepEnabled"].as_bool().unwrap_or(true));
+    let voice_silence_threshold = validate_hermes_i64(
+        if form.get("voiceSilenceThreshold").is_some() {
+            form_i64(form, "voiceSilenceThreshold")
+        } else {
+            current["voiceSilenceThreshold"].as_i64()
+        },
+        "voice.silence_threshold",
+        200,
+        0,
+        32767,
+    )?;
+    let voice_silence_duration = validate_hermes_f64(
+        if form.get("voiceSilenceDuration").is_some() {
+            form_f64(form, "voiceSilenceDuration")
+        } else {
+            current["voiceSilenceDuration"].as_f64()
+        },
+        "voice.silence_duration",
+        3.0,
+        0.1,
+        60.0,
+    )?;
+
+    let root = ensure_yaml_object(config)?;
+    let tts = yaml_child_object(root, "tts")?;
+    tts.insert(
+        yaml_key("provider"),
+        serde_yaml::Value::String(tts_provider),
+    );
+    let edge = yaml_child_object(tts, "edge")?;
+    set_optional_yaml_string(edge, "voice", tts_edge_voice);
+    let openai = yaml_child_object(tts, "openai")?;
+    openai.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(tts_openai_model),
+    );
+    openai.insert(
+        yaml_key("voice"),
+        serde_yaml::Value::String(tts_openai_voice),
+    );
+    let elevenlabs = yaml_child_object(tts, "elevenlabs")?;
+    set_optional_yaml_string(elevenlabs, "voice_id", tts_elevenlabs_voice_id);
+    set_optional_yaml_string(elevenlabs, "model_id", tts_elevenlabs_model_id);
+    let xai = yaml_child_object(tts, "xai")?;
+    xai.insert(
+        yaml_key("voice_id"),
+        serde_yaml::Value::String(tts_xai_voice_id),
+    );
+    xai.insert(
+        yaml_key("language"),
+        serde_yaml::Value::String(tts_xai_language),
+    );
+    xai.insert(
+        yaml_key("sample_rate"),
+        serde_yaml::Value::Number(tts_xai_sample_rate.into()),
+    );
+    xai.insert(
+        yaml_key("bit_rate"),
+        serde_yaml::Value::Number(tts_xai_bit_rate.into()),
+    );
+    let mistral = yaml_child_object(tts, "mistral")?;
+    mistral.insert(
+        yaml_key("model"),
+        serde_yaml::Value::String(tts_mistral_model),
+    );
+    set_optional_yaml_string(mistral, "voice_id", tts_mistral_voice_id);
+    let piper = yaml_child_object(tts, "piper")?;
+    set_optional_yaml_string(piper, "voice", tts_piper_voice);
+
+    let voice = yaml_child_object(root, "voice")?;
+    set_optional_yaml_string(voice, "record_key", voice_record_key);
+    voice.insert(
+        yaml_key("max_recording_seconds"),
+        serde_yaml::Value::Number(voice_max_recording_seconds.into()),
+    );
+    voice.insert(
+        yaml_key("auto_tts"),
+        serde_yaml::Value::Bool(voice_auto_tts),
+    );
+    voice.insert(
+        yaml_key("beep_enabled"),
+        serde_yaml::Value::Bool(voice_beep_enabled),
+    );
+    voice.insert(
+        yaml_key("silence_threshold"),
+        serde_yaml::Value::Number(voice_silence_threshold.into()),
+    );
+    voice.insert(
+        yaml_key("silence_duration"),
+        serde_yaml::to_value(voice_silence_duration).map_err(|err| err.to_string())?,
+    );
+    Ok(())
+}
+
+fn merge_hermes_execution_limits_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_execution_limits_config_values(config);
+    let code_execution_mode = normalize_hermes_code_execution_mode(
+        if form.get("codeExecutionMode").is_some() {
+            form_string(form, "codeExecutionMode")
+        } else {
+            current["codeExecutionMode"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let code_execution_timeout = validate_hermes_i64(
+        if form.get("codeExecutionTimeout").is_some() {
+            form_i64(form, "codeExecutionTimeout")
+        } else {
+            Some(current["codeExecutionTimeout"].as_i64().unwrap_or(300))
+        },
+        "code_execution.timeout",
+        300,
+        1,
+        86400,
+    )?;
+    let code_execution_max_tool_calls = validate_hermes_i64(
+        if form.get("codeExecutionMaxToolCalls").is_some() {
+            form_i64(form, "codeExecutionMaxToolCalls")
+        } else {
+            Some(current["codeExecutionMaxToolCalls"].as_i64().unwrap_or(50))
+        },
+        "code_execution.max_tool_calls",
+        50,
+        1,
+        10000,
+    )?;
+    let delegation_max_iterations = validate_hermes_i64(
+        if form.get("delegationMaxIterations").is_some() {
+            form_i64(form, "delegationMaxIterations")
+        } else {
+            Some(current["delegationMaxIterations"].as_i64().unwrap_or(50))
+        },
+        "delegation.max_iterations",
+        50,
+        1,
+        1000,
+    )?;
+    let delegation_child_timeout_seconds = validate_hermes_i64(
+        if form.get("delegationChildTimeoutSeconds").is_some() {
+            form_i64(form, "delegationChildTimeoutSeconds")
+        } else {
+            Some(
+                current["delegationChildTimeoutSeconds"]
+                    .as_i64()
+                    .unwrap_or(600),
+            )
+        },
+        "delegation.child_timeout_seconds",
+        600,
+        30,
+        86400,
+    )?;
+    let delegation_max_concurrent_children = validate_hermes_i64(
+        if form.get("delegationMaxConcurrentChildren").is_some() {
+            form_i64(form, "delegationMaxConcurrentChildren")
+        } else {
+            Some(
+                current["delegationMaxConcurrentChildren"]
+                    .as_i64()
+                    .unwrap_or(3),
+            )
+        },
+        "delegation.max_concurrent_children",
+        3,
+        1,
+        100,
+    )?;
+    let delegation_max_spawn_depth = validate_hermes_i64(
+        if form.get("delegationMaxSpawnDepth").is_some() {
+            form_i64(form, "delegationMaxSpawnDepth")
+        } else {
+            Some(current["delegationMaxSpawnDepth"].as_i64().unwrap_or(1))
+        },
+        "delegation.max_spawn_depth",
+        1,
+        1,
+        3,
+    )?;
+    let delegation_orchestrator_enabled = form_bool(form, "delegationOrchestratorEnabled")
+        .unwrap_or_else(|| {
+            current["delegationOrchestratorEnabled"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+    let delegation_subagent_auto_approve = form_bool(form, "delegationSubagentAutoApprove")
+        .unwrap_or_else(|| {
+            current["delegationSubagentAutoApprove"]
+                .as_bool()
+                .unwrap_or(false)
+        });
+    let delegation_inherit_mcp_toolsets = form_bool(form, "delegationInheritMcpToolsets")
+        .unwrap_or_else(|| {
+            current["delegationInheritMcpToolsets"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+    let delegation_model = form_string(form, "delegationModel")
+        .or_else(|| current["delegationModel"].as_str().map(ToString::to_string))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let delegation_provider = form_string(form, "delegationProvider")
+        .or_else(|| {
+            current["delegationProvider"]
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let root = ensure_yaml_object(config)?;
+    let code_execution = yaml_child_object(root, "code_execution")?;
+    code_execution.insert(
+        yaml_key("mode"),
+        serde_yaml::Value::String(code_execution_mode),
+    );
+    code_execution.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(code_execution_timeout.into()),
+    );
+    code_execution.insert(
+        yaml_key("max_tool_calls"),
+        serde_yaml::Value::Number(code_execution_max_tool_calls.into()),
+    );
+
+    let delegation = yaml_child_object(root, "delegation")?;
+    delegation.insert(
+        yaml_key("max_iterations"),
+        serde_yaml::Value::Number(delegation_max_iterations.into()),
+    );
+    delegation.insert(
+        yaml_key("child_timeout_seconds"),
+        serde_yaml::Value::Number(delegation_child_timeout_seconds.into()),
+    );
+    delegation.insert(
+        yaml_key("max_concurrent_children"),
+        serde_yaml::Value::Number(delegation_max_concurrent_children.into()),
+    );
+    delegation.insert(
+        yaml_key("max_spawn_depth"),
+        serde_yaml::Value::Number(delegation_max_spawn_depth.into()),
+    );
+    delegation.insert(
+        yaml_key("orchestrator_enabled"),
+        serde_yaml::Value::Bool(delegation_orchestrator_enabled),
+    );
+    delegation.insert(
+        yaml_key("subagent_auto_approve"),
+        serde_yaml::Value::Bool(delegation_subagent_auto_approve),
+    );
+    delegation.insert(
+        yaml_key("inherit_mcp_toolsets"),
+        serde_yaml::Value::Bool(delegation_inherit_mcp_toolsets),
+    );
+    if delegation_model.is_empty() {
+        delegation.remove(yaml_key("model"));
+    } else {
+        delegation.insert(
+            yaml_key("model"),
+            serde_yaml::Value::String(delegation_model),
+        );
+    }
+    if delegation_provider.is_empty() {
+        delegation.remove(yaml_key("provider"));
+    } else {
+        delegation.insert(
+            yaml_key("provider"),
+            serde_yaml::Value::String(delegation_provider),
+        );
+    }
+    Ok(())
+}
+
+fn build_hermes_terminal_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let terminal = root.and_then(|map| yaml_get_mapping(map, "terminal"));
+    let terminal_string = |key: &str| {
+        terminal
+            .and_then(|map| yaml_string_field(map, key))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+    };
+    let terminal_backend = normalize_hermes_terminal_backend(
+        terminal.and_then(|map| yaml_string_field(map, "backend")),
+        false,
+    )
+    .unwrap_or_else(|_| "local".to_string());
+    let terminal_cwd = terminal
+        .and_then(|map| yaml_string_field(map, "cwd"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    let terminal_timeout = terminal
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "timeout"), 180, 1, 86400))
+        .unwrap_or(180);
+    let terminal_lifetime_seconds = terminal
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "lifetime_seconds"), 300, 0, 86400))
+        .unwrap_or(300);
+    let terminal_shell_init_files = terminal
+        .map(|map| yaml_string_sequence_field(map, "shell_init_files").join("\n"))
+        .unwrap_or_default();
+    let terminal_auto_source_bashrc = terminal
+        .and_then(|map| yaml_bool_field(map, "auto_source_bashrc"))
+        .unwrap_or(true);
+    let terminal_persistent_shell = terminal
+        .and_then(|map| yaml_bool_field(map, "persistent_shell"))
+        .unwrap_or(true);
+    let terminal_env_passthrough = terminal
+        .map(|map| yaml_string_sequence_field(map, "env_passthrough").join("\n"))
+        .unwrap_or_default();
+    let terminal_docker_mount_cwd_to_workspace = terminal
+        .and_then(|map| yaml_bool_field(map, "docker_mount_cwd_to_workspace"))
+        .unwrap_or(false);
+    let terminal_docker_run_as_host_user = terminal
+        .and_then(|map| yaml_bool_field(map, "docker_run_as_host_user"))
+        .unwrap_or(false);
+    let terminal_docker_image = terminal_string("docker_image");
+    let terminal_singularity_image = terminal_string("singularity_image");
+    let terminal_modal_image = terminal_string("modal_image");
+    let terminal_modal_mode = normalize_hermes_terminal_modal_mode(
+        terminal.and_then(|map| yaml_string_field(map, "modal_mode")),
+        false,
+    )
+    .unwrap_or_else(|_| "auto".to_string());
+    let terminal_vercel_runtime = normalize_hermes_terminal_vercel_runtime(
+        terminal.and_then(|map| yaml_string_field(map, "vercel_runtime")),
+        false,
+    )
+    .unwrap_or_else(|_| "node24".to_string());
+    let terminal_daytona_image = terminal_string("daytona_image");
+    let terminal_docker_forward_env = terminal
+        .map(|map| yaml_string_sequence_field(map, "docker_forward_env").join("\n"))
+        .unwrap_or_default();
+    let terminal_docker_env_json = yaml_docker_env_json_field(terminal, "docker_env");
+    let terminal_docker_volumes = terminal
+        .map(|map| yaml_string_sequence_field(map, "docker_volumes").join("\n"))
+        .unwrap_or_default();
+    let terminal_docker_extra_args = terminal
+        .map(|map| yaml_string_sequence_field(map, "docker_extra_args").join("\n"))
+        .unwrap_or_default();
+    let terminal_ssh_host = terminal_string("ssh_host");
+    let terminal_ssh_user = terminal_string("ssh_user");
+    let terminal_ssh_port = terminal
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "ssh_port"), 22, 1, 65535))
+        .unwrap_or(22);
+    let terminal_ssh_key = terminal_string("ssh_key");
+    let terminal_container_cpu = terminal
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "container_cpu"), 1, 1, 64))
+        .unwrap_or(1);
+    let terminal_container_memory = terminal
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "container_memory"), 5120, 128, 1048576))
+        .unwrap_or(5120);
+    let terminal_container_disk = terminal
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "container_disk"), 51200, 1024, 10485760))
+        .unwrap_or(51200);
+    let terminal_container_persistent = terminal
+        .and_then(|map| yaml_bool_field(map, "container_persistent"))
+        .unwrap_or(true);
+
+    serde_json::json!({
+        "terminalBackend": terminal_backend,
+        "terminalCwd": terminal_cwd,
+        "terminalTimeout": terminal_timeout,
+        "terminalLifetimeSeconds": terminal_lifetime_seconds,
+        "terminalShellInitFiles": terminal_shell_init_files,
+        "terminalAutoSourceBashrc": terminal_auto_source_bashrc,
+        "terminalPersistentShell": terminal_persistent_shell,
+        "terminalEnvPassthrough": terminal_env_passthrough,
+        "terminalDockerMountCwdToWorkspace": terminal_docker_mount_cwd_to_workspace,
+        "terminalDockerRunAsHostUser": terminal_docker_run_as_host_user,
+        "terminalDockerImage": terminal_docker_image,
+        "terminalSingularityImage": terminal_singularity_image,
+        "terminalModalImage": terminal_modal_image,
+        "terminalModalMode": terminal_modal_mode,
+        "terminalVercelRuntime": terminal_vercel_runtime,
+        "terminalDaytonaImage": terminal_daytona_image,
+        "terminalDockerForwardEnv": terminal_docker_forward_env,
+        "terminalDockerEnvJson": terminal_docker_env_json,
+        "terminalDockerVolumes": terminal_docker_volumes,
+        "terminalDockerExtraArgs": terminal_docker_extra_args,
+        "terminalSshHost": terminal_ssh_host,
+        "terminalSshUser": terminal_ssh_user,
+        "terminalSshPort": terminal_ssh_port,
+        "terminalSshKey": terminal_ssh_key,
+        "terminalContainerCpu": terminal_container_cpu,
+        "terminalContainerMemory": terminal_container_memory,
+        "terminalContainerDisk": terminal_container_disk,
+        "terminalContainerPersistent": terminal_container_persistent,
+    })
+}
+
+fn merge_hermes_terminal_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_terminal_config_values(config);
+    let terminal_backend = normalize_hermes_terminal_backend(
+        if form.get("terminalBackend").is_some() {
+            form_string(form, "terminalBackend")
+        } else {
+            current["terminalBackend"].as_str().map(ToString::to_string)
+        },
+        true,
+    )?;
+    let terminal_cwd = if form.get("terminalCwd").is_some() {
+        form_string(form, "terminalCwd")
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    } else {
+        current["terminalCwd"].as_str().unwrap_or(".").to_string()
+    };
+    let terminal_cwd = if terminal_cwd.trim().is_empty() {
+        ".".to_string()
+    } else {
+        terminal_cwd
+    };
+    let terminal_timeout = validate_hermes_i64(
+        if form.get("terminalTimeout").is_some() {
+            form_i64(form, "terminalTimeout")
+        } else {
+            Some(current["terminalTimeout"].as_i64().unwrap_or(180))
+        },
+        "terminal.timeout",
+        180,
+        1,
+        86400,
+    )?;
+    let terminal_lifetime_seconds = validate_hermes_i64(
+        if form.get("terminalLifetimeSeconds").is_some() {
+            form_i64(form, "terminalLifetimeSeconds")
+        } else {
+            Some(current["terminalLifetimeSeconds"].as_i64().unwrap_or(300))
+        },
+        "terminal.lifetime_seconds",
+        300,
+        0,
+        86400,
+    )?;
+    let terminal_shell_init_files = normalize_hermes_shell_init_file_list(
+        form_string(form, "terminalShellInitFiles").or_else(|| {
+            current["terminalShellInitFiles"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "terminal.shell_init_files",
+    )?;
+    let terminal_auto_source_bashrc =
+        form_bool(form, "terminalAutoSourceBashrc").unwrap_or_else(|| {
+            current["terminalAutoSourceBashrc"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+    let terminal_persistent_shell = form_bool(form, "terminalPersistentShell")
+        .unwrap_or_else(|| current["terminalPersistentShell"].as_bool().unwrap_or(true));
+    let terminal_env_passthrough = normalize_hermes_env_name_list(
+        form_string(form, "terminalEnvPassthrough").or_else(|| {
+            current["terminalEnvPassthrough"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "terminal.env_passthrough",
+    )?;
+    let terminal_docker_mount_cwd_to_workspace =
+        form_bool(form, "terminalDockerMountCwdToWorkspace").unwrap_or_else(|| {
+            current["terminalDockerMountCwdToWorkspace"]
+                .as_bool()
+                .unwrap_or(false)
+        });
+    let terminal_docker_run_as_host_user = form_bool(form, "terminalDockerRunAsHostUser")
+        .unwrap_or_else(|| {
+            current["terminalDockerRunAsHostUser"]
+                .as_bool()
+                .unwrap_or(false)
+        });
+    let terminal_modal_mode = normalize_hermes_terminal_modal_mode(
+        if form.get("terminalModalMode").is_some() {
+            form_string(form, "terminalModalMode")
+        } else {
+            current["terminalModalMode"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let terminal_vercel_runtime = normalize_hermes_terminal_vercel_runtime(
+        if form.get("terminalVercelRuntime").is_some() {
+            form_string(form, "terminalVercelRuntime")
+        } else {
+            current["terminalVercelRuntime"]
+                .as_str()
+                .map(ToString::to_string)
+        },
+        true,
+    )?;
+    let terminal_docker_image = form_string(form, "terminalDockerImage")
+        .or_else(|| {
+            current["terminalDockerImage"]
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terminal_singularity_image = form_string(form, "terminalSingularityImage")
+        .or_else(|| {
+            current["terminalSingularityImage"]
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terminal_modal_image = form_string(form, "terminalModalImage")
+        .or_else(|| {
+            current["terminalModalImage"]
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terminal_daytona_image = form_string(form, "terminalDaytonaImage")
+        .or_else(|| {
+            current["terminalDaytonaImage"]
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terminal_docker_forward_env = normalize_hermes_env_name_list(
+        form_string(form, "terminalDockerForwardEnv").or_else(|| {
+            current["terminalDockerForwardEnv"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "terminal.docker_forward_env",
+    )?;
+    let terminal_docker_env = normalize_hermes_docker_env_json(
+        form_string(form, "terminalDockerEnvJson").or_else(|| {
+            current["terminalDockerEnvJson"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "terminal.docker_env",
+    )?;
+    let terminal_docker_volumes = normalize_hermes_docker_volume_list(
+        form_string(form, "terminalDockerVolumes").or_else(|| {
+            current["terminalDockerVolumes"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "terminal.docker_volumes",
+    )?;
+    let terminal_docker_extra_args = normalize_hermes_docker_extra_args_list(
+        form_string(form, "terminalDockerExtraArgs").or_else(|| {
+            current["terminalDockerExtraArgs"]
+                .as_str()
+                .map(ToString::to_string)
+        }),
+        "terminal.docker_extra_args",
+    )?;
+    let terminal_ssh_host = form_string(form, "terminalSshHost")
+        .or_else(|| current["terminalSshHost"].as_str().map(ToString::to_string))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terminal_ssh_user = form_string(form, "terminalSshUser")
+        .or_else(|| current["terminalSshUser"].as_str().map(ToString::to_string))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terminal_ssh_port = validate_hermes_i64(
+        if form.get("terminalSshPort").is_some() {
+            form_i64(form, "terminalSshPort")
+        } else {
+            Some(current["terminalSshPort"].as_i64().unwrap_or(22))
+        },
+        "terminal.ssh_port",
+        22,
+        1,
+        65535,
+    )?;
+    let terminal_ssh_key = form_string(form, "terminalSshKey")
+        .or_else(|| current["terminalSshKey"].as_str().map(ToString::to_string))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terminal_container_cpu = validate_hermes_i64(
+        if form.get("terminalContainerCpu").is_some() {
+            form_i64(form, "terminalContainerCpu")
+        } else {
+            Some(current["terminalContainerCpu"].as_i64().unwrap_or(1))
+        },
+        "terminal.container_cpu",
+        1,
+        1,
+        64,
+    )?;
+    let terminal_container_memory = validate_hermes_i64(
+        if form.get("terminalContainerMemory").is_some() {
+            form_i64(form, "terminalContainerMemory")
+        } else {
+            Some(current["terminalContainerMemory"].as_i64().unwrap_or(5120))
+        },
+        "terminal.container_memory",
+        5120,
+        128,
+        1048576,
+    )?;
+    let terminal_container_disk = validate_hermes_i64(
+        if form.get("terminalContainerDisk").is_some() {
+            form_i64(form, "terminalContainerDisk")
+        } else {
+            Some(current["terminalContainerDisk"].as_i64().unwrap_or(51200))
+        },
+        "terminal.container_disk",
+        51200,
+        1024,
+        10485760,
+    )?;
+    let terminal_container_persistent = form_bool(form, "terminalContainerPersistent")
+        .unwrap_or_else(|| {
+            current["terminalContainerPersistent"]
+                .as_bool()
+                .unwrap_or(true)
+        });
+
+    let root = ensure_yaml_object(config)?;
+    let terminal = yaml_child_object(root, "terminal")?;
+    terminal.insert(
+        yaml_key("backend"),
+        serde_yaml::Value::String(terminal_backend),
+    );
+    terminal.insert(yaml_key("cwd"), serde_yaml::Value::String(terminal_cwd));
+    terminal.insert(
+        yaml_key("timeout"),
+        serde_yaml::Value::Number(terminal_timeout.into()),
+    );
+    terminal.insert(
+        yaml_key("lifetime_seconds"),
+        serde_yaml::Value::Number(terminal_lifetime_seconds.into()),
+    );
+    if terminal_shell_init_files.is_empty() {
+        terminal.remove(yaml_key("shell_init_files"));
+    } else {
+        terminal.insert(
+            yaml_key("shell_init_files"),
+            serde_yaml::Value::Sequence(
+                terminal_shell_init_files
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    terminal.insert(
+        yaml_key("auto_source_bashrc"),
+        serde_yaml::Value::Bool(terminal_auto_source_bashrc),
+    );
+    terminal.insert(
+        yaml_key("persistent_shell"),
+        serde_yaml::Value::Bool(terminal_persistent_shell),
+    );
+    if terminal_env_passthrough.is_empty() {
+        terminal.remove(yaml_key("env_passthrough"));
+    } else {
+        terminal.insert(
+            yaml_key("env_passthrough"),
+            serde_yaml::Value::Sequence(
+                terminal_env_passthrough
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    terminal.insert(
+        yaml_key("docker_mount_cwd_to_workspace"),
+        serde_yaml::Value::Bool(terminal_docker_mount_cwd_to_workspace),
+    );
+    terminal.insert(
+        yaml_key("docker_run_as_host_user"),
+        serde_yaml::Value::Bool(terminal_docker_run_as_host_user),
+    );
+    set_optional_yaml_string(terminal, "docker_image", terminal_docker_image);
+    set_optional_yaml_string(terminal, "singularity_image", terminal_singularity_image);
+    set_optional_yaml_string(terminal, "modal_image", terminal_modal_image);
+    terminal.insert(
+        yaml_key("modal_mode"),
+        serde_yaml::Value::String(terminal_modal_mode),
+    );
+    terminal.insert(
+        yaml_key("vercel_runtime"),
+        serde_yaml::Value::String(terminal_vercel_runtime),
+    );
+    set_optional_yaml_string(terminal, "daytona_image", terminal_daytona_image);
+    if terminal_docker_forward_env.is_empty() {
+        terminal.remove(yaml_key("docker_forward_env"));
+    } else {
+        terminal.insert(
+            yaml_key("docker_forward_env"),
+            serde_yaml::Value::Sequence(
+                terminal_docker_forward_env
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if terminal_docker_env.is_empty() {
+        terminal.remove(yaml_key("docker_env"));
+    } else {
+        let mut docker_env = serde_yaml::Mapping::new();
+        for (name, value) in terminal_docker_env {
+            let value = value.as_str().unwrap_or_default().to_string();
+            docker_env.insert(yaml_key(&name), serde_yaml::Value::String(value));
+        }
+        terminal.insert(
+            yaml_key("docker_env"),
+            serde_yaml::Value::Mapping(docker_env),
+        );
+    }
+    if terminal_docker_volumes.is_empty() {
+        terminal.remove(yaml_key("docker_volumes"));
+    } else {
+        terminal.insert(
+            yaml_key("docker_volumes"),
+            serde_yaml::Value::Sequence(
+                terminal_docker_volumes
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if terminal_docker_extra_args.is_empty() {
+        terminal.remove(yaml_key("docker_extra_args"));
+    } else {
+        terminal.insert(
+            yaml_key("docker_extra_args"),
+            serde_yaml::Value::Sequence(
+                terminal_docker_extra_args
+                    .into_iter()
+                    .map(serde_yaml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    set_optional_yaml_string(terminal, "ssh_host", terminal_ssh_host);
+    set_optional_yaml_string(terminal, "ssh_user", terminal_ssh_user);
+    terminal.insert(
+        yaml_key("ssh_port"),
+        serde_yaml::Value::Number(terminal_ssh_port.into()),
+    );
+    set_optional_yaml_string(terminal, "ssh_key", terminal_ssh_key);
+    terminal.insert(
+        yaml_key("container_cpu"),
+        serde_yaml::Value::Number(terminal_container_cpu.into()),
+    );
+    terminal.insert(
+        yaml_key("container_memory"),
+        serde_yaml::Value::Number(terminal_container_memory.into()),
+    );
+    terminal.insert(
+        yaml_key("container_disk"),
+        serde_yaml::Value::Number(terminal_container_disk.into()),
+    );
+    terminal.insert(
+        yaml_key("container_persistent"),
+        serde_yaml::Value::Bool(terminal_container_persistent),
+    );
+    Ok(())
+}
+
+fn build_hermes_session_runtime_config_values(config: &serde_yaml::Value) -> Value {
+    let root = config.as_mapping();
+    let session_reset = root.and_then(|map| yaml_get_mapping(map, "session_reset"));
+    let mode = session_reset
+        .and_then(|map| yaml_string_field(map, "mode"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| matches!(value.as_str(), "both" | "idle" | "daily" | "none"))
+        .unwrap_or_else(|| "both".to_string());
+    let idle_minutes = session_reset
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "idle_minutes"), 1440, 1, 525600))
+        .unwrap_or(1440);
+    let at_hour = session_reset
+        .map(|map| bounded_hermes_i64(yaml_i64_field(map, "at_hour"), 4, 0, 23))
+        .unwrap_or(4);
+    let group_sessions_per_user = root
+        .and_then(|map| yaml_bool_field(map, "group_sessions_per_user"))
+        .unwrap_or(true);
+    let thread_sessions_per_user = root
+        .and_then(|map| yaml_bool_field(map, "thread_sessions_per_user"))
+        .unwrap_or(false);
+    let worktree_enabled = root
+        .and_then(|map| yaml_bool_field(map, "worktree"))
+        .unwrap_or(false);
+
+    serde_json::json!({
+        "sessionResetMode": mode,
+        "idleMinutes": idle_minutes,
+        "atHour": at_hour,
+        "groupSessionsPerUser": group_sessions_per_user,
+        "threadSessionsPerUser": thread_sessions_per_user,
+        "worktreeEnabled": worktree_enabled,
+    })
+}
+
+fn merge_hermes_session_runtime_config(
+    config: &mut serde_yaml::Value,
+    form: &Value,
+) -> Result<(), String> {
+    let current = build_hermes_session_runtime_config_values(config);
+    let current_mode = current["sessionResetMode"].as_str().unwrap_or("both");
+    let mode = if form.get("sessionResetMode").is_some() {
+        form_string(form, "sessionResetMode")
+            .map(|value| value.trim().to_string())
+            .filter(|value| matches!(value.as_str(), "both" | "idle" | "daily" | "none"))
+            .ok_or_else(|| "session_reset.mode 必须是 both、idle、daily 或 none".to_string())?
+    } else {
+        current_mode.to_string()
+    };
+    let current_idle_minutes = current["idleMinutes"].as_i64().unwrap_or(1440);
+    let idle_minutes = validate_hermes_i64(
+        if form.get("idleMinutes").is_some() {
+            form_i64(form, "idleMinutes")
+        } else {
+            Some(current_idle_minutes)
+        },
+        "idle_minutes",
+        1440,
+        1,
+        525600,
+    )?;
+    let current_at_hour = current["atHour"].as_i64().unwrap_or(4);
+    let at_hour = validate_hermes_i64(
+        if form.get("atHour").is_some() {
+            form_i64(form, "atHour")
+        } else {
+            Some(current_at_hour)
+        },
+        "at_hour",
+        4,
+        0,
+        23,
+    )?;
+    let group_sessions_per_user = form_bool(form, "groupSessionsPerUser")
+        .unwrap_or_else(|| current["groupSessionsPerUser"].as_bool().unwrap_or(true));
+    let thread_sessions_per_user = form_bool(form, "threadSessionsPerUser")
+        .unwrap_or_else(|| current["threadSessionsPerUser"].as_bool().unwrap_or(false));
+    let worktree_enabled = form_bool(form, "worktreeEnabled")
+        .unwrap_or_else(|| current["worktreeEnabled"].as_bool().unwrap_or(false));
+
+    let root = ensure_yaml_object(config)?;
+    let session_reset = yaml_child_object(root, "session_reset")?;
+    session_reset.insert(yaml_key("mode"), serde_yaml::Value::String(mode));
+    session_reset.insert(
+        yaml_key("idle_minutes"),
+        serde_yaml::Value::Number(idle_minutes.into()),
+    );
+    session_reset.insert(
+        yaml_key("at_hour"),
+        serde_yaml::Value::Number(at_hour.into()),
+    );
+    root.insert(
+        yaml_key("group_sessions_per_user"),
+        serde_yaml::Value::Bool(group_sessions_per_user),
+    );
+    root.insert(
+        yaml_key("thread_sessions_per_user"),
+        serde_yaml::Value::Bool(thread_sessions_per_user),
+    );
+    root.insert(
+        yaml_key("worktree"),
+        serde_yaml::Value::Bool(worktree_enabled),
+    );
+    Ok(())
+}
+
+fn merge_hermes_channel_config(
+    config: &mut serde_yaml::Value,
+    platform: &str,
+    form: &Value,
+) -> Result<(), String> {
+    let platform = normalize_hermes_channel_platform(platform)
+        .ok_or_else(|| format!("不支持的 Hermes 渠道: {platform}"))?;
+    let root = ensure_yaml_object(config)?;
+    merge_hermes_channel_display_config(root, platform, form)?;
+    let platforms = yaml_child_object(root, "platforms")?;
+    let entry = yaml_child_object(platforms, platform)?;
+
+    entry.insert(
+        yaml_key("enabled"),
+        serde_yaml::Value::Bool(form_bool(form, "enabled").unwrap_or(false)),
+    );
+
+    match platform {
+        "telegram" => {
+            delete_yaml_key(entry, "token");
+            set_extra_string_if_present(
+                entry,
+                "reply_to_mode",
+                Some(normalize_hermes_telegram_reply_to_mode(
+                    form_string(form, "replyToMode"),
+                    true,
+                )?),
+            );
+            if let Some(value) = form_bool(form, "guestMode") {
+                set_extra_bool(entry, "guest_mode", value);
+            }
+            if let Some(value) = form_bool(form, "disableLinkPreviews") {
+                set_extra_bool(entry, "disable_link_previews", value);
+            }
+        }
+        "discord" => {
+            delete_yaml_key(entry, "token");
+            for (form_key_name, extra_key_name) in [
+                ("freeResponseChannels", "free_response_channels"),
+                ("allowedChannels", "allowed_channels"),
+                ("ignoredChannels", "ignored_channels"),
+                ("noThreadChannels", "no_thread_channels"),
+            ] {
+                if let Some(values) = form_string_array(form, form_key_name) {
+                    set_extra_string_array(entry, extra_key_name, values);
+                }
+            }
+            for (form_key_name, extra_key_name) in [
+                ("autoThread", "auto_thread"),
+                ("reactions", "reactions"),
+                ("threadRequireMention", "thread_require_mention"),
+                ("historyBackfill", "history_backfill"),
+            ] {
+                if let Some(value) = form_bool(form, form_key_name) {
+                    set_extra_bool(entry, extra_key_name, value);
+                }
+            }
+            set_extra_string_if_present(
+                entry,
+                "history_backfill_limit",
+                form_string(form, "historyBackfillLimit"),
+            );
+            set_extra_string_if_present(entry, "reply_to_mode", form_string(form, "replyToMode"));
+        }
+        "slack" => {
+            delete_yaml_key(entry, "token");
+            delete_extra_key(entry, "app_token");
+            delete_extra_key(entry, "signing_secret");
+            set_extra_string_if_present(
+                entry,
+                "webhook_path",
+                Some(form_string_or_default(form, "webhookPath", "/slack/events")),
+            );
+        }
+        "feishu" => {
+            delete_extra_key(entry, "app_id");
+            delete_extra_key(entry, "app_secret");
+            set_extra_string_if_present(
+                entry,
+                "domain",
+                Some(form_string_or_default(form, "domain", "feishu")),
+            );
+            set_extra_string_if_present(
+                entry,
+                "connection_mode",
+                Some(form_string_or_default(form, "connectionMode", "websocket")),
+            );
+            set_extra_string_if_present(
+                entry,
+                "webhook_path",
+                Some(form_string_or_default(
+                    form,
+                    "webhookPath",
+                    "/feishu/webhook",
+                )),
+            );
+            set_extra_string_if_present(
+                entry,
+                "reaction_notifications",
+                Some(form_string_or_default(form, "reactionNotifications", "off")),
+            );
+            set_extra_bool(
+                entry,
+                "typing_indicator",
+                form_bool(form, "typingIndicator").unwrap_or(true),
+            );
+            set_extra_bool(
+                entry,
+                "resolve_sender_names",
+                form_bool(form, "resolveSenderNames").unwrap_or(true),
+            );
+        }
+        "dingtalk" => {
+            delete_extra_key(entry, "client_id");
+            delete_extra_key(entry, "client_secret");
+            delete_extra_key(entry, "allow_from");
+            delete_extra_key(entry, "group_allow_from");
+        }
+        "teams" => {
+            delete_extra_key(entry, "client_id");
+            delete_extra_key(entry, "client_secret");
+            delete_extra_key(entry, "tenant_id");
+            set_extra_integer_if_present(entry, "port", form_i64(form, "port"));
+            set_extra_string_if_present(entry, "service_url", form_string(form, "serviceUrl"));
+            set_hermes_home_channel(entry, form);
+        }
+        "google_chat" => {
+            set_extra_string_if_present(entry, "project_id", form_string(form, "projectId"));
+            set_extra_string_if_present(
+                entry,
+                "subscription_name",
+                form_string(form, "subscriptionName"),
+            );
+            delete_extra_key(entry, "service_account_json");
+            set_hermes_home_channel(entry, form);
+        }
+        "irc" => {
+            set_extra_string_if_present(entry, "server", form_string(form, "server"));
+            set_extra_integer_if_present(entry, "port", form_i64(form, "port"));
+            set_extra_string_if_present(entry, "nickname", form_string(form, "nickname"));
+            set_extra_string_if_present(entry, "channel", form_string(form, "channel"));
+            if let Some(value) = form_bool(form, "useTls") {
+                set_extra_bool(entry, "use_tls", value);
+            }
+            delete_extra_key(entry, "server_password");
+            delete_extra_key(entry, "nickserv_password");
+            set_hermes_home_channel(entry, form);
+        }
+        "line" => {
+            delete_extra_key(entry, "channel_access_token");
+            delete_extra_key(entry, "channel_secret");
+            set_extra_integer_if_present(entry, "port", form_i64(form, "port"));
+            set_extra_string_if_present(entry, "host", form_string(form, "host"));
+            set_extra_string_if_present(entry, "public_url", form_string(form, "publicUrl"));
+            if let Some(values) = form_string_array(form, "allowedGroups") {
+                set_extra_string_array(entry, "allowed_groups", values);
+            }
+            if let Some(values) = form_string_array(form, "allowedRooms") {
+                set_extra_string_array(entry, "allowed_rooms", values);
+            }
+            set_extra_string_if_present(
+                entry,
+                "slow_response_threshold",
+                form_string(form, "slowResponseThreshold"),
+            );
+            set_hermes_home_channel(entry, form);
+        }
+        "simplex" => {
+            set_extra_string_if_present(entry, "ws_url", form_string(form, "wsUrl"));
+            set_hermes_home_channel(entry, form);
+        }
+        _ => {}
+    }
+
+    if form.get("dmPolicy").is_some() {
+        set_extra_string_if_present(
+            entry,
+            "dm_policy",
+            Some(normalize_hermes_dm_policy(form_string(form, "dmPolicy"))),
+        );
+    }
+    if form.get("groupPolicy").is_some() {
+        let group_policy = normalize_hermes_group_policy(form_string(form, "groupPolicy"));
+        set_extra_string_if_present(entry, "group_policy", Some(group_policy.clone()));
+        if platform == "feishu" {
+            set_extra_string_if_present(entry, "default_group_policy", Some(group_policy));
+        }
+    }
+    if let Some(value) = form_bool(form, "requireMention") {
+        set_extra_bool(entry, "require_mention", value);
+    }
+    if let Some(values) = form_string_array(form, "allowFrom") {
+        let key = if ["dingtalk", "irc", "line", "simplex"].contains(&platform) {
+            "allowed_users"
+        } else {
+            "allow_from"
+        };
+        set_extra_string_array(entry, key, values);
+    }
+    if let Some(values) = form_string_array(form, "groupAllowFrom") {
+        let key = if platform == "dingtalk" {
+            "allowed_chats"
+        } else {
+            "group_allow_from"
+        };
+        set_extra_string_array(entry, key, values);
+    }
+
+    Ok(())
+}
+
+fn read_hermes_channel_yaml_config() -> Result<(PathBuf, bool, serde_yaml::Value), String> {
+    let config_path = hermes_home().join("config.yaml");
+    if !config_path.exists() {
+        return Ok((
+            config_path,
+            false,
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        ));
+    }
+    let raw =
+        std::fs::read_to_string(&config_path).map_err(|e| format!("读取 config.yaml 失败: {e}"))?;
+    let config = if raw.trim().is_empty() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        serde_yaml::from_str(&raw).map_err(|e| format!("解析 config.yaml 失败: {e}"))?
+    };
+    Ok((config_path, true, config))
+}
+
+fn write_hermes_yaml_config(path: &PathBuf, config: &serde_yaml::Value) -> Result<String, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 Hermes 配置目录失败: {e}"))?;
+    }
+    let mut backup_path = String::new();
+    if path.exists() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = path.with_extension(format!("yaml.bak-{ts}"));
+        if std::fs::copy(path, &backup).is_ok() {
+            backup_path = backup.to_string_lossy().to_string();
+        }
+    }
+    let yaml =
+        serde_yaml::to_string(config).map_err(|e| format!("序列化 config.yaml 失败: {e}"))?;
+    std::fs::write(path, yaml).map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
+    Ok(backup_path)
+}
+
+fn csv_env_value(form: &Value, key: &str) -> String {
+    form_string_array(form, key).unwrap_or_default().join(",")
+}
+
+fn bool_env_value(value: bool) -> String {
+    if value { "true" } else { "false" }.to_string()
+}
+
+fn build_hermes_channel_env_updates(platform: &str, form: &Value) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut push = |key: &str, value: String| {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            pairs.push((key.to_string(), value));
+        }
+    };
+
+    match platform {
+        "telegram" => {
+            push(
+                "TELEGRAM_BOT_TOKEN",
+                form_string(form, "botToken").unwrap_or_default(),
+            );
+            push("TELEGRAM_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            push(
+                "TELEGRAM_GROUP_ALLOWED_USERS",
+                csv_env_value(form, "groupAllowFrom"),
+            );
+            if let Some(value) = form_bool(form, "requireMention") {
+                push("TELEGRAM_REQUIRE_MENTION", bool_env_value(value));
+            }
+            push(
+                "TELEGRAM_REPLY_TO_MODE",
+                normalize_hermes_telegram_reply_to_mode(form_string(form, "replyToMode"), true)
+                    .unwrap_or_else(|_| "first".to_string()),
+            );
+            if let Some(value) = form_bool(form, "guestMode") {
+                push("TELEGRAM_GUEST_MODE", bool_env_value(value));
+            }
+            if let Some(value) = form_bool(form, "disableLinkPreviews") {
+                push("TELEGRAM_DISABLE_LINK_PREVIEWS", bool_env_value(value));
+            }
+        }
+        "discord" => {
+            push(
+                "DISCORD_BOT_TOKEN",
+                form_string(form, "token").unwrap_or_default(),
+            );
+            push("DISCORD_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            if let Some(value) = form_bool(form, "requireMention") {
+                push("DISCORD_REQUIRE_MENTION", bool_env_value(value));
+            }
+            push(
+                "DISCORD_FREE_RESPONSE_CHANNELS",
+                csv_env_value(form, "freeResponseChannels"),
+            );
+            push(
+                "DISCORD_ALLOWED_CHANNELS",
+                csv_env_value(form, "allowedChannels"),
+            );
+            push(
+                "DISCORD_IGNORED_CHANNELS",
+                csv_env_value(form, "ignoredChannels"),
+            );
+            push(
+                "DISCORD_NO_THREAD_CHANNELS",
+                csv_env_value(form, "noThreadChannels"),
+            );
+            if let Some(value) = form_bool(form, "autoThread") {
+                push("DISCORD_AUTO_THREAD", bool_env_value(value));
+            }
+            if let Some(value) = form_bool(form, "reactions") {
+                push("DISCORD_REACTIONS", bool_env_value(value));
+            }
+            if let Some(value) = form_bool(form, "threadRequireMention") {
+                push("DISCORD_THREAD_REQUIRE_MENTION", bool_env_value(value));
+            }
+            if let Some(value) = form_bool(form, "historyBackfill") {
+                push("DISCORD_HISTORY_BACKFILL", bool_env_value(value));
+            }
+            push(
+                "DISCORD_HISTORY_BACKFILL_LIMIT",
+                form_string(form, "historyBackfillLimit").unwrap_or_default(),
+            );
+            push(
+                "DISCORD_REPLY_TO_MODE",
+                form_string(form, "replyToMode").unwrap_or_default(),
+            );
+            push(
+                "DISCORD_HOME_CHANNEL",
+                form_string(form, "homeChannel").unwrap_or_default(),
+            );
+            push(
+                "DISCORD_HOME_CHANNEL_NAME",
+                form_string(form, "homeChannelName").unwrap_or_default(),
+            );
+        }
+        "slack" => {
+            push(
+                "SLACK_BOT_TOKEN",
+                form_string(form, "botToken").unwrap_or_default(),
+            );
+            push(
+                "SLACK_APP_TOKEN",
+                form_string(form, "appToken").unwrap_or_default(),
+            );
+            push("SLACK_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            if let Some(value) = form_bool(form, "requireMention") {
+                push("SLACK_REQUIRE_MENTION", bool_env_value(value));
+            }
+        }
+        "feishu" => {
+            push(
+                "FEISHU_APP_ID",
+                form_string(form, "appId").unwrap_or_default(),
+            );
+            push(
+                "FEISHU_APP_SECRET",
+                form_string(form, "appSecret").unwrap_or_default(),
+            );
+            push(
+                "FEISHU_DOMAIN",
+                form_string_or_default(form, "domain", "feishu"),
+            );
+            push(
+                "FEISHU_CONNECTION_MODE",
+                form_string_or_default(form, "connectionMode", "websocket"),
+            );
+            push(
+                "FEISHU_WEBHOOK_PATH",
+                form_string_or_default(form, "webhookPath", "/feishu/webhook"),
+            );
+            push("FEISHU_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            push(
+                "FEISHU_GROUP_POLICY",
+                normalize_hermes_group_policy(form_string(form, "groupPolicy")),
+            );
+            push(
+                "FEISHU_REQUIRE_MENTION",
+                bool_env_value(form_bool(form, "requireMention").unwrap_or(true)),
+            );
+            let reactions = form_string(form, "reactionNotifications").unwrap_or_default();
+            push(
+                "FEISHU_REACTIONS",
+                if reactions.trim() == "off" {
+                    "false"
+                } else {
+                    "true"
+                }
+                .to_string(),
+            );
+        }
+        "dingtalk" => {
+            push(
+                "DINGTALK_CLIENT_ID",
+                form_string(form, "clientId").unwrap_or_default(),
+            );
+            push(
+                "DINGTALK_CLIENT_SECRET",
+                form_string(form, "clientSecret").unwrap_or_default(),
+            );
+            push("DINGTALK_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            push(
+                "DINGTALK_ALLOWED_CHATS",
+                csv_env_value(form, "groupAllowFrom"),
+            );
+            if let Some(value) = form_bool(form, "requireMention") {
+                push("DINGTALK_REQUIRE_MENTION", bool_env_value(value));
+            }
+        }
+        "teams" => {
+            push(
+                "TEAMS_CLIENT_ID",
+                form_string(form, "clientId").unwrap_or_default(),
+            );
+            push(
+                "TEAMS_CLIENT_SECRET",
+                form_string(form, "clientSecret").unwrap_or_default(),
+            );
+            push(
+                "TEAMS_TENANT_ID",
+                form_string(form, "tenantId").unwrap_or_default(),
+            );
+            push("TEAMS_PORT", form_string(form, "port").unwrap_or_default());
+            push(
+                "TEAMS_SERVICE_URL",
+                form_string(form, "serviceUrl").unwrap_or_default(),
+            );
+            push("TEAMS_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            if let Some(value) = form_bool(form, "allowAllUsers") {
+                push("TEAMS_ALLOW_ALL_USERS", bool_env_value(value));
+            }
+            push(
+                "TEAMS_HOME_CHANNEL",
+                form_string(form, "homeChannel").unwrap_or_default(),
+            );
+            push(
+                "TEAMS_HOME_CHANNEL_NAME",
+                form_string(form, "homeChannelName").unwrap_or_default(),
+            );
+        }
+        "google_chat" => {
+            push(
+                "GOOGLE_CHAT_PROJECT_ID",
+                form_string(form, "projectId").unwrap_or_default(),
+            );
+            push(
+                "GOOGLE_CHAT_SUBSCRIPTION_NAME",
+                form_string(form, "subscriptionName").unwrap_or_default(),
+            );
+            push(
+                "GOOGLE_CHAT_SERVICE_ACCOUNT_JSON",
+                form_string(form, "serviceAccountJson").unwrap_or_default(),
+            );
+            push(
+                "GOOGLE_CHAT_ALLOWED_USERS",
+                csv_env_value(form, "allowFrom"),
+            );
+            if let Some(value) = form_bool(form, "allowAllUsers") {
+                push("GOOGLE_CHAT_ALLOW_ALL_USERS", bool_env_value(value));
+            }
+            push(
+                "GOOGLE_CHAT_HOME_CHANNEL",
+                form_string(form, "homeChannel").unwrap_or_default(),
+            );
+            push(
+                "GOOGLE_CHAT_HOME_CHANNEL_NAME",
+                form_string(form, "homeChannelName").unwrap_or_default(),
+            );
+        }
+        "irc" => {
+            push(
+                "IRC_SERVER",
+                form_string(form, "server").unwrap_or_default(),
+            );
+            push("IRC_PORT", form_string(form, "port").unwrap_or_default());
+            push(
+                "IRC_NICKNAME",
+                form_string(form, "nickname").unwrap_or_default(),
+            );
+            push(
+                "IRC_CHANNEL",
+                form_string(form, "channel").unwrap_or_default(),
+            );
+            if let Some(value) = form_bool(form, "useTls") {
+                push("IRC_USE_TLS", bool_env_value(value));
+            }
+            push(
+                "IRC_SERVER_PASSWORD",
+                form_string(form, "serverPassword").unwrap_or_default(),
+            );
+            push(
+                "IRC_NICKSERV_PASSWORD",
+                form_string(form, "nickservPassword").unwrap_or_default(),
+            );
+            push("IRC_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            if let Some(value) = form_bool(form, "allowAllUsers") {
+                push("IRC_ALLOW_ALL_USERS", bool_env_value(value));
+            }
+            push(
+                "IRC_HOME_CHANNEL",
+                form_string(form, "homeChannel").unwrap_or_default(),
+            );
+            push(
+                "IRC_HOME_CHANNEL_NAME",
+                form_string(form, "homeChannelName").unwrap_or_default(),
+            );
+        }
+        "line" => {
+            push(
+                "LINE_CHANNEL_ACCESS_TOKEN",
+                form_string(form, "channelAccessToken").unwrap_or_default(),
+            );
+            push(
+                "LINE_CHANNEL_SECRET",
+                form_string(form, "channelSecret").unwrap_or_default(),
+            );
+            push("LINE_PORT", form_string(form, "port").unwrap_or_default());
+            push("LINE_HOST", form_string(form, "host").unwrap_or_default());
+            push(
+                "LINE_PUBLIC_URL",
+                form_string(form, "publicUrl").unwrap_or_default(),
+            );
+            push("LINE_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            push("LINE_ALLOWED_GROUPS", csv_env_value(form, "allowedGroups"));
+            push("LINE_ALLOWED_ROOMS", csv_env_value(form, "allowedRooms"));
+            if let Some(value) = form_bool(form, "allowAllUsers") {
+                push("LINE_ALLOW_ALL_USERS", bool_env_value(value));
+            }
+            push(
+                "LINE_HOME_CHANNEL",
+                form_string(form, "homeChannel").unwrap_or_default(),
+            );
+            push(
+                "LINE_SLOW_RESPONSE_THRESHOLD",
+                form_string(form, "slowResponseThreshold").unwrap_or_default(),
+            );
+        }
+        "simplex" => {
+            push(
+                "SIMPLEX_WS_URL",
+                form_string(form, "wsUrl").unwrap_or_default(),
+            );
+            push("SIMPLEX_ALLOWED_USERS", csv_env_value(form, "allowFrom"));
+            if let Some(value) = form_bool(form, "allowAllUsers") {
+                push("SIMPLEX_ALLOW_ALL_USERS", bool_env_value(value));
+            }
+            push(
+                "SIMPLEX_HOME_CHANNEL",
+                form_string(form, "homeChannel").unwrap_or_default(),
+            );
+            push(
+                "SIMPLEX_HOME_CHANNEL_NAME",
+                form_string(form, "homeChannelName").unwrap_or_default(),
+            );
+        }
+        _ => {}
+    }
+
+    pairs
+}
+
+fn write_hermes_channel_env(platform: &str, form: &Value) -> Result<(), String> {
+    let env_path = hermes_home().join(".env");
+    if let Some(parent) = env_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 Hermes 配置目录失败: {e}"))?;
+    }
+    let raw = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let managed_keys: Vec<&str> = match platform {
+        "telegram" => vec![
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_ALLOWED_USERS",
+            "TELEGRAM_GROUP_ALLOWED_USERS",
+            "TELEGRAM_REQUIRE_MENTION",
+        ],
+        "discord" => vec![
+            "DISCORD_BOT_TOKEN",
+            "DISCORD_ALLOWED_USERS",
+            "DISCORD_REQUIRE_MENTION",
+            "DISCORD_FREE_RESPONSE_CHANNELS",
+            "DISCORD_ALLOWED_CHANNELS",
+            "DISCORD_IGNORED_CHANNELS",
+            "DISCORD_NO_THREAD_CHANNELS",
+            "DISCORD_AUTO_THREAD",
+            "DISCORD_REACTIONS",
+            "DISCORD_THREAD_REQUIRE_MENTION",
+            "DISCORD_HISTORY_BACKFILL",
+            "DISCORD_HISTORY_BACKFILL_LIMIT",
+            "DISCORD_REPLY_TO_MODE",
+            "DISCORD_HOME_CHANNEL",
+            "DISCORD_HOME_CHANNEL_NAME",
+        ],
+        "slack" => vec![
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+            "SLACK_ALLOWED_USERS",
+            "SLACK_REQUIRE_MENTION",
+        ],
+        "feishu" => vec![
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_DOMAIN",
+            "FEISHU_CONNECTION_MODE",
+            "FEISHU_WEBHOOK_PATH",
+            "FEISHU_ALLOWED_USERS",
+            "FEISHU_GROUP_POLICY",
+            "FEISHU_REQUIRE_MENTION",
+            "FEISHU_REACTIONS",
+        ],
+        "dingtalk" => vec![
+            "DINGTALK_CLIENT_ID",
+            "DINGTALK_CLIENT_SECRET",
+            "DINGTALK_ALLOWED_USERS",
+            "DINGTALK_ALLOWED_CHATS",
+            "DINGTALK_REQUIRE_MENTION",
+        ],
+        "teams" => vec![
+            "TEAMS_CLIENT_ID",
+            "TEAMS_CLIENT_SECRET",
+            "TEAMS_TENANT_ID",
+            "TEAMS_PORT",
+            "TEAMS_SERVICE_URL",
+            "TEAMS_ALLOWED_USERS",
+            "TEAMS_ALLOW_ALL_USERS",
+            "TEAMS_HOME_CHANNEL",
+            "TEAMS_HOME_CHANNEL_NAME",
+        ],
+        "google_chat" => vec![
+            "GOOGLE_CHAT_PROJECT_ID",
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME",
+            "GOOGLE_CHAT_SERVICE_ACCOUNT_JSON",
+            "GOOGLE_CHAT_ALLOWED_USERS",
+            "GOOGLE_CHAT_ALLOW_ALL_USERS",
+            "GOOGLE_CHAT_HOME_CHANNEL",
+            "GOOGLE_CHAT_HOME_CHANNEL_NAME",
+        ],
+        "irc" => vec![
+            "IRC_SERVER",
+            "IRC_PORT",
+            "IRC_NICKNAME",
+            "IRC_CHANNEL",
+            "IRC_USE_TLS",
+            "IRC_SERVER_PASSWORD",
+            "IRC_NICKSERV_PASSWORD",
+            "IRC_ALLOWED_USERS",
+            "IRC_ALLOW_ALL_USERS",
+            "IRC_HOME_CHANNEL",
+            "IRC_HOME_CHANNEL_NAME",
+        ],
+        "line" => vec![
+            "LINE_CHANNEL_ACCESS_TOKEN",
+            "LINE_CHANNEL_SECRET",
+            "LINE_PORT",
+            "LINE_HOST",
+            "LINE_PUBLIC_URL",
+            "LINE_ALLOWED_USERS",
+            "LINE_ALLOWED_GROUPS",
+            "LINE_ALLOWED_ROOMS",
+            "LINE_ALLOW_ALL_USERS",
+            "LINE_HOME_CHANNEL",
+            "LINE_SLOW_RESPONSE_THRESHOLD",
+        ],
+        "simplex" => vec![
+            "SIMPLEX_WS_URL",
+            "SIMPLEX_ALLOWED_USERS",
+            "SIMPLEX_ALLOW_ALL_USERS",
+            "SIMPLEX_HOME_CHANNEL",
+            "SIMPLEX_HOME_CHANNEL_NAME",
+        ],
+        _ => Vec::new(),
+    };
+    let pairs = build_hermes_channel_env_updates(platform, form);
+    let content = merge_env_file(&raw, &managed_keys, &pairs);
+    std::fs::write(&env_path, content).map_err(|e| format!("写入 .env 失败: {e}"))
+}
+
+#[tauri::command]
+pub fn hermes_channel_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    let env_values = read_hermes_channel_env_values();
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_channel_config_values(&config, &env_values),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_channel_config_save(platform: String, form: Value) -> Result<Value, String> {
+    let platform = normalize_hermes_channel_platform(&platform)
+        .ok_or_else(|| format!("不支持的 Hermes 渠道: {}", platform.trim()))?;
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_channel_config(&mut config, platform, &form)?;
+    write_hermes_yaml_config(&config_path, &config)?;
+    write_hermes_channel_env(platform, &form)?;
+    let mut env_values = read_hermes_channel_env_values();
+    for (key, value) in build_hermes_channel_env_updates(platform, &form) {
+        env_values.insert(key, value);
+    }
+    let values = build_hermes_channel_config_values(&config, &env_values);
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "values": values.get(platform).cloned().unwrap_or(Value::Null),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_session_runtime_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_session_runtime_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_session_runtime_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_session_runtime_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_session_runtime_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_compression_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_compression_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_compression_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_compression_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_compression_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_prompt_caching_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_prompt_caching_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_prompt_caching_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_prompt_caching_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_prompt_caching_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_openrouter_cache_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_openrouter_cache_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_openrouter_cache_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_openrouter_cache_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_openrouter_cache_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_provider_routing_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_provider_routing_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_provider_routing_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_provider_routing_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_provider_routing_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_auxiliary_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_auxiliary_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_auxiliary_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_auxiliary_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_auxiliary_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_tool_loop_guardrails_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_tool_loop_guardrails_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_tool_loop_guardrails_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_tool_loop_guardrails_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_tool_loop_guardrails_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_memory_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_memory_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_memory_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_memory_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_memory_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_skills_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_skills_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_skills_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_skills_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_skills_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_curator_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_curator_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_curator_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_curator_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_curator_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_quick_commands_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_quick_commands_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_quick_commands_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_quick_commands_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_quick_commands_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_model_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_model_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_model_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_aliases_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_model_aliases_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_aliases_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_model_aliases_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_model_aliases_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_hooks_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_hooks_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_hooks_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_hooks_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_hooks_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_provider_overrides_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_provider_overrides_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_provider_overrides_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_provider_overrides_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_provider_overrides_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_mcp_servers_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_mcp_servers_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_mcp_servers_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_mcp_servers_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_mcp_servers_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_agent_toolsets_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_agent_toolsets_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_agent_toolsets_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_agent_toolsets_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_agent_toolsets_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_platform_toolsets_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_platform_toolsets_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_platform_toolsets_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_platform_toolsets_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_platform_toolsets_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_agent_runtime_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_agent_runtime_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_agent_runtime_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_agent_runtime_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_agent_runtime_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_unauthorized_dm_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_unauthorized_dm_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_unauthorized_dm_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_unauthorized_dm_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_unauthorized_dm_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_security_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_security_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_security_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_security_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_security_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_display_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_display_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_display_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_display_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_display_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_kanban_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_kanban_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_kanban_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_kanban_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_kanban_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_human_delay_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_human_delay_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_human_delay_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_human_delay_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_human_delay_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_streaming_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_streaming_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_streaming_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_streaming_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_streaming_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_execution_limits_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_execution_limits_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_execution_limits_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_execution_limits_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_execution_limits_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_io_safety_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_io_safety_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_io_safety_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_io_safety_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_io_safety_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_checkpoints_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_checkpoints_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_checkpoints_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_checkpoints_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_checkpoints_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_cron_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_cron_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_cron_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_cron_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_cron_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_sessions_maintenance_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_sessions_maintenance_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_sessions_maintenance_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_sessions_maintenance_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_sessions_maintenance_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_updates_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_updates_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_updates_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_updates_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_updates_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_logging_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_logging_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_logging_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_logging_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_logging_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_approvals_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_approvals_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_approvals_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_approvals_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_approvals_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_privacy_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_privacy_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_privacy_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_privacy_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_privacy_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_browser_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_browser_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_browser_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_browser_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_browser_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_web_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_web_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_web_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_web_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_web_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_lsp_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_lsp_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_lsp_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_lsp_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_lsp_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_catalog_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_model_catalog_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_model_catalog_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_model_catalog_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_model_catalog_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_x_search_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_x_search_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_x_search_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_x_search_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_x_search_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_context_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_context_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_context_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_context_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_context_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_stt_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_stt_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_stt_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_stt_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_stt_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_tts_voice_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_tts_voice_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_tts_voice_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_tts_voice_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_tts_voice_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_terminal_config_read() -> Result<Value, String> {
+    let (config_path, exists, config) = read_hermes_channel_yaml_config()?;
+    ensure_yaml_object(&mut config.clone())?;
+    Ok(serde_json::json!({
+        "exists": exists,
+        "configPath": config_path.to_string_lossy(),
+        "values": build_hermes_terminal_config_values(&config),
+    }))
+}
+
+#[tauri::command]
+pub fn hermes_terminal_config_save(form: Value) -> Result<Value, String> {
+    let (config_path, _exists, mut config) = read_hermes_channel_yaml_config()?;
+    merge_hermes_terminal_config(&mut config, &form)?;
+    let backup = write_hermes_yaml_config(&config_path, &config)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "configPath": config_path.to_string_lossy(),
+        "backup": backup,
+        "values": build_hermes_terminal_config_values(&config),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // hermes_read_config — 读取 Hermes config.yaml + .env
 // ---------------------------------------------------------------------------
 
@@ -2369,9 +12796,12 @@ pub async fn hermes_read_config_full() -> Result<Value, String> {
 
 /// 找到 Hermes venv 的 Python 解释器路径
 ///
-/// 优先级（P1-3 优化）：
-/// 1. 环境变量 `HERMES_PYTHON` — 适配自定义 venv（brew / uv tool / 容器等非默认路径）
-/// 2. ~/.hermes-venv/bin/python (Unix) 或 ~/.hermes-venv/Scripts/python.exe (Windows)
+/// 优先级：
+/// 1. 环境变量 `HERMES_PYTHON` — 适配自定义 venv（brew / 容器 / 任何非默认布局）
+/// 2. `~/.hermes-venv/{Scripts,bin}/python` — `uv pip install` 备选安装路径
+/// 3. `<uv tool dir>/hermes-agent/{Scripts,bin}/python` — `uv tool install` 默认路径
+///    （ClawPanel `install_hermes` 默认走此分支，所以这里的 fallback 必不可少；
+///    早期实现只查路径 #2 导致「可选依赖管理」等页面对绝大多数用户都误报「未安装」）
 fn hermes_venv_python() -> Option<PathBuf> {
     // 1. HERMES_PYTHON 环境变量优先
     if let Ok(custom) = std::env::var("HERMES_PYTHON") {
@@ -2380,23 +12810,25 @@ fn hermes_venv_python() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // 2. 默认 venv 位置
-    let venv_dir = dirs::home_dir()?.join(".hermes-venv");
-    #[cfg(target_os = "windows")]
-    let py = venv_dir.join("Scripts").join("python.exe");
-    #[cfg(not(target_os = "windows"))]
-    let py = venv_dir.join("bin").join("python");
-    if py.exists() {
-        Some(py)
-    } else {
-        None
+    // 2. 旧的 ~/.hermes-venv 位置（uv pip install 路径）
+    if let Some(home) = dirs::home_dir() {
+        let venv_dir = home.join(".hermes-venv");
+        #[cfg(target_os = "windows")]
+        let py = venv_dir.join("Scripts").join("python.exe");
+        #[cfg(not(target_os = "windows"))]
+        let py = venv_dir.join("bin").join("python");
+        if py.exists() {
+            return Some(py);
+        }
     }
+    // 3. uv tool 默认路径（ClawPanel 默认安装方式）
+    hermes_uv_tool_python()
 }
 
 /// 统一跑 venv python -c "<script>" 拿 JSON 结果。失败给可读错误。
 async fn run_venv_python_json(script: &str) -> Result<Value, String> {
     let py = hermes_venv_python().ok_or_else(|| {
-        "Hermes venv 未找到（~/.hermes-venv 不存在）。请先安装 Hermes。".to_string()
+        "Hermes Python 解释器未找到（已尝试 HERMES_PYTHON、~/.hermes-venv 与 uv tool 路径）。请先安装 Hermes。".to_string()
     })?;
 
     let mut cmd = tokio::process::Command::new(&py);
@@ -3346,20 +13778,15 @@ pub async fn update_hermes(app: tauri::AppHandle) -> Result<String, String> {
 
     let pkg = format!("hermes-agent[web] @ {}", HERMES_GIT_URL);
     let mut cmd = tokio::process::Command::new(&uv);
-    cmd.args([
-        "tool",
-        "install",
-        "--reinstall",
-        &pkg,
-        "--python",
-        "3.11",
-        "--with",
-        "croniter",
-    ]);
+    cmd.args(["tool", "install", "--reinstall", &pkg, "--python", "3.11"]);
+    append_hermes_runtime_extras(&mut cmd);
     let _ = app.emit("hermes-install-progress", 20u32);
     let _ = app.emit(
         "hermes-install-log",
-        "uv tool install --reinstall hermes-agent --python 3.11 --with croniter",
+        format!(
+            "uv tool install --reinstall hermes-agent --python 3.11 {}",
+            hermes_runtime_extras_log_segment()
+        ),
     );
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(mirror) = pypi_mirror_url() {
@@ -3385,6 +13812,8 @@ pub async fn update_hermes(app: tauri::AppHandle) -> Result<String, String> {
     }
 
     if output.status.success() {
+        // 注入 dashboard 兼容 stub（升级路径与安装路径保持一致，避免上游 wheel 漏装的子包再次缺失）
+        inject_hermes_dashboard_compat_stub(&app);
         let _ = app.emit("hermes-install-log", "✅ 升级完成");
         let _ = app.emit("hermes-install-progress", 100u32);
         Ok("升级完成".into())
@@ -6102,22 +16531,38 @@ pub fn hermes_config_raw_read() -> Result<Value, String> {
     Ok(serde_json::json!({ "yaml": yaml }))
 }
 
+fn validate_hermes_config_raw_yaml(yaml_text: &str) -> Result<(), String> {
+    if yaml_text.trim().is_empty() {
+        return Ok(());
+    }
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(yaml_text).map_err(|e| format!("config.yaml YAML 格式错误: {e}"))?;
+    if parsed.as_mapping().is_none() {
+        return Err("config.yaml 顶层必须是对象".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn hermes_config_raw_write(yaml_text: String) -> Result<Value, String> {
+    validate_hermes_config_raw_yaml(&yaml_text)?;
     let path = hermes_home().join("config.yaml");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
     }
+    let mut backup_path: Option<String> = None;
     if path.exists() {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let backup = path.with_extension(format!("yaml.bak-{ts}"));
-        let _ = std::fs::copy(&path, backup);
+        if std::fs::copy(&path, &backup).is_ok() {
+            backup_path = Some(backup.to_string_lossy().to_string());
+        }
     }
     std::fs::write(&path, yaml_text).map_err(|e| format!("Failed to write config.yaml: {e}"))?;
-    Ok(serde_json::json!({ "ok": true }))
+    Ok(serde_json::json!({ "ok": true, "backup": backup_path.unwrap_or_default() }))
 }
 
 #[tauri::command]
@@ -7001,5 +17446,7564 @@ platforms:
             !patched.contains("enabled: false"),
             "disabled marker should have been removed"
         );
+    }
+}
+
+#[cfg(test)]
+mod hermes_config_raw_tests {
+    use super::validate_hermes_config_raw_yaml;
+
+    #[test]
+    fn rejects_invalid_raw_config_yaml_before_write() {
+        let err =
+            validate_hermes_config_raw_yaml("model:\n  default: gpt-4o\n    provider: openai\n")
+                .unwrap_err();
+        assert!(err.contains("config.yaml YAML 格式错误"));
+    }
+
+    #[test]
+    fn rejects_non_object_raw_config_yaml_before_write() {
+        let err = validate_hermes_config_raw_yaml("- model\n- display\n").unwrap_err();
+        assert!(err.contains("config.yaml 顶层必须是对象"));
+    }
+
+    #[test]
+    fn accepts_empty_and_mapping_raw_config_yaml() {
+        validate_hermes_config_raw_yaml("").unwrap();
+        validate_hermes_config_raw_yaml("model:\n  default: gpt-4o\n").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hermes_session_runtime_config_tests {
+    use super::{build_hermes_session_runtime_config_values, merge_hermes_session_runtime_config};
+    use serde_json::json;
+
+    #[test]
+    fn session_runtime_values_have_safe_defaults() {
+        let config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let values = build_hermes_session_runtime_config_values(&config);
+
+        assert_eq!(values["sessionResetMode"], "both");
+        assert_eq!(values["idleMinutes"], 1440);
+        assert_eq!(values["atHour"], 4);
+        assert_eq!(values["groupSessionsPerUser"], true);
+        assert_eq!(values["threadSessionsPerUser"], false);
+        assert_eq!(values["worktreeEnabled"], false);
+    }
+
+    #[test]
+    fn session_runtime_values_read_worktree_flag() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+session_reset:
+  mode: daily
+  idle_minutes: 720
+  at_hour: 3
+group_sessions_per_user: false
+thread_sessions_per_user: true
+worktree: true
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_session_runtime_config_values(&config);
+
+        assert_eq!(values["sessionResetMode"], "daily");
+        assert_eq!(values["idleMinutes"], 720);
+        assert_eq!(values["atHour"], 3);
+        assert_eq!(values["groupSessionsPerUser"], false);
+        assert_eq!(values["threadSessionsPerUser"], true);
+        assert_eq!(values["worktreeEnabled"], true);
+    }
+
+    #[test]
+    fn merge_session_runtime_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+  default: claude-sonnet-4-6
+session_reset:
+  mode: idle
+  idle_minutes: 60
+  custom_flag: keep-me
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_session_runtime_config(
+            &mut config,
+            &json!({
+                "sessionResetMode": "both",
+                "idleMinutes": "90",
+                "atHour": "6",
+                "groupSessionsPerUser": false,
+                "threadSessionsPerUser": true,
+                "worktreeEnabled": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["session_reset"]["mode"].as_str(), Some("both"));
+        assert_eq!(config["session_reset"]["idle_minutes"].as_i64(), Some(90));
+        assert_eq!(config["session_reset"]["at_hour"].as_i64(), Some(6));
+        assert_eq!(
+            config["session_reset"]["custom_flag"].as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(config["group_sessions_per_user"].as_bool(), Some(false));
+        assert_eq!(config["thread_sessions_per_user"].as_bool(), Some(true));
+        assert_eq!(config["worktree"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_session_runtime_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_session_runtime_config(
+            &mut config,
+            &json!({ "sessionResetMode": "weekly" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("session_reset.mode"));
+
+        let err = merge_hermes_session_runtime_config(&mut config, &json!({ "idleMinutes": 0 }))
+            .unwrap_err();
+        assert!(err.contains("idle_minutes"));
+
+        let err =
+            merge_hermes_session_runtime_config(&mut config, &json!({ "atHour": 24 })).unwrap_err();
+        assert!(err.contains("at_hour"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_compression_config_tests {
+    use super::{build_hermes_compression_config_values, merge_hermes_compression_config};
+    use serde_json::json;
+
+    #[test]
+    fn compression_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_compression_config_values(&config);
+        assert_eq!(values["enabled"], true);
+        assert_eq!(values["threshold"], 0.5);
+        assert_eq!(values["targetRatio"], 0.2);
+        assert_eq!(values["protectLastN"], 20);
+        assert_eq!(values["protectFirstN"], 3);
+        assert_eq!(values["abortOnSummaryFailure"], false);
+    }
+
+    #[test]
+    fn merge_compression_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+compression:
+  enabled: true
+  threshold: 0.5
+  custom_flag: keep-me
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_compression_config(
+            &mut config,
+            &json!({
+                "enabled": false,
+                "threshold": "0.7",
+                "targetRatio": "0.4",
+                "protectLastN": "28",
+                "protectFirstN": "0",
+                "abortOnSummaryFailure": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["compression"]["enabled"].as_bool(), Some(false));
+        assert_eq!(config["compression"]["threshold"].as_f64(), Some(0.7));
+        assert_eq!(config["compression"]["target_ratio"].as_f64(), Some(0.4));
+        assert_eq!(config["compression"]["protect_last_n"].as_i64(), Some(28));
+        assert_eq!(config["compression"]["protect_first_n"].as_i64(), Some(0));
+        assert_eq!(
+            config["compression"]["abort_on_summary_failure"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["compression"]["custom_flag"].as_str(),
+            Some("keep-me")
+        );
+    }
+
+    #[test]
+    fn merge_compression_config_rejects_invalid_values() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let err =
+            merge_hermes_compression_config(&mut config, &json!({ "threshold": 0 })).unwrap_err();
+        assert!(err.contains("compression.threshold"));
+        let err = merge_hermes_compression_config(&mut config, &json!({ "targetRatio": 0.05 }))
+            .unwrap_err();
+        assert!(err.contains("compression.target_ratio"));
+        let err = merge_hermes_compression_config(&mut config, &json!({ "protectLastN": 0 }))
+            .unwrap_err();
+        assert!(err.contains("compression.protect_last_n"));
+        let err = merge_hermes_compression_config(&mut config, &json!({ "protectFirstN": -1 }))
+            .unwrap_err();
+        assert!(err.contains("compression.protect_first_n"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_prompt_caching_config_tests {
+    use super::{build_hermes_prompt_caching_config_values, merge_hermes_prompt_caching_config};
+    use serde_json::json;
+
+    #[test]
+    fn prompt_caching_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_prompt_caching_config_values(&config);
+        assert_eq!(values["promptCacheTtl"], "5m");
+    }
+
+    #[test]
+    fn prompt_caching_values_normalize_existing_ttl() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+prompt_caching:
+  cache_ttl: "1H"
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_prompt_caching_config_values(&config);
+        assert_eq!(values["promptCacheTtl"], "1h");
+    }
+
+    #[test]
+    fn merge_prompt_caching_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+prompt_caching:
+  cache_ttl: 5m
+  custom_flag: keep-prompt-cache
+compression:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_prompt_caching_config(
+            &mut config,
+            &json!({
+                "promptCacheTtl": "1h",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["compression"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["prompt_caching"]["cache_ttl"].as_str(), Some("1h"));
+        assert_eq!(
+            config["prompt_caching"]["custom_flag"].as_str(),
+            Some("keep-prompt-cache")
+        );
+    }
+
+    #[test]
+    fn merge_prompt_caching_config_rejects_invalid_ttl() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let err =
+            merge_hermes_prompt_caching_config(&mut config, &json!({ "promptCacheTtl": "30m" }))
+                .unwrap_err();
+        assert!(err.contains("prompt_caching.cache_ttl"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_openrouter_cache_config_tests {
+    use super::{
+        build_hermes_openrouter_cache_config_values, merge_hermes_openrouter_cache_config,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn openrouter_cache_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_openrouter_cache_config_values(&config);
+        assert_eq!(values["openrouterResponseCache"], true);
+        assert_eq!(values["openrouterResponseCacheTtl"], 300);
+    }
+
+    #[test]
+    fn openrouter_cache_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+openrouter:
+  response_cache: false
+  response_cache_ttl: 900
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_openrouter_cache_config_values(&config);
+        assert_eq!(values["openrouterResponseCache"], false);
+        assert_eq!(values["openrouterResponseCacheTtl"], 900);
+    }
+
+    #[test]
+    fn merge_openrouter_cache_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+openrouter:
+  response_cache: false
+  response_cache_ttl: 900
+  custom_flag: keep-openrouter
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_openrouter_cache_config(
+            &mut config,
+            &json!({
+                "openrouterResponseCache": true,
+                "openrouterResponseCacheTtl": "600",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["openrouter"]["response_cache"].as_bool(), Some(true));
+        assert_eq!(
+            config["openrouter"]["response_cache_ttl"].as_i64(),
+            Some(600)
+        );
+        assert_eq!(
+            config["openrouter"]["custom_flag"].as_str(),
+            Some("keep-openrouter")
+        );
+    }
+
+    #[test]
+    fn merge_openrouter_cache_config_rejects_invalid_ttl() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        for ttl in ["0", "86401", "1.5"] {
+            let err = merge_hermes_openrouter_cache_config(
+                &mut config,
+                &json!({ "openrouterResponseCacheTtl": ttl }),
+            )
+            .unwrap_err();
+            assert!(err.contains("openrouter.response_cache_ttl"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod hermes_provider_routing_config_tests {
+    use super::{
+        build_hermes_provider_routing_config_values, merge_hermes_provider_routing_config,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn provider_routing_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_provider_routing_config_values(&config);
+        assert_eq!(values["providerRoutingSort"], "price");
+        assert_eq!(values["providerRoutingOnly"], "");
+        assert_eq!(values["providerRoutingIgnore"], "");
+        assert_eq!(values["providerRoutingOrder"], "");
+        assert_eq!(values["providerRoutingRequireParameters"], false);
+        assert_eq!(values["providerRoutingDataCollection"], "allow");
+    }
+
+    #[test]
+    fn provider_routing_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+provider_routing:
+  sort: throughput
+  only:
+    - anthropic
+    - google
+  ignore:
+    - deepinfra
+  order:
+    - anthropic
+    - google
+    - together
+  require_parameters: true
+  data_collection: deny
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_provider_routing_config_values(&config);
+        assert_eq!(values["providerRoutingSort"], "throughput");
+        assert_eq!(values["providerRoutingOnly"], "anthropic\ngoogle");
+        assert_eq!(values["providerRoutingIgnore"], "deepinfra");
+        assert_eq!(
+            values["providerRoutingOrder"],
+            "anthropic\ngoogle\ntogether"
+        );
+        assert_eq!(values["providerRoutingRequireParameters"], true);
+        assert_eq!(values["providerRoutingDataCollection"], "deny");
+    }
+
+    #[test]
+    fn merge_provider_routing_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+openrouter:
+  response_cache: true
+provider_routing:
+  sort: price
+  custom_flag: keep-routing
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_provider_routing_config(
+            &mut config,
+            &json!({
+                "providerRoutingSort": "latency",
+                "providerRoutingOnly": " anthropic \n google \n anthropic ",
+                "providerRoutingIgnore": "deepinfra\nfireworks",
+                "providerRoutingOrder": "google\nanthropic",
+                "providerRoutingRequireParameters": true,
+                "providerRoutingDataCollection": "deny",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["openrouter"]["response_cache"].as_bool(), Some(true));
+        assert_eq!(config["provider_routing"]["sort"].as_str(), Some("latency"));
+        assert_eq!(
+            config["provider_routing"]["only"].as_sequence().unwrap(),
+            &vec![
+                serde_yaml::Value::String("anthropic".to_string()),
+                serde_yaml::Value::String("google".to_string()),
+            ]
+        );
+        assert_eq!(
+            config["provider_routing"]["ignore"].as_sequence().unwrap(),
+            &vec![
+                serde_yaml::Value::String("deepinfra".to_string()),
+                serde_yaml::Value::String("fireworks".to_string()),
+            ]
+        );
+        assert_eq!(
+            config["provider_routing"]["order"].as_sequence().unwrap(),
+            &vec![
+                serde_yaml::Value::String("google".to_string()),
+                serde_yaml::Value::String("anthropic".to_string()),
+            ]
+        );
+        assert_eq!(
+            config["provider_routing"]["require_parameters"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["provider_routing"]["data_collection"].as_str(),
+            Some("deny")
+        );
+        assert_eq!(
+            config["provider_routing"]["custom_flag"].as_str(),
+            Some("keep-routing")
+        );
+    }
+
+    #[test]
+    fn merge_provider_routing_config_removes_empty_lists() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+provider_routing:
+  only:
+    - anthropic
+  ignore:
+    - deepinfra
+  order:
+    - google
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_provider_routing_config(
+            &mut config,
+            &json!({
+                "providerRoutingOnly": "",
+                "providerRoutingIgnore": "  \n ",
+                "providerRoutingOrder": "",
+                "providerRoutingRequireParameters": false,
+                "providerRoutingDataCollection": "allow",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["provider_routing"]["sort"].as_str(), Some("price"));
+        assert_eq!(
+            config["provider_routing"]["require_parameters"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["provider_routing"]["data_collection"].as_str(),
+            Some("allow")
+        );
+        let provider_routing = config["provider_routing"].as_mapping().unwrap();
+        assert!(!provider_routing.contains_key(super::yaml_key("only")));
+        assert!(!provider_routing.contains_key(super::yaml_key("ignore")));
+        assert!(!provider_routing.contains_key(super::yaml_key("order")));
+    }
+
+    #[test]
+    fn merge_provider_routing_config_rejects_invalid_values() {
+        for (form, expected) in [
+            (
+                json!({ "providerRoutingSort": "random" }),
+                "provider_routing.sort",
+            ),
+            (
+                json!({ "providerRoutingDataCollection": "maybe" }),
+                "provider_routing.data_collection",
+            ),
+            (
+                json!({ "providerRoutingOnly": "bad provider" }),
+                "provider_routing.only",
+            ),
+            (
+                json!({ "providerRoutingOrder": "../secret" }),
+                "provider_routing.order",
+            ),
+        ] {
+            let mut config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+            let err = merge_hermes_provider_routing_config(&mut config, &form).unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hermes_auxiliary_config_tests {
+    use super::{build_hermes_auxiliary_config_values, merge_hermes_auxiliary_config};
+    use serde_json::json;
+
+    #[test]
+    fn auxiliary_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_auxiliary_config_values(&config);
+        assert_eq!(values["auxiliaryVisionProvider"], "auto");
+        assert_eq!(values["auxiliaryVisionModel"], "");
+        assert_eq!(values["auxiliaryVisionTimeout"], 30);
+        assert_eq!(values["auxiliaryVisionDownloadTimeout"], 30);
+        assert_eq!(values["auxiliaryWebExtractProvider"], "auto");
+        assert_eq!(values["auxiliaryWebExtractModel"], "");
+        assert_eq!(values["auxiliarySessionSearchProvider"], "auto");
+        assert_eq!(values["auxiliarySessionSearchModel"], "");
+        assert_eq!(values["auxiliarySessionSearchTimeout"], 30);
+        assert_eq!(values["auxiliarySessionSearchMaxConcurrency"], 3);
+    }
+
+    #[test]
+    fn auxiliary_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+auxiliary:
+  vision:
+    provider: openrouter
+    model: google/gemini-2.5-flash
+    timeout: 45
+    download_timeout: 60
+  web_extract:
+    provider: main
+    model: local-summary
+  session_search:
+    provider: nous
+    model: gemini-3-flash
+    timeout: 50
+    max_concurrency: 5
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_auxiliary_config_values(&config);
+        assert_eq!(values["auxiliaryVisionProvider"], "openrouter");
+        assert_eq!(values["auxiliaryVisionModel"], "google/gemini-2.5-flash");
+        assert_eq!(values["auxiliaryVisionTimeout"], 45);
+        assert_eq!(values["auxiliaryVisionDownloadTimeout"], 60);
+        assert_eq!(values["auxiliaryWebExtractProvider"], "main");
+        assert_eq!(values["auxiliaryWebExtractModel"], "local-summary");
+        assert_eq!(values["auxiliarySessionSearchProvider"], "nous");
+        assert_eq!(values["auxiliarySessionSearchModel"], "gemini-3-flash");
+        assert_eq!(values["auxiliarySessionSearchTimeout"], 50);
+        assert_eq!(values["auxiliarySessionSearchMaxConcurrency"], 5);
+    }
+
+    #[test]
+    fn merge_auxiliary_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+auxiliary:
+  vision:
+    provider: auto
+    custom_flag: keep-vision
+  web_extract:
+    custom_flag: keep-web
+  session_search:
+    extra_body:
+      enable_thinking: false
+    custom_flag: keep-search
+  custom_task:
+    provider: main
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({
+                "auxiliaryVisionProvider": "codex",
+                "auxiliaryVisionModel": "gpt-5.3-codex",
+                "auxiliaryVisionTimeout": "40",
+                "auxiliaryVisionDownloadTimeout": "55",
+                "auxiliaryWebExtractProvider": "gemini",
+                "auxiliaryWebExtractModel": "gemini-3-flash",
+                "auxiliarySessionSearchProvider": "ollama-cloud",
+                "auxiliarySessionSearchModel": "gpt-oss:20b",
+                "auxiliarySessionSearchTimeout": "70",
+                "auxiliarySessionSearchMaxConcurrency": "6",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["auxiliary"]["vision"]["provider"].as_str(),
+            Some("codex")
+        );
+        assert_eq!(
+            config["auxiliary"]["vision"]["model"].as_str(),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(config["auxiliary"]["vision"]["timeout"].as_i64(), Some(40));
+        assert_eq!(
+            config["auxiliary"]["vision"]["download_timeout"].as_i64(),
+            Some(55)
+        );
+        assert_eq!(
+            config["auxiliary"]["vision"]["custom_flag"].as_str(),
+            Some("keep-vision")
+        );
+        assert_eq!(
+            config["auxiliary"]["web_extract"]["provider"].as_str(),
+            Some("gemini")
+        );
+        assert_eq!(
+            config["auxiliary"]["web_extract"]["model"].as_str(),
+            Some("gemini-3-flash")
+        );
+        assert_eq!(
+            config["auxiliary"]["web_extract"]["custom_flag"].as_str(),
+            Some("keep-web")
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["provider"].as_str(),
+            Some("ollama-cloud")
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["model"].as_str(),
+            Some("gpt-oss:20b")
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["timeout"].as_i64(),
+            Some(70)
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["max_concurrency"].as_i64(),
+            Some(6)
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["extra_body"]["enable_thinking"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["auxiliary"]["session_search"]["custom_flag"].as_str(),
+            Some("keep-search")
+        );
+        assert_eq!(
+            config["auxiliary"]["custom_task"]["provider"].as_str(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn merge_auxiliary_config_rejects_invalid_values() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliaryVisionProvider": "bad-provider" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.vision.provider"));
+
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliaryVisionModel": "../secret" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.vision.model"));
+
+        let err =
+            merge_hermes_auxiliary_config(&mut config, &json!({ "auxiliaryVisionTimeout": 0 }))
+                .unwrap_err();
+        assert!(err.contains("auxiliary.vision.timeout"));
+
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliaryVisionDownloadTimeout": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.vision.download_timeout"));
+
+        let err = merge_hermes_auxiliary_config(
+            &mut config,
+            &json!({ "auxiliarySessionSearchMaxConcurrency": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("auxiliary.session_search.max_concurrency"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_tool_loop_guardrails_config_tests {
+    use super::{
+        build_hermes_tool_loop_guardrails_config_values, merge_hermes_tool_loop_guardrails_config,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn tool_loop_guardrails_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_tool_loop_guardrails_config_values(&config);
+        assert_eq!(values["warningsEnabled"], true);
+        assert_eq!(values["hardStopEnabled"], false);
+        assert_eq!(values["warnExactFailure"], 2);
+        assert_eq!(values["warnSameToolFailure"], 3);
+        assert_eq!(values["warnNoProgress"], 2);
+        assert_eq!(values["hardStopExactFailure"], 5);
+        assert_eq!(values["hardStopSameToolFailure"], 8);
+        assert_eq!(values["hardStopNoProgress"], 5);
+    }
+
+    #[test]
+    fn merge_tool_loop_guardrails_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+tool_loop_guardrails:
+  warnings_enabled: true
+  custom_flag: keep-me
+  warn_after:
+    exact_failure: 2
+    custom_warn: 99
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_tool_loop_guardrails_config(
+            &mut config,
+            &json!({
+                "warningsEnabled": false,
+                "hardStopEnabled": true,
+                "warnExactFailure": "3",
+                "warnSameToolFailure": "4",
+                "warnNoProgress": "5",
+                "hardStopExactFailure": "6",
+                "hardStopSameToolFailure": "7",
+                "hardStopNoProgress": "8",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["tool_loop_guardrails"]["warnings_enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["hard_stop_enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["custom_flag"].as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["warn_after"]["exact_failure"].as_i64(),
+            Some(3)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["warn_after"]["same_tool_failure"].as_i64(),
+            Some(4)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["warn_after"]["idempotent_no_progress"].as_i64(),
+            Some(5)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["warn_after"]["custom_warn"].as_i64(),
+            Some(99)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["hard_stop_after"]["exact_failure"].as_i64(),
+            Some(6)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["hard_stop_after"]["same_tool_failure"].as_i64(),
+            Some(7)
+        );
+        assert_eq!(
+            config["tool_loop_guardrails"]["hard_stop_after"]["idempotent_no_progress"].as_i64(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn merge_tool_loop_guardrails_config_rejects_invalid_values() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let err = merge_hermes_tool_loop_guardrails_config(
+            &mut config,
+            &json!({ "warnExactFailure": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("tool_loop_guardrails.warn_after.exact_failure"));
+        let err = merge_hermes_tool_loop_guardrails_config(
+            &mut config,
+            &json!({ "warnSameToolFailure": 101 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("tool_loop_guardrails.warn_after.same_tool_failure"));
+        let err = merge_hermes_tool_loop_guardrails_config(
+            &mut config,
+            &json!({ "hardStopExactFailure": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("tool_loop_guardrails.hard_stop_after.exact_failure"));
+        let err = merge_hermes_tool_loop_guardrails_config(
+            &mut config,
+            &json!({ "hardStopNoProgress": 101 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("tool_loop_guardrails.hard_stop_after.idempotent_no_progress"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_streaming_config_tests {
+    use super::{build_hermes_streaming_config_values, merge_hermes_streaming_config};
+    use serde_json::json;
+
+    #[test]
+    fn streaming_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_streaming_config_values(&config);
+        assert_eq!(values["enabled"], false);
+        assert_eq!(values["transport"], "edit");
+        assert_eq!(values["editInterval"], 0.8);
+        assert_eq!(values["bufferThreshold"], 24);
+        assert_eq!(values["cursor"], " ▉");
+        assert_eq!(values["freshFinalAfterSeconds"], 60.0);
+    }
+
+    #[test]
+    fn streaming_values_prefer_top_level_and_fallback_to_gateway() {
+        let fallback: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+gateway:
+  streaming:
+    enabled: true
+    transport: draft
+    edit_interval: 0.25
+    buffer_threshold: 11
+    cursor: "..."
+    fresh_final_after_seconds: 0
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_streaming_config_values(&fallback);
+        assert_eq!(values["enabled"], true);
+        assert_eq!(values["transport"], "draft");
+        assert_eq!(values["editInterval"], 0.25);
+        assert_eq!(values["bufferThreshold"], 11);
+        assert_eq!(values["cursor"], "...");
+        assert_eq!(values["freshFinalAfterSeconds"], 0.0);
+
+        let top_level: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+streaming:
+  enabled: false
+  transport: auto
+  edit_interval: 0.5
+  buffer_threshold: 40
+  cursor: ">"
+  fresh_final_after_seconds: 120
+gateway:
+  streaming:
+    enabled: true
+    transport: draft
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_streaming_config_values(&top_level);
+        assert_eq!(values["enabled"], false);
+        assert_eq!(values["transport"], "auto");
+        assert_eq!(values["editInterval"], 0.5);
+        assert_eq!(values["bufferThreshold"], 40);
+        assert_eq!(values["cursor"], ">");
+        assert_eq!(values["freshFinalAfterSeconds"], 120.0);
+    }
+
+    #[test]
+    fn merge_streaming_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+streaming:
+  enabled: false
+  custom_flag: keep-me
+gateway:
+  streaming:
+    enabled: false
+    legacy_flag: keep-nested
+display:
+  streaming: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_streaming_config(
+            &mut config,
+            &json!({
+                "enabled": true,
+                "transport": "draft",
+                "editInterval": "0.35",
+                "bufferThreshold": "48",
+                "cursor": "",
+                "freshFinalAfterSeconds": "0",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["display"]["streaming"].as_bool(), Some(true));
+        assert_eq!(
+            config["gateway"]["streaming"]["legacy_flag"].as_str(),
+            Some("keep-nested")
+        );
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["streaming"]["transport"].as_str(), Some("draft"));
+        assert_eq!(config["streaming"]["edit_interval"].as_f64(), Some(0.35));
+        assert_eq!(config["streaming"]["buffer_threshold"].as_i64(), Some(48));
+        assert_eq!(config["streaming"]["cursor"].as_str(), Some(""));
+        assert_eq!(
+            config["streaming"]["fresh_final_after_seconds"].as_f64(),
+            Some(0.0)
+        );
+        assert_eq!(config["streaming"]["custom_flag"].as_str(), Some("keep-me"));
+    }
+
+    #[test]
+    fn merge_streaming_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_streaming_config(&mut config, &json!({ "transport": "invalid" }))
+            .unwrap_err();
+        assert!(err.contains("streaming.transport"));
+        let err = merge_hermes_streaming_config(&mut config, &json!({ "editInterval": 0.01 }))
+            .unwrap_err();
+        assert!(err.contains("streaming.edit_interval"));
+        let err = merge_hermes_streaming_config(&mut config, &json!({ "bufferThreshold": 0 }))
+            .unwrap_err();
+        assert!(err.contains("streaming.buffer_threshold"));
+        let err =
+            merge_hermes_streaming_config(&mut config, &json!({ "freshFinalAfterSeconds": -1 }))
+                .unwrap_err();
+        assert!(err.contains("streaming.fresh_final_after_seconds"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_execution_limits_config_tests {
+    use super::{
+        build_hermes_execution_limits_config_values, merge_hermes_execution_limits_config,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn execution_limits_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_execution_limits_config_values(&config);
+        assert_eq!(values["codeExecutionMode"], "project");
+        assert_eq!(values["codeExecutionTimeout"], 300);
+        assert_eq!(values["codeExecutionMaxToolCalls"], 50);
+        assert_eq!(values["delegationMaxIterations"], 50);
+        assert_eq!(values["delegationChildTimeoutSeconds"], 600);
+        assert_eq!(values["delegationMaxConcurrentChildren"], 3);
+        assert_eq!(values["delegationMaxSpawnDepth"], 1);
+        assert_eq!(values["delegationOrchestratorEnabled"], true);
+        assert_eq!(values["delegationSubagentAutoApprove"], false);
+        assert_eq!(values["delegationInheritMcpToolsets"], true);
+        assert_eq!(values["delegationModel"], "");
+        assert_eq!(values["delegationProvider"], "");
+    }
+
+    #[test]
+    fn execution_limits_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+code_execution:
+  mode: strict
+  timeout: 120
+  max_tool_calls: 12
+delegation:
+  max_iterations: 30
+  child_timeout_seconds: 900
+  max_concurrent_children: 5
+  max_spawn_depth: 2
+  orchestrator_enabled: false
+  subagent_auto_approve: true
+  inherit_mcp_toolsets: false
+  model: google/gemini-3-flash-preview
+  provider: openrouter
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_execution_limits_config_values(&config);
+        assert_eq!(values["codeExecutionMode"], "strict");
+        assert_eq!(values["codeExecutionTimeout"], 120);
+        assert_eq!(values["codeExecutionMaxToolCalls"], 12);
+        assert_eq!(values["delegationMaxIterations"], 30);
+        assert_eq!(values["delegationChildTimeoutSeconds"], 900);
+        assert_eq!(values["delegationMaxConcurrentChildren"], 5);
+        assert_eq!(values["delegationMaxSpawnDepth"], 2);
+        assert_eq!(values["delegationOrchestratorEnabled"], false);
+        assert_eq!(values["delegationSubagentAutoApprove"], true);
+        assert_eq!(values["delegationInheritMcpToolsets"], false);
+        assert_eq!(values["delegationModel"], "google/gemini-3-flash-preview");
+        assert_eq!(values["delegationProvider"], "openrouter");
+    }
+
+    #[test]
+    fn merge_execution_limits_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+code_execution:
+  mode: project
+  custom_flag: keep-code
+delegation:
+  model: child-model
+  provider: openrouter
+  custom_flag: keep-delegation
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_execution_limits_config(
+            &mut config,
+            &json!({
+                "codeExecutionMode": "strict",
+                "codeExecutionTimeout": "180",
+                "codeExecutionMaxToolCalls": "25",
+                "delegationMaxIterations": "40",
+                "delegationChildTimeoutSeconds": "1200",
+                "delegationMaxConcurrentChildren": "4",
+                "delegationMaxSpawnDepth": "2",
+                "delegationOrchestratorEnabled": false,
+                "delegationSubagentAutoApprove": true,
+                "delegationInheritMcpToolsets": false,
+                "delegationModel": "anthropic/claude-haiku-4.6",
+                "delegationProvider": "anthropic",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["code_execution"]["mode"].as_str(), Some("strict"));
+        assert_eq!(config["code_execution"]["timeout"].as_i64(), Some(180));
+        assert_eq!(
+            config["code_execution"]["max_tool_calls"].as_i64(),
+            Some(25)
+        );
+        assert_eq!(
+            config["code_execution"]["custom_flag"].as_str(),
+            Some("keep-code")
+        );
+        assert_eq!(config["delegation"]["max_iterations"].as_i64(), Some(40));
+        assert_eq!(
+            config["delegation"]["child_timeout_seconds"].as_i64(),
+            Some(1200)
+        );
+        assert_eq!(
+            config["delegation"]["max_concurrent_children"].as_i64(),
+            Some(4)
+        );
+        assert_eq!(config["delegation"]["max_spawn_depth"].as_i64(), Some(2));
+        assert_eq!(
+            config["delegation"]["orchestrator_enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["delegation"]["subagent_auto_approve"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["delegation"]["inherit_mcp_toolsets"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["delegation"]["model"].as_str(),
+            Some("anthropic/claude-haiku-4.6")
+        );
+        assert_eq!(config["delegation"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(
+            config["delegation"]["custom_flag"].as_str(),
+            Some("keep-delegation")
+        );
+    }
+
+    #[test]
+    fn merge_execution_limits_config_removes_empty_child_model_overrides() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+delegation:
+  model: child-model
+  provider: openrouter
+  custom_flag: keep-delegation
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_execution_limits_config(
+            &mut config,
+            &json!({
+                "delegationModel": "  ",
+                "delegationProvider": "",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["delegation"]["model"].is_null());
+        assert!(config["delegation"]["provider"].is_null());
+        assert_eq!(
+            config["delegation"]["custom_flag"].as_str(),
+            Some("keep-delegation")
+        );
+    }
+
+    #[test]
+    fn merge_execution_limits_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_execution_limits_config(
+            &mut config,
+            &json!({ "codeExecutionMode": "unsafe" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("code_execution.mode"));
+        let err = merge_hermes_execution_limits_config(
+            &mut config,
+            &json!({ "codeExecutionTimeout": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("code_execution.timeout"));
+        let err = merge_hermes_execution_limits_config(
+            &mut config,
+            &json!({ "delegationMaxConcurrentChildren": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("delegation.max_concurrent_children"));
+        let err = merge_hermes_execution_limits_config(
+            &mut config,
+            &json!({ "delegationMaxSpawnDepth": 4 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("delegation.max_spawn_depth"));
+        let err = merge_hermes_execution_limits_config(
+            &mut config,
+            &json!({ "delegationChildTimeoutSeconds": 29 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("delegation.child_timeout_seconds"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_io_safety_config_tests {
+    use super::{build_hermes_io_safety_config_values, merge_hermes_io_safety_config};
+    use serde_json::json;
+
+    #[test]
+    fn io_safety_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_io_safety_config_values(&config);
+        assert_eq!(values["fileReadMaxChars"], 100000);
+        assert_eq!(values["toolOutputMaxBytes"], 50000);
+        assert_eq!(values["toolOutputMaxLines"], 2000);
+        assert_eq!(values["toolOutputMaxLineLength"], 2000);
+    }
+
+    #[test]
+    fn io_safety_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+file_read_max_chars: 200000
+tool_output:
+  max_bytes: 150000
+  max_lines: 5000
+  max_line_length: 4000
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_io_safety_config_values(&config);
+        assert_eq!(values["fileReadMaxChars"], 200000);
+        assert_eq!(values["toolOutputMaxBytes"], 150000);
+        assert_eq!(values["toolOutputMaxLines"], 5000);
+        assert_eq!(values["toolOutputMaxLineLength"], 4000);
+    }
+
+    #[test]
+    fn merge_io_safety_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+file_read_max_chars: 100000
+tool_output:
+  max_bytes: 50000
+  custom_flag: keep-output
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_io_safety_config(
+            &mut config,
+            &json!({
+                "fileReadMaxChars": "120000",
+                "toolOutputMaxBytes": "80000",
+                "toolOutputMaxLines": "3000",
+                "toolOutputMaxLineLength": "2500",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["file_read_max_chars"].as_i64(), Some(120000));
+        assert_eq!(config["tool_output"]["max_bytes"].as_i64(), Some(80000));
+        assert_eq!(config["tool_output"]["max_lines"].as_i64(), Some(3000));
+        assert_eq!(
+            config["tool_output"]["max_line_length"].as_i64(),
+            Some(2500)
+        );
+        assert_eq!(
+            config["tool_output"]["custom_flag"].as_str(),
+            Some("keep-output")
+        );
+    }
+
+    #[test]
+    fn merge_io_safety_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_io_safety_config(&mut config, &json!({ "fileReadMaxChars": 999 }))
+            .unwrap_err();
+        assert!(err.contains("file_read_max_chars"));
+        let err = merge_hermes_io_safety_config(&mut config, &json!({ "toolOutputMaxBytes": 999 }))
+            .unwrap_err();
+        assert!(err.contains("tool_output.max_bytes"));
+        let err = merge_hermes_io_safety_config(&mut config, &json!({ "toolOutputMaxLines": 0 }))
+            .unwrap_err();
+        assert!(err.contains("tool_output.max_lines"));
+        let err =
+            merge_hermes_io_safety_config(&mut config, &json!({ "toolOutputMaxLineLength": 0 }))
+                .unwrap_err();
+        assert!(err.contains("tool_output.max_line_length"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_privacy_config_tests {
+    use super::{build_hermes_privacy_config_values, merge_hermes_privacy_config};
+    use serde_json::json;
+
+    #[test]
+    fn privacy_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_privacy_config_values(&config);
+        assert_eq!(values["redactPii"], false);
+    }
+
+    #[test]
+    fn privacy_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+privacy:
+  redact_pii: true
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_privacy_config_values(&config);
+        assert_eq!(values["redactPii"], true);
+    }
+
+    #[test]
+    fn merge_privacy_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+privacy:
+  redact_pii: false
+  custom_flag: keep-privacy
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_privacy_config(
+            &mut config,
+            &json!({
+                "redactPii": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["privacy"]["redact_pii"].as_bool(), Some(true));
+        assert_eq!(
+            config["privacy"]["custom_flag"].as_str(),
+            Some("keep-privacy")
+        );
+    }
+}
+
+#[cfg(test)]
+mod hermes_browser_config_tests {
+    use super::{build_hermes_browser_config_values, merge_hermes_browser_config};
+    use serde_json::json;
+
+    #[test]
+    fn browser_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_browser_config_values(&config);
+        assert_eq!(values["browserInactivityTimeout"], 120);
+        assert_eq!(values["browserCommandTimeout"], 30);
+        assert_eq!(values["browserRecordSessions"], false);
+        assert_eq!(values["browserEngine"], "auto");
+        assert_eq!(values["browserAllowPrivateUrls"], false);
+        assert_eq!(values["browserAutoLocalForPrivateUrls"], true);
+        assert_eq!(values["browserCdpUrl"], "");
+        assert_eq!(values["browserCamofoxManagedPersistence"], false);
+        assert_eq!(values["browserCamofoxUserId"], "");
+        assert_eq!(values["browserCamofoxSessionKey"], "");
+        assert_eq!(values["browserCamofoxAdoptExistingTab"], false);
+        assert_eq!(values["browserDialogPolicy"], "must_respond");
+        assert_eq!(values["browserDialogTimeout"], 300);
+    }
+
+    #[test]
+    fn browser_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+browser:
+  inactivity_timeout: 300
+  command_timeout: 45
+  record_sessions: true
+  engine: lightpanda
+  allow_private_urls: true
+  auto_local_for_private_urls: false
+  cdp_url: ws://127.0.0.1:9222/devtools/browser/demo
+  camofox:
+    managed_persistence: true
+    user_id: shared-camofox-user
+    session_key: shared-session-key
+    adopt_existing_tab: true
+  dialog_policy: auto_accept
+  dialog_timeout_s: 120
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_browser_config_values(&config);
+        assert_eq!(values["browserInactivityTimeout"], 300);
+        assert_eq!(values["browserCommandTimeout"], 45);
+        assert_eq!(values["browserRecordSessions"], true);
+        assert_eq!(values["browserEngine"], "lightpanda");
+        assert_eq!(values["browserAllowPrivateUrls"], true);
+        assert_eq!(values["browserAutoLocalForPrivateUrls"], false);
+        assert_eq!(
+            values["browserCdpUrl"],
+            "ws://127.0.0.1:9222/devtools/browser/demo"
+        );
+        assert_eq!(values["browserCamofoxManagedPersistence"], true);
+        assert_eq!(values["browserCamofoxUserId"], "shared-camofox-user");
+        assert_eq!(values["browserCamofoxSessionKey"], "shared-session-key");
+        assert_eq!(values["browserCamofoxAdoptExistingTab"], true);
+        assert_eq!(values["browserDialogPolicy"], "auto_accept");
+        assert_eq!(values["browserDialogTimeout"], 120);
+    }
+
+    #[test]
+    fn merge_browser_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+browser:
+  inactivity_timeout: 120
+  command_timeout: 30
+  record_sessions: false
+  engine: auto
+  cdp_url: ws://127.0.0.1:9222/devtools/browser/demo
+  camofox:
+    managed_persistence: false
+    user_id: old-user
+    session_key: old-session
+    adopt_existing_tab: false
+    custom_flag: keep-camofox
+  custom_flag: keep-browser
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_browser_config(
+            &mut config,
+            &json!({
+                "browserInactivityTimeout": "180",
+                "browserCommandTimeout": "60",
+                "browserRecordSessions": true,
+                "browserEngine": "chrome",
+                "browserAllowPrivateUrls": true,
+                "browserAutoLocalForPrivateUrls": false,
+                "browserCdpUrl": "http://127.0.0.1:9222",
+                "browserCamofoxManagedPersistence": true,
+                "browserCamofoxUserId": "shared-camofox-user",
+                "browserCamofoxSessionKey": "shared-session-key",
+                "browserCamofoxAdoptExistingTab": true,
+                "browserDialogPolicy": "auto_dismiss",
+                "browserDialogTimeout": "45",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["browser"]["inactivity_timeout"].as_i64(), Some(180));
+        assert_eq!(config["browser"]["command_timeout"].as_i64(), Some(60));
+        assert_eq!(config["browser"]["record_sessions"].as_bool(), Some(true));
+        assert_eq!(config["browser"]["engine"].as_str(), Some("chrome"));
+        assert_eq!(
+            config["browser"]["allow_private_urls"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["browser"]["auto_local_for_private_urls"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["browser"]["cdp_url"].as_str(),
+            Some("http://127.0.0.1:9222")
+        );
+        assert_eq!(
+            config["browser"]["dialog_policy"].as_str(),
+            Some("auto_dismiss")
+        );
+        assert_eq!(config["browser"]["dialog_timeout_s"].as_i64(), Some(45));
+        assert_eq!(
+            config["browser"]["camofox"]["managed_persistence"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["browser"]["camofox"]["user_id"].as_str(),
+            Some("shared-camofox-user")
+        );
+        assert_eq!(
+            config["browser"]["camofox"]["session_key"].as_str(),
+            Some("shared-session-key")
+        );
+        assert_eq!(
+            config["browser"]["camofox"]["adopt_existing_tab"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["browser"]["camofox"]["custom_flag"].as_str(),
+            Some("keep-camofox")
+        );
+        assert_eq!(
+            config["browser"]["custom_flag"].as_str(),
+            Some("keep-browser")
+        );
+    }
+
+    #[test]
+    fn merge_browser_config_removes_empty_camofox_identity_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+browser:
+  camofox:
+    managed_persistence: true
+    user_id: old-user
+    session_key: old-session
+    adopt_existing_tab: true
+    custom_flag: keep-camofox
+  custom_flag: keep-browser
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_browser_config(
+            &mut config,
+            &json!({
+                "browserCamofoxManagedPersistence": false,
+                "browserCamofoxUserId": "  ",
+                "browserCamofoxSessionKey": "",
+                "browserCamofoxAdoptExistingTab": false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["browser"]["camofox"]["managed_persistence"].as_bool(),
+            Some(false)
+        );
+        assert!(config["browser"]["camofox"]["user_id"].is_null());
+        assert!(config["browser"]["camofox"]["session_key"].is_null());
+        assert_eq!(
+            config["browser"]["camofox"]["adopt_existing_tab"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["browser"]["camofox"]["custom_flag"].as_str(),
+            Some("keep-camofox")
+        );
+        assert_eq!(
+            config["browser"]["custom_flag"].as_str(),
+            Some("keep-browser")
+        );
+    }
+
+    #[test]
+    fn merge_browser_config_removes_empty_cdp_url() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+browser:
+  cdp_url: ws://127.0.0.1:9222/devtools/browser/demo
+  custom_flag: keep-browser
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_browser_config(&mut config, &json!({ "browserCdpUrl": "   " })).unwrap();
+
+        assert_eq!(
+            config["browser"]["custom_flag"].as_str(),
+            Some("keep-browser")
+        );
+        assert!(config["browser"]["cdp_url"].is_null());
+    }
+
+    #[test]
+    fn merge_browser_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_browser_config(&mut config, &json!({ "browserEngine": "firefox" }))
+            .unwrap_err();
+        assert!(err.contains("browser.engine"));
+        let err =
+            merge_hermes_browser_config(&mut config, &json!({ "browserInactivityTimeout": 0 }))
+                .unwrap_err();
+        assert!(err.contains("browser.inactivity_timeout"));
+        let err = merge_hermes_browser_config(&mut config, &json!({ "browserCommandTimeout": 4 }))
+            .unwrap_err();
+        assert!(err.contains("browser.command_timeout"));
+        let err =
+            merge_hermes_browser_config(&mut config, &json!({ "browserDialogPolicy": "ignore" }))
+                .unwrap_err();
+        assert!(err.contains("browser.dialog_policy"));
+        let err = merge_hermes_browser_config(&mut config, &json!({ "browserDialogTimeout": 0 }))
+            .unwrap_err();
+        assert!(err.contains("browser.dialog_timeout_s"));
+        let err =
+            merge_hermes_browser_config(&mut config, &json!({ "browserCdpUrl": 123 })).unwrap_err();
+        assert!(err.contains("browser.cdp_url"));
+        let err = merge_hermes_browser_config(&mut config, &json!({ "browserCamofoxUserId": 123 }))
+            .unwrap_err();
+        assert!(err.contains("browser.camofox.user_id"));
+        let err = merge_hermes_browser_config(
+            &mut config,
+            &json!({ "browserCamofoxUserId": "bad user" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("browser.camofox.user_id"));
+        let err = merge_hermes_browser_config(
+            &mut config,
+            &json!({ "browserCamofoxSessionKey": "bad session" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("browser.camofox.session_key"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_web_config_tests {
+    use super::{build_hermes_web_config_values, merge_hermes_web_config};
+    use serde_json::json;
+
+    #[test]
+    fn web_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_web_config_values(&config);
+        assert_eq!(values["webBackend"], "");
+        assert_eq!(values["webSearchBackend"], "");
+        assert_eq!(values["webExtractBackend"], "");
+    }
+
+    #[test]
+    fn web_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+web:
+  backend: tavily
+  search_backend: searxng
+  extract_backend: firecrawl
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_web_config_values(&config);
+        assert_eq!(values["webBackend"], "tavily");
+        assert_eq!(values["webSearchBackend"], "searxng");
+        assert_eq!(values["webExtractBackend"], "firecrawl");
+    }
+
+    #[test]
+    fn merge_web_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+web:
+  backend: tavily
+  search_backend: searxng
+  extract_backend: firecrawl
+  custom_flag: keep-web
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_web_config(
+            &mut config,
+            &json!({
+                "webBackend": "parallel",
+                "webSearchBackend": "exa",
+                "webExtractBackend": "native",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["web"]["backend"].as_str(), Some("parallel"));
+        assert_eq!(config["web"]["search_backend"].as_str(), Some("exa"));
+        assert_eq!(config["web"]["extract_backend"].as_str(), Some("native"));
+        assert_eq!(config["web"]["custom_flag"].as_str(), Some("keep-web"));
+    }
+
+    #[test]
+    fn merge_web_config_removes_empty_optional_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+web:
+  backend: tavily
+  search_backend: searxng
+  extract_backend: firecrawl
+  custom_flag: keep-web
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_web_config(
+            &mut config,
+            &json!({
+                "webBackend": "   ",
+                "webSearchBackend": "",
+                "webExtractBackend": "  ",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["web"]["custom_flag"].as_str(), Some("keep-web"));
+        assert!(config["web"].get("backend").is_none());
+        assert!(config["web"].get("search_backend").is_none());
+        assert!(config["web"].get("extract_backend").is_none());
+    }
+
+    #[test]
+    fn merge_web_config_rejects_invalid_backends() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_web_config(&mut config, &json!({ "webBackend": "unsafe" })).unwrap_err();
+        assert!(err.contains("web.backend"));
+        let err = merge_hermes_web_config(&mut config, &json!({ "webSearchBackend": "unsafe" }))
+            .unwrap_err();
+        assert!(err.contains("web.search_backend"));
+        let err = merge_hermes_web_config(&mut config, &json!({ "webExtractBackend": "unsafe" }))
+            .unwrap_err();
+        assert!(err.contains("web.extract_backend"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_model_catalog_config_tests {
+    use super::{
+        build_hermes_model_catalog_config_values, merge_hermes_model_catalog_config,
+        HERMES_MODEL_CATALOG_DEFAULT_URL,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn model_catalog_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_model_catalog_config_values(&config);
+        assert_eq!(values["modelCatalogEnabled"], true);
+        assert_eq!(values["modelCatalogUrl"], HERMES_MODEL_CATALOG_DEFAULT_URL);
+        assert_eq!(values["modelCatalogTtlHours"], 24);
+        assert_eq!(values["modelCatalogProvidersJson"], "{}");
+    }
+
+    #[test]
+    fn model_catalog_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_catalog:
+  enabled: false
+  url: https://example.com/catalog.json
+  ttl_hours: 6
+  providers:
+    openrouter:
+      url: https://mirror.example.com/openrouter.json
+    nous:
+      url: https://mirror.example.com/nous.json
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_model_catalog_config_values(&config);
+        assert_eq!(values["modelCatalogEnabled"], false);
+        assert_eq!(
+            values["modelCatalogUrl"],
+            "https://example.com/catalog.json"
+        );
+        assert_eq!(values["modelCatalogTtlHours"], 6);
+        let providers: serde_json::Value =
+            serde_json::from_str(values["modelCatalogProvidersJson"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            providers["openrouter"]["url"],
+            "https://mirror.example.com/openrouter.json"
+        );
+        assert_eq!(
+            providers["nous"]["url"],
+            "https://mirror.example.com/nous.json"
+        );
+    }
+
+    #[test]
+    fn merge_model_catalog_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+model_catalog:
+  enabled: false
+  url: https://old.example.com/catalog.json
+  ttl_hours: 12
+  providers:
+    openrouter:
+      url: https://old.example.com/openrouter.json
+  custom_flag: keep-catalog
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({
+                "modelCatalogEnabled": true,
+                "modelCatalogUrl": "https://catalog.example.com/model-catalog.json",
+                "modelCatalogTtlHours": 48,
+                "modelCatalogProvidersJson": serde_json::to_string(&json!({
+                    "openrouter": { "url": "https://catalog.example.com/openrouter.json" },
+                    "nous": { "url": "https://catalog.example.com/nous.json" },
+                })).unwrap(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["model_catalog"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["model_catalog"]["url"].as_str(),
+            Some("https://catalog.example.com/model-catalog.json")
+        );
+        assert_eq!(config["model_catalog"]["ttl_hours"].as_i64(), Some(48));
+        assert_eq!(
+            config["model_catalog"]["providers"]["openrouter"]["url"].as_str(),
+            Some("https://catalog.example.com/openrouter.json")
+        );
+        assert_eq!(
+            config["model_catalog"]["providers"]["nous"]["url"].as_str(),
+            Some("https://catalog.example.com/nous.json")
+        );
+        assert_eq!(
+            config["model_catalog"]["custom_flag"].as_str(),
+            Some("keep-catalog")
+        );
+    }
+
+    #[test]
+    fn merge_model_catalog_config_removes_empty_providers() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_catalog:
+  providers:
+    openrouter:
+      url: https://old.example.com/openrouter.json
+  custom_flag: keep-catalog
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({
+                "modelCatalogProvidersJson": "{}",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["model_catalog"]["custom_flag"].as_str(),
+            Some("keep-catalog")
+        );
+        assert!(config["model_catalog"].get("providers").is_none());
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_model_catalog_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogUrl": "ftp://example.com/catalog.json" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.url"));
+        let err =
+            merge_hermes_model_catalog_config(&mut config, &json!({ "modelCatalogTtlHours": 0 }))
+                .unwrap_err();
+        assert!(err.contains("model_catalog.ttl_hours"));
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogProvidersJson": "[" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.providers"));
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogProvidersJson": serde_json::to_string(&json!({
+                "bad provider": { "url": "https://example.com/catalog.json" }
+            })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.providers.bad provider"));
+        let err = merge_hermes_model_catalog_config(
+            &mut config,
+            &json!({ "modelCatalogProvidersJson": serde_json::to_string(&json!({
+                "openrouter": { "url": "file:///tmp/catalog.json" }
+            })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_catalog.providers.openrouter.url"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_x_search_config_tests {
+    use super::{build_hermes_x_search_config_values, merge_hermes_x_search_config};
+    use serde_json::json;
+
+    #[test]
+    fn x_search_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_x_search_config_values(&config);
+        assert_eq!(values["xSearchModel"], "grok-4.20-reasoning");
+        assert_eq!(values["xSearchTimeoutSeconds"], 180);
+        assert_eq!(values["xSearchRetries"], 2);
+    }
+
+    #[test]
+    fn x_search_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+x_search:
+  model: grok-4.20-fast
+  timeout_seconds: 90
+  retries: 4
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_x_search_config_values(&config);
+        assert_eq!(values["xSearchModel"], "grok-4.20-fast");
+        assert_eq!(values["xSearchTimeoutSeconds"], 90);
+        assert_eq!(values["xSearchRetries"], 4);
+    }
+
+    #[test]
+    fn merge_x_search_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: xai
+x_search:
+  model: old-grok
+  timeout_seconds: 60
+  retries: 1
+  custom_flag: keep-x-search
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_x_search_config(
+            &mut config,
+            &json!({
+                "xSearchModel": "grok-4.20-reasoning",
+                "xSearchTimeoutSeconds": 240,
+                "xSearchRetries": 3,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("xai"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["x_search"]["model"].as_str(),
+            Some("grok-4.20-reasoning")
+        );
+        assert_eq!(config["x_search"]["timeout_seconds"].as_i64(), Some(240));
+        assert_eq!(config["x_search"]["retries"].as_i64(), Some(3));
+        assert_eq!(
+            config["x_search"]["custom_flag"].as_str(),
+            Some("keep-x-search")
+        );
+    }
+
+    #[test]
+    fn merge_x_search_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_x_search_config(&mut config, &json!({ "xSearchModel": "" })).unwrap_err();
+        assert!(err.contains("x_search.model"));
+        let err =
+            merge_hermes_x_search_config(&mut config, &json!({ "xSearchModel": "bad model" }))
+                .unwrap_err();
+        assert!(err.contains("x_search.model"));
+        let err =
+            merge_hermes_x_search_config(&mut config, &json!({ "xSearchTimeoutSeconds": 29 }))
+                .unwrap_err();
+        assert!(err.contains("x_search.timeout_seconds"));
+        let err = merge_hermes_x_search_config(&mut config, &json!({ "xSearchRetries": -1 }))
+            .unwrap_err();
+        assert!(err.contains("x_search.retries"));
+        let err = merge_hermes_x_search_config(&mut config, &json!({ "xSearchRetries": 21 }))
+            .unwrap_err();
+        assert!(err.contains("x_search.retries"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_context_config_tests {
+    use super::{build_hermes_context_config_values, merge_hermes_context_config};
+    use serde_json::json;
+
+    #[test]
+    fn context_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_context_config_values(&config);
+        assert_eq!(values["contextEngine"], "compressor");
+    }
+
+    #[test]
+    fn context_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+context:
+  engine: lcm
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_context_config_values(&config);
+        assert_eq!(values["contextEngine"], "lcm");
+    }
+
+    #[test]
+    fn merge_context_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+context:
+  engine: compressor
+  custom_flag: keep-context
+model:
+  provider: anthropic
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_context_config(&mut config, &json!({ "contextEngine": "lcm" })).unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["context"]["engine"].as_str(), Some("lcm"));
+        assert_eq!(
+            config["context"]["custom_flag"].as_str(),
+            Some("keep-context")
+        );
+    }
+
+    #[test]
+    fn merge_context_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_context_config(&mut config, &json!({ "contextEngine": "" })).unwrap_err();
+        assert!(err.contains("context.engine"));
+        let err =
+            merge_hermes_context_config(&mut config, &json!({ "contextEngine": "bad engine" }))
+                .unwrap_err();
+        assert!(err.contains("context.engine"));
+        let err = merge_hermes_context_config(&mut config, &json!({ "contextEngine": "中文" }))
+            .unwrap_err();
+        assert!(err.contains("context.engine"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_lsp_config_tests {
+    use super::{build_hermes_lsp_config_values, merge_hermes_lsp_config};
+    use serde_json::json;
+
+    #[test]
+    fn lsp_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_lsp_config_values(&config);
+        assert_eq!(values["lspEnabled"], true);
+        assert_eq!(values["lspWaitMode"], "document");
+        assert_eq!(values["lspWaitTimeout"], 5.0);
+        assert_eq!(values["lspInstallStrategy"], "auto");
+    }
+
+    #[test]
+    fn lsp_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+lsp:
+  enabled: false
+  wait_mode: full
+  wait_timeout: 12.5
+  install_strategy: manual
+  servers:
+    pyright:
+      disabled: true
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_lsp_config_values(&config);
+        assert_eq!(values["lspEnabled"], false);
+        assert_eq!(values["lspWaitMode"], "full");
+        assert_eq!(values["lspWaitTimeout"], 12.5);
+        assert_eq!(values["lspInstallStrategy"], "manual");
+    }
+
+    #[test]
+    fn merge_lsp_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+lsp:
+  enabled: false
+  wait_mode: full
+  wait_timeout: 12.5
+  install_strategy: manual
+  servers:
+    pyright:
+      disabled: true
+  custom_flag: keep-lsp
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_lsp_config(
+            &mut config,
+            &json!({
+                "lspEnabled": true,
+                "lspWaitMode": "document",
+                "lspWaitTimeout": 7.5,
+                "lspInstallStrategy": "off",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["lsp"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["lsp"]["wait_mode"].as_str(), Some("document"));
+        assert_eq!(config["lsp"]["wait_timeout"].as_f64(), Some(7.5));
+        assert_eq!(config["lsp"]["install_strategy"].as_str(), Some("off"));
+        assert_eq!(
+            config["lsp"]["servers"]["pyright"]["disabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(config["lsp"]["custom_flag"].as_str(), Some("keep-lsp"));
+    }
+
+    #[test]
+    fn merge_lsp_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_lsp_config(&mut config, &json!({ "lspWaitMode": "workspace" }))
+            .unwrap_err();
+        assert!(err.contains("lsp.wait_mode"));
+        let err = merge_hermes_lsp_config(&mut config, &json!({ "lspInstallStrategy": "unsafe" }))
+            .unwrap_err();
+        assert!(err.contains("lsp.install_strategy"));
+        let err =
+            merge_hermes_lsp_config(&mut config, &json!({ "lspWaitTimeout": 0 })).unwrap_err();
+        assert!(err.contains("lsp.wait_timeout"));
+        let err =
+            merge_hermes_lsp_config(&mut config, &json!({ "lspWaitTimeout": 120.5 })).unwrap_err();
+        assert!(err.contains("lsp.wait_timeout"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_stt_config_tests {
+    use super::{build_hermes_stt_config_values, merge_hermes_stt_config};
+    use serde_json::json;
+
+    #[test]
+    fn stt_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_stt_config_values(&config);
+        assert_eq!(values["sttEnabled"], true);
+        assert_eq!(values["sttProvider"], "auto");
+        assert_eq!(values["sttLocalModel"], "base");
+        assert_eq!(values["sttLocalLanguage"], "");
+        assert_eq!(values["sttOpenaiModel"], "whisper-1");
+        assert_eq!(values["sttMistralModel"], "voxtral-mini-latest");
+    }
+
+    #[test]
+    fn stt_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+stt:
+  enabled: false
+  provider: openai
+  local:
+    model: small
+    language: zh
+  openai:
+    model: gpt-4o-mini-transcribe
+  mistral:
+    model: voxtral-mini-2602
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_stt_config_values(&config);
+        assert_eq!(values["sttEnabled"], false);
+        assert_eq!(values["sttProvider"], "openai");
+        assert_eq!(values["sttLocalModel"], "small");
+        assert_eq!(values["sttLocalLanguage"], "zh");
+        assert_eq!(values["sttOpenaiModel"], "gpt-4o-mini-transcribe");
+        assert_eq!(values["sttMistralModel"], "voxtral-mini-2602");
+    }
+
+    #[test]
+    fn merge_stt_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+stt:
+  enabled: true
+  provider: auto
+  custom_flag: keep-stt
+  local:
+    model: base
+    custom_flag: keep-local
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_stt_config(
+            &mut config,
+            &json!({
+                "sttEnabled": false,
+                "sttProvider": "openai",
+                "sttLocalModel": "small",
+                "sttLocalLanguage": "zh",
+                "sttOpenaiModel": "gpt-4o-mini-transcribe",
+                "sttMistralModel": "voxtral-mini-2602",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(config["stt"]["enabled"].as_bool(), Some(false));
+        assert_eq!(config["stt"]["provider"].as_str(), Some("openai"));
+        assert_eq!(config["stt"]["local"]["model"].as_str(), Some("small"));
+        assert_eq!(config["stt"]["local"]["language"].as_str(), Some("zh"));
+        assert_eq!(
+            config["stt"]["openai"]["model"].as_str(),
+            Some("gpt-4o-mini-transcribe")
+        );
+        assert_eq!(
+            config["stt"]["mistral"]["model"].as_str(),
+            Some("voxtral-mini-2602")
+        );
+        assert_eq!(config["stt"]["custom_flag"].as_str(), Some("keep-stt"));
+        assert_eq!(
+            config["stt"]["local"]["custom_flag"].as_str(),
+            Some("keep-local")
+        );
+    }
+
+    #[test]
+    fn merge_stt_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_stt_config(&mut config, &json!({ "sttProvider": "bad" })).unwrap_err();
+        assert!(err.contains("stt.provider"));
+        let err =
+            merge_hermes_stt_config(&mut config, &json!({ "sttLocalModel": "giant" })).unwrap_err();
+        assert!(err.contains("stt.local.model"));
+        let err = merge_hermes_stt_config(&mut config, &json!({ "sttOpenaiModel": "gpt-4.1" }))
+            .unwrap_err();
+        assert!(err.contains("stt.openai.model"));
+        let err =
+            merge_hermes_stt_config(&mut config, &json!({ "sttMistralModel": "voxtral-large" }))
+                .unwrap_err();
+        assert!(err.contains("stt.mistral.model"));
+        let err = merge_hermes_stt_config(&mut config, &json!({ "sttLocalLanguage": "中文" }))
+            .unwrap_err();
+        assert!(err.contains("stt.local.language"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_tts_voice_config_tests {
+    use super::{build_hermes_tts_voice_config_values, merge_hermes_tts_voice_config};
+    use serde_json::json;
+
+    #[test]
+    fn tts_voice_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_tts_voice_config_values(&config);
+        assert_eq!(values["ttsProvider"], "edge");
+        assert_eq!(values["ttsEdgeVoice"], "en-US-AriaNeural");
+        assert_eq!(values["ttsOpenaiModel"], "gpt-4o-mini-tts");
+        assert_eq!(values["ttsOpenaiVoice"], "alloy");
+        assert_eq!(values["ttsElevenlabsVoiceId"], "pNInz6obpgDQGcFmaJgB");
+        assert_eq!(values["ttsElevenlabsModelId"], "eleven_multilingual_v2");
+        assert_eq!(values["ttsXaiVoiceId"], "eve");
+        assert_eq!(values["ttsXaiLanguage"], "en");
+        assert_eq!(values["ttsXaiSampleRate"], 24000);
+        assert_eq!(values["ttsXaiBitRate"], 128000);
+        assert_eq!(values["ttsMistralModel"], "voxtral-mini-tts-2603");
+        assert_eq!(
+            values["ttsMistralVoiceId"],
+            "c69964a6-ab8b-4f8a-9465-ec0925096ec8"
+        );
+        assert_eq!(values["ttsPiperVoice"], "en_US-lessac-medium");
+        assert_eq!(values["voiceRecordKey"], "ctrl+b");
+        assert_eq!(values["voiceMaxRecordingSeconds"], 120);
+        assert_eq!(values["voiceAutoTts"], false);
+        assert_eq!(values["voiceBeepEnabled"], true);
+        assert_eq!(values["voiceSilenceThreshold"], 200);
+        assert_eq!(values["voiceSilenceDuration"], 3.0);
+    }
+
+    #[test]
+    fn tts_voice_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tts:
+  provider: openai
+  edge:
+    voice: zh-CN-XiaoxiaoNeural
+  openai:
+    model: gpt-4o-mini-tts
+    voice: nova
+  elevenlabs:
+    voice_id: voice-123
+    model_id: eleven_turbo_v2_5
+  xai:
+    voice_id: custom-eve
+    language: zh
+    sample_rate: 48000
+    bit_rate: 192000
+  mistral:
+    model: voxtral-mini-tts-2603
+    voice_id: mistral-voice
+  piper:
+    voice: zh_CN-huayan-medium
+voice:
+  record_key: ctrl+shift+v
+  max_recording_seconds: 240
+  auto_tts: true
+  beep_enabled: false
+  silence_threshold: 350
+  silence_duration: 1.5
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_tts_voice_config_values(&config);
+        assert_eq!(values["ttsProvider"], "openai");
+        assert_eq!(values["ttsEdgeVoice"], "zh-CN-XiaoxiaoNeural");
+        assert_eq!(values["ttsOpenaiVoice"], "nova");
+        assert_eq!(values["ttsElevenlabsVoiceId"], "voice-123");
+        assert_eq!(values["ttsXaiLanguage"], "zh");
+        assert_eq!(values["ttsXaiSampleRate"], 48000);
+        assert_eq!(values["ttsMistralVoiceId"], "mistral-voice");
+        assert_eq!(values["ttsPiperVoice"], "zh_CN-huayan-medium");
+        assert_eq!(values["voiceRecordKey"], "ctrl+shift+v");
+        assert_eq!(values["voiceAutoTts"], true);
+        assert_eq!(values["voiceBeepEnabled"], false);
+        assert_eq!(values["voiceSilenceDuration"], 1.5);
+    }
+
+    #[test]
+    fn merge_tts_voice_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+tts:
+  provider: edge
+  custom_flag: keep-tts
+  openai:
+    custom_flag: keep-openai
+  piper:
+    voices_dir: /cache/piper
+voice:
+  custom_flag: keep-voice
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_tts_voice_config(
+            &mut config,
+            &json!({
+                "ttsProvider": "openai",
+                "ttsEdgeVoice": "zh-CN-XiaoxiaoNeural",
+                "ttsOpenaiModel": "gpt-4o-mini-tts",
+                "ttsOpenaiVoice": "nova",
+                "ttsElevenlabsVoiceId": "voice-123",
+                "ttsElevenlabsModelId": "eleven_turbo_v2_5",
+                "ttsXaiVoiceId": "eve-pro",
+                "ttsXaiLanguage": "zh",
+                "ttsXaiSampleRate": "48000",
+                "ttsXaiBitRate": "192000",
+                "ttsMistralModel": "voxtral-mini-tts-2603",
+                "ttsMistralVoiceId": "mistral-voice",
+                "ttsPiperVoice": "zh_CN-huayan-medium",
+                "voiceRecordKey": "ctrl+shift+v",
+                "voiceMaxRecordingSeconds": "240",
+                "voiceAutoTts": true,
+                "voiceBeepEnabled": false,
+                "voiceSilenceThreshold": "350",
+                "voiceSilenceDuration": "1.5",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["tts"]["provider"].as_str(), Some("openai"));
+        assert_eq!(
+            config["tts"]["edge"]["voice"].as_str(),
+            Some("zh-CN-XiaoxiaoNeural")
+        );
+        assert_eq!(config["tts"]["openai"]["voice"].as_str(), Some("nova"));
+        assert_eq!(
+            config["tts"]["openai"]["custom_flag"].as_str(),
+            Some("keep-openai")
+        );
+        assert_eq!(
+            config["tts"]["elevenlabs"]["voice_id"].as_str(),
+            Some("voice-123")
+        );
+        assert_eq!(config["tts"]["xai"]["sample_rate"].as_i64(), Some(48000));
+        assert_eq!(config["tts"]["xai"]["bit_rate"].as_i64(), Some(192000));
+        assert_eq!(
+            config["tts"]["mistral"]["voice_id"].as_str(),
+            Some("mistral-voice")
+        );
+        assert_eq!(
+            config["tts"]["piper"]["voice"].as_str(),
+            Some("zh_CN-huayan-medium")
+        );
+        assert_eq!(
+            config["tts"]["piper"]["voices_dir"].as_str(),
+            Some("/cache/piper")
+        );
+        assert_eq!(config["tts"]["custom_flag"].as_str(), Some("keep-tts"));
+        assert_eq!(config["voice"]["record_key"].as_str(), Some("ctrl+shift+v"));
+        assert_eq!(config["voice"]["max_recording_seconds"].as_i64(), Some(240));
+        assert_eq!(config["voice"]["auto_tts"].as_bool(), Some(true));
+        assert_eq!(config["voice"]["beep_enabled"].as_bool(), Some(false));
+        assert_eq!(config["voice"]["silence_threshold"].as_i64(), Some(350));
+        assert_eq!(config["voice"]["silence_duration"].as_f64(), Some(1.5));
+        assert_eq!(config["voice"]["custom_flag"].as_str(), Some("keep-voice"));
+    }
+
+    #[test]
+    fn merge_tts_voice_config_removes_empty_optional_overrides() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+tts:
+  edge:
+    voice: custom-edge
+  elevenlabs:
+    voice_id: voice-123
+    model_id: model-123
+  piper:
+    voice: custom-piper
+    voices_dir: /cache/piper
+voice:
+  record_key: ctrl+shift+v
+  custom_flag: keep-voice
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_tts_voice_config(
+            &mut config,
+            &json!({
+                "ttsEdgeVoice": "",
+                "ttsElevenlabsVoiceId": " ",
+                "ttsElevenlabsModelId": "",
+                "ttsPiperVoice": "",
+                "voiceRecordKey": "",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["tts"]["edge"]["voice"].is_null());
+        assert!(config["tts"]["elevenlabs"]["voice_id"].is_null());
+        assert!(config["tts"]["elevenlabs"]["model_id"].is_null());
+        assert!(config["tts"]["piper"]["voice"].is_null());
+        assert_eq!(
+            config["tts"]["piper"]["voices_dir"].as_str(),
+            Some("/cache/piper")
+        );
+        assert!(config["voice"]["record_key"].is_null());
+        assert_eq!(config["voice"]["custom_flag"].as_str(), Some("keep-voice"));
+    }
+
+    #[test]
+    fn merge_tts_voice_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_tts_voice_config(&mut config, &json!({ "ttsProvider": "bad" }))
+            .unwrap_err();
+        assert!(err.contains("tts.provider"));
+        let err = merge_hermes_tts_voice_config(&mut config, &json!({ "ttsOpenaiVoice": "robot" }))
+            .unwrap_err();
+        assert!(err.contains("tts.openai.voice"));
+        let err = merge_hermes_tts_voice_config(&mut config, &json!({ "ttsXaiSampleRate": "0" }))
+            .unwrap_err();
+        assert!(err.contains("tts.xai.sample_rate"));
+        let err =
+            merge_hermes_tts_voice_config(&mut config, &json!({ "voiceMaxRecordingSeconds": "0" }))
+                .unwrap_err();
+        assert!(err.contains("voice.max_recording_seconds"));
+        let err =
+            merge_hermes_tts_voice_config(&mut config, &json!({ "voiceSilenceDuration": "-1" }))
+                .unwrap_err();
+        assert!(err.contains("voice.silence_duration"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_checkpoints_config_tests {
+    use super::{build_hermes_checkpoints_config_values, merge_hermes_checkpoints_config};
+    use serde_json::json;
+
+    #[test]
+    fn checkpoints_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_checkpoints_config_values(&config);
+        assert_eq!(values["checkpointsEnabled"], false);
+        assert_eq!(values["checkpointMaxSnapshots"], 20);
+        assert_eq!(values["checkpointMaxTotalSizeMb"], 500);
+        assert_eq!(values["checkpointMaxFileSizeMb"], 10);
+        assert_eq!(values["checkpointAutoPrune"], true);
+        assert_eq!(values["checkpointRetentionDays"], 7);
+        assert_eq!(values["checkpointDeleteOrphans"], true);
+        assert_eq!(values["checkpointMinIntervalHours"], 24);
+    }
+
+    #[test]
+    fn checkpoints_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+checkpoints:
+  enabled: true
+  max_snapshots: 12
+  max_total_size_mb: 900
+  max_file_size_mb: 25
+  auto_prune: false
+  retention_days: 14
+  delete_orphans: false
+  min_interval_hours: 6
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_checkpoints_config_values(&config);
+        assert_eq!(values["checkpointsEnabled"], true);
+        assert_eq!(values["checkpointMaxSnapshots"], 12);
+        assert_eq!(values["checkpointMaxTotalSizeMb"], 900);
+        assert_eq!(values["checkpointMaxFileSizeMb"], 25);
+        assert_eq!(values["checkpointAutoPrune"], false);
+        assert_eq!(values["checkpointRetentionDays"], 14);
+        assert_eq!(values["checkpointDeleteOrphans"], false);
+        assert_eq!(values["checkpointMinIntervalHours"], 6);
+    }
+
+    #[test]
+    fn merge_checkpoints_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+checkpoints:
+  enabled: true
+  custom_flag: keep-checkpoints
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_checkpoints_config(
+            &mut config,
+            &json!({
+                "checkpointsEnabled": false,
+                "checkpointMaxSnapshots": "30",
+                "checkpointMaxTotalSizeMb": "0",
+                "checkpointMaxFileSizeMb": "0",
+                "checkpointAutoPrune": true,
+                "checkpointRetentionDays": "21",
+                "checkpointDeleteOrphans": true,
+                "checkpointMinIntervalHours": "12",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["checkpoints"]["enabled"].as_bool(), Some(false));
+        assert_eq!(config["checkpoints"]["max_snapshots"].as_i64(), Some(30));
+        assert_eq!(config["checkpoints"]["max_total_size_mb"].as_i64(), Some(0));
+        assert_eq!(config["checkpoints"]["max_file_size_mb"].as_i64(), Some(0));
+        assert_eq!(config["checkpoints"]["auto_prune"].as_bool(), Some(true));
+        assert_eq!(config["checkpoints"]["retention_days"].as_i64(), Some(21));
+        assert_eq!(
+            config["checkpoints"]["delete_orphans"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["checkpoints"]["min_interval_hours"].as_i64(),
+            Some(12)
+        );
+        assert_eq!(
+            config["checkpoints"]["custom_flag"].as_str(),
+            Some("keep-checkpoints")
+        );
+    }
+
+    #[test]
+    fn merge_checkpoints_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_checkpoints_config(&mut config, &json!({ "checkpointMaxSnapshots": 0 }))
+                .unwrap_err();
+        assert!(err.contains("checkpoints.max_snapshots"));
+        let err = merge_hermes_checkpoints_config(
+            &mut config,
+            &json!({ "checkpointMaxTotalSizeMb": -1 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("checkpoints.max_total_size_mb"));
+        let err =
+            merge_hermes_checkpoints_config(&mut config, &json!({ "checkpointMaxFileSizeMb": -1 }))
+                .unwrap_err();
+        assert!(err.contains("checkpoints.max_file_size_mb"));
+        let err =
+            merge_hermes_checkpoints_config(&mut config, &json!({ "checkpointRetentionDays": 0 }))
+                .unwrap_err();
+        assert!(err.contains("checkpoints.retention_days"));
+        let err = merge_hermes_checkpoints_config(
+            &mut config,
+            &json!({ "checkpointMinIntervalHours": -1 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("checkpoints.min_interval_hours"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_cron_config_tests {
+    use super::{build_hermes_cron_config_values, merge_hermes_cron_config};
+    use serde_json::json;
+
+    #[test]
+    fn cron_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_cron_config_values(&config);
+        assert_eq!(values["cronWrapResponse"], true);
+        assert_eq!(values["cronMaxParallelJobs"], 0);
+    }
+
+    #[test]
+    fn cron_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+cron:
+  wrap_response: false
+  max_parallel_jobs: 4
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_cron_config_values(&config);
+        assert_eq!(values["cronWrapResponse"], false);
+        assert_eq!(values["cronMaxParallelJobs"], 4);
+    }
+
+    #[test]
+    fn merge_cron_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+cron:
+  wrap_response: true
+  custom_flag: keep-cron
+approvals:
+  cron_mode: deny
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_cron_config(
+            &mut config,
+            &json!({
+                "cronWrapResponse": false,
+                "cronMaxParallelJobs": "3",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["approvals"]["cron_mode"].as_str(), Some("deny"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["cron"]["wrap_response"].as_bool(), Some(false));
+        assert_eq!(config["cron"]["max_parallel_jobs"].as_i64(), Some(3));
+        assert_eq!(config["cron"]["custom_flag"].as_str(), Some("keep-cron"));
+    }
+
+    #[test]
+    fn merge_cron_config_writes_unbounded_null_and_rejects_invalid_values() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+cron:
+  max_parallel_jobs: 8
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_cron_config(
+            &mut config,
+            &json!({
+                "cronMaxParallelJobs": "0",
+            }),
+        )
+        .unwrap();
+        assert_eq!(config["cron"]["max_parallel_jobs"], serde_yaml::Value::Null);
+
+        let err = merge_hermes_cron_config(&mut config, &json!({ "cronMaxParallelJobs": -1 }))
+            .unwrap_err();
+        assert!(err.contains("cron.max_parallel_jobs"));
+        let err = merge_hermes_cron_config(&mut config, &json!({ "cronMaxParallelJobs": 10001 }))
+            .unwrap_err();
+        assert!(err.contains("cron.max_parallel_jobs"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_sessions_maintenance_config_tests {
+    use super::{
+        build_hermes_sessions_maintenance_config_values, merge_hermes_sessions_maintenance_config,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn sessions_maintenance_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_sessions_maintenance_config_values(&config);
+        assert_eq!(values["sessionsAutoPrune"], false);
+        assert_eq!(values["sessionsRetentionDays"], 90);
+        assert_eq!(values["sessionsVacuumAfterPrune"], true);
+        assert_eq!(values["sessionsMinIntervalHours"], 24);
+        assert_eq!(values["sessionsWriteJsonSnapshots"], false);
+    }
+
+    #[test]
+    fn sessions_maintenance_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sessions:
+  auto_prune: true
+  retention_days: 14
+  vacuum_after_prune: false
+  min_interval_hours: 6
+  write_json_snapshots: true
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_sessions_maintenance_config_values(&config);
+        assert_eq!(values["sessionsAutoPrune"], true);
+        assert_eq!(values["sessionsRetentionDays"], 14);
+        assert_eq!(values["sessionsVacuumAfterPrune"], false);
+        assert_eq!(values["sessionsMinIntervalHours"], 6);
+        assert_eq!(values["sessionsWriteJsonSnapshots"], true);
+    }
+
+    #[test]
+    fn merge_sessions_maintenance_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sessions:
+  auto_prune: false
+  custom_flag: keep-sessions
+model:
+  provider: anthropic
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_sessions_maintenance_config(
+            &mut config,
+            &json!({
+                "sessionsAutoPrune": true,
+                "sessionsRetentionDays": "30",
+                "sessionsVacuumAfterPrune": false,
+                "sessionsMinIntervalHours": "12",
+                "sessionsWriteJsonSnapshots": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["sessions"]["auto_prune"].as_bool(), Some(true));
+        assert_eq!(config["sessions"]["retention_days"].as_i64(), Some(30));
+        assert_eq!(
+            config["sessions"]["vacuum_after_prune"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(config["sessions"]["min_interval_hours"].as_i64(), Some(12));
+        assert_eq!(
+            config["sessions"]["write_json_snapshots"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["sessions"]["custom_flag"].as_str(),
+            Some("keep-sessions")
+        );
+    }
+
+    #[test]
+    fn merge_sessions_maintenance_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_sessions_maintenance_config(
+            &mut config,
+            &json!({ "sessionsRetentionDays": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("sessions.retention_days"));
+        let err = merge_hermes_sessions_maintenance_config(
+            &mut config,
+            &json!({ "sessionsRetentionDays": 36501 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("sessions.retention_days"));
+        let err = merge_hermes_sessions_maintenance_config(
+            &mut config,
+            &json!({ "sessionsMinIntervalHours": -1 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("sessions.min_interval_hours"));
+        let err = merge_hermes_sessions_maintenance_config(
+            &mut config,
+            &json!({ "sessionsMinIntervalHours": 87601 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("sessions.min_interval_hours"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_updates_config_tests {
+    use super::{build_hermes_updates_config_values, merge_hermes_updates_config};
+    use serde_json::json;
+
+    #[test]
+    fn updates_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_updates_config_values(&config);
+        assert_eq!(values["updatesPreUpdateBackup"], false);
+        assert_eq!(values["updatesBackupKeep"], 5);
+    }
+
+    #[test]
+    fn updates_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+updates:
+  pre_update_backup: true
+  backup_keep: 9
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_updates_config_values(&config);
+        assert_eq!(values["updatesPreUpdateBackup"], true);
+        assert_eq!(values["updatesBackupKeep"], 9);
+    }
+
+    #[test]
+    fn merge_updates_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+updates:
+  pre_update_backup: false
+  custom_flag: keep-updates
+sessions:
+  auto_prune: true
+model:
+  provider: anthropic
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_updates_config(
+            &mut config,
+            &json!({
+                "updatesPreUpdateBackup": true,
+                "updatesBackupKeep": "7",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["sessions"]["auto_prune"].as_bool(), Some(true));
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["updates"]["pre_update_backup"].as_bool(), Some(true));
+        assert_eq!(config["updates"]["backup_keep"].as_i64(), Some(7));
+        assert_eq!(
+            config["updates"]["custom_flag"].as_str(),
+            Some("keep-updates")
+        );
+    }
+
+    #[test]
+    fn merge_updates_config_rejects_invalid_backup_keep() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_updates_config(&mut config, &json!({ "updatesBackupKeep": 0 }))
+            .unwrap_err();
+        assert!(err.contains("updates.backup_keep"));
+        let err = merge_hermes_updates_config(&mut config, &json!({ "updatesBackupKeep": 1001 }))
+            .unwrap_err();
+        assert!(err.contains("updates.backup_keep"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_logging_config_tests {
+    use super::{build_hermes_logging_config_values, merge_hermes_logging_config};
+    use serde_json::json;
+
+    #[test]
+    fn logging_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_logging_config_values(&config);
+        assert_eq!(values["loggingLevel"], "INFO");
+        assert_eq!(values["loggingMaxSizeMb"], 5);
+        assert_eq!(values["loggingBackupCount"], 3);
+        assert_eq!(values["loggingMemoryMonitorEnabled"], true);
+        assert_eq!(values["loggingMemoryMonitorIntervalSeconds"], 300);
+    }
+
+    #[test]
+    fn logging_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+logging:
+  level: DEBUG
+  max_size_mb: 12
+  backup_count: 7
+  memory_monitor:
+    enabled: false
+    interval_seconds: 120
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_logging_config_values(&config);
+        assert_eq!(values["loggingLevel"], "DEBUG");
+        assert_eq!(values["loggingMaxSizeMb"], 12);
+        assert_eq!(values["loggingBackupCount"], 7);
+        assert_eq!(values["loggingMemoryMonitorEnabled"], false);
+        assert_eq!(values["loggingMemoryMonitorIntervalSeconds"], 120);
+    }
+
+    #[test]
+    fn merge_logging_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+logging:
+  level: INFO
+  custom_flag: keep-logging
+  memory_monitor:
+    custom_flag: keep-memory-monitor
+cron:
+  wrap_response: true
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_logging_config(
+            &mut config,
+            &json!({
+                "loggingLevel": "WARNING",
+                "loggingMaxSizeMb": "20",
+                "loggingBackupCount": "5",
+                "loggingMemoryMonitorEnabled": true,
+                "loggingMemoryMonitorIntervalSeconds": "180",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["cron"]["wrap_response"].as_bool(), Some(true));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["logging"]["level"].as_str(), Some("WARNING"));
+        assert_eq!(config["logging"]["max_size_mb"].as_i64(), Some(20));
+        assert_eq!(config["logging"]["backup_count"].as_i64(), Some(5));
+        assert_eq!(
+            config["logging"]["memory_monitor"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["logging"]["memory_monitor"]["interval_seconds"].as_i64(),
+            Some(180)
+        );
+        assert_eq!(
+            config["logging"]["custom_flag"].as_str(),
+            Some("keep-logging")
+        );
+        assert_eq!(
+            config["logging"]["memory_monitor"]["custom_flag"].as_str(),
+            Some("keep-memory-monitor")
+        );
+    }
+
+    #[test]
+    fn merge_logging_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_logging_config(&mut config, &json!({ "loggingLevel": "TRACE" }))
+            .unwrap_err();
+        assert!(err.contains("logging.level"));
+        let err = merge_hermes_logging_config(&mut config, &json!({ "loggingMaxSizeMb": 0 }))
+            .unwrap_err();
+        assert!(err.contains("logging.max_size_mb"));
+        let err = merge_hermes_logging_config(&mut config, &json!({ "loggingBackupCount": -1 }))
+            .unwrap_err();
+        assert!(err.contains("logging.backup_count"));
+        let err = merge_hermes_logging_config(
+            &mut config,
+            &json!({ "loggingMemoryMonitorIntervalSeconds": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("logging.memory_monitor.interval_seconds"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_approvals_config_tests {
+    use super::{build_hermes_approvals_config_values, merge_hermes_approvals_config};
+    use serde_json::json;
+
+    #[test]
+    fn approvals_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_approvals_config_values(&config);
+        assert_eq!(values["approvalMode"], "manual");
+        assert_eq!(values["approvalTimeout"], 60);
+        assert_eq!(values["approvalCronMode"], "deny");
+        assert_eq!(values["approvalMcpReloadConfirm"], true);
+        assert_eq!(values["approvalDestructiveSlashConfirm"], true);
+    }
+
+    #[test]
+    fn approvals_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+approvals:
+  mode: smart
+  timeout: 120
+  cron_mode: approve
+  mcp_reload_confirm: false
+  destructive_slash_confirm: false
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_approvals_config_values(&config);
+        assert_eq!(values["approvalMode"], "smart");
+        assert_eq!(values["approvalTimeout"], 120);
+        assert_eq!(values["approvalCronMode"], "approve");
+        assert_eq!(values["approvalMcpReloadConfirm"], false);
+        assert_eq!(values["approvalDestructiveSlashConfirm"], false);
+    }
+
+    #[test]
+    fn merge_approvals_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+approvals:
+  mode: manual
+  custom_flag: keep-approvals
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_approvals_config(
+            &mut config,
+            &json!({
+                "approvalMode": "off",
+                "approvalTimeout": "15",
+                "approvalCronMode": "approve",
+                "approvalMcpReloadConfirm": false,
+                "approvalDestructiveSlashConfirm": false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["approvals"]["mode"].as_str(), Some("off"));
+        assert_eq!(config["approvals"]["timeout"].as_i64(), Some(15));
+        assert_eq!(config["approvals"]["cron_mode"].as_str(), Some("approve"));
+        assert_eq!(
+            config["approvals"]["mcp_reload_confirm"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["approvals"]["destructive_slash_confirm"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["approvals"]["custom_flag"].as_str(),
+            Some("keep-approvals")
+        );
+    }
+
+    #[test]
+    fn merge_approvals_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_approvals_config(&mut config, &json!({ "approvalMode": "always" }))
+            .unwrap_err();
+        assert!(err.contains("approvals.mode"));
+        let err =
+            merge_hermes_approvals_config(&mut config, &json!({ "approvalCronMode": "prompt" }))
+                .unwrap_err();
+        assert!(err.contains("approvals.cron_mode"));
+        let err = merge_hermes_approvals_config(&mut config, &json!({ "approvalTimeout": 0 }))
+            .unwrap_err();
+        assert!(err.contains("approvals.timeout"));
+        let err = merge_hermes_approvals_config(&mut config, &json!({ "approvalTimeout": 86401 }))
+            .unwrap_err();
+        assert!(err.contains("approvals.timeout"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_terminal_config_tests {
+    use super::{build_hermes_terminal_config_values, merge_hermes_terminal_config};
+    use serde_json::json;
+
+    #[test]
+    fn terminal_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_terminal_config_values(&config);
+        assert_eq!(values["terminalBackend"], "local");
+        assert_eq!(values["terminalCwd"], ".");
+        assert_eq!(values["terminalTimeout"], 180);
+        assert_eq!(values["terminalLifetimeSeconds"], 300);
+        assert_eq!(values["terminalShellInitFiles"], "");
+        assert_eq!(values["terminalAutoSourceBashrc"], true);
+        assert_eq!(values["terminalPersistentShell"], true);
+        assert_eq!(values["terminalEnvPassthrough"], "");
+        assert_eq!(values["terminalDockerMountCwdToWorkspace"], false);
+        assert_eq!(values["terminalDockerRunAsHostUser"], false);
+        assert_eq!(values["terminalContainerCpu"], 1);
+        assert_eq!(values["terminalContainerMemory"], 5120);
+        assert_eq!(values["terminalContainerDisk"], 51200);
+        assert_eq!(values["terminalContainerPersistent"], true);
+        assert_eq!(values["terminalDockerImage"], "");
+        assert_eq!(values["terminalSingularityImage"], "");
+        assert_eq!(values["terminalModalImage"], "");
+        assert_eq!(values["terminalModalMode"], "auto");
+        assert_eq!(values["terminalVercelRuntime"], "node24");
+        assert_eq!(values["terminalDaytonaImage"], "");
+        assert_eq!(values["terminalDockerForwardEnv"], "");
+        assert_eq!(values["terminalDockerEnvJson"], "{}");
+        assert_eq!(values["terminalDockerVolumes"], "");
+        assert_eq!(values["terminalDockerExtraArgs"], "");
+        assert_eq!(values["terminalSshHost"], "");
+        assert_eq!(values["terminalSshUser"], "");
+        assert_eq!(values["terminalSshPort"], 22);
+        assert_eq!(values["terminalSshKey"], "");
+    }
+
+    #[test]
+    fn terminal_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+terminal:
+  backend: docker
+  cwd: /workspace
+  timeout: 600
+  lifetime_seconds: 1800
+  shell_init_files:
+    - ~/.zshrc
+    - ${HOME}/.config/hermes/env.sh
+  auto_source_bashrc: false
+  persistent_shell: false
+  env_passthrough:
+    - OPENROUTER_API_KEY
+    - GITHUB_TOKEN
+  docker_mount_cwd_to_workspace: true
+  docker_run_as_host_user: true
+  docker_image: nikolaik/python-nodejs:python3.11-nodejs20
+  docker_forward_env:
+    - GITHUB_TOKEN
+    - NPM_TOKEN
+  docker_env:
+    PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    PIP_CACHE_DIR: /workspace/.cache/pip
+  docker_volumes:
+    - /data/projects:/workspace/projects
+    - /data/cache:/cache
+  docker_extra_args:
+    - --network=host
+    - --add-host=host.docker.internal:host-gateway
+  singularity_image: docker://nikolaik/python-nodejs:python3.11-nodejs20
+  modal_image: python:3.12
+  modal_mode: managed
+  vercel_runtime: python3.13
+  daytona_image: ubuntu:24.04
+  ssh_host: build.example.com
+  ssh_user: deploy
+  ssh_port: 2222
+  ssh_key: ~/.ssh/hermes_ed25519
+  container_cpu: 4
+  container_memory: 8192
+  container_disk: 102400
+  container_persistent: false
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_terminal_config_values(&config);
+        assert_eq!(values["terminalBackend"], "docker");
+        assert_eq!(values["terminalCwd"], "/workspace");
+        assert_eq!(values["terminalTimeout"], 600);
+        assert_eq!(values["terminalLifetimeSeconds"], 1800);
+        assert_eq!(
+            values["terminalShellInitFiles"],
+            "~/.zshrc\n${HOME}/.config/hermes/env.sh"
+        );
+        assert_eq!(values["terminalAutoSourceBashrc"], false);
+        assert_eq!(values["terminalPersistentShell"], false);
+        assert_eq!(
+            values["terminalEnvPassthrough"],
+            "OPENROUTER_API_KEY\nGITHUB_TOKEN"
+        );
+        assert_eq!(values["terminalDockerMountCwdToWorkspace"], true);
+        assert_eq!(values["terminalDockerRunAsHostUser"], true);
+        assert_eq!(
+            values["terminalDockerImage"],
+            "nikolaik/python-nodejs:python3.11-nodejs20"
+        );
+        assert_eq!(
+            values["terminalDockerForwardEnv"],
+            "GITHUB_TOKEN\nNPM_TOKEN"
+        );
+        assert_eq!(
+            values["terminalDockerEnvJson"],
+            "{\n  \"PLAYWRIGHT_BROWSERS_PATH\": \"/ms-playwright\",\n  \"PIP_CACHE_DIR\": \"/workspace/.cache/pip\"\n}"
+        );
+        assert_eq!(
+            values["terminalDockerVolumes"],
+            "/data/projects:/workspace/projects\n/data/cache:/cache"
+        );
+        assert_eq!(
+            values["terminalDockerExtraArgs"],
+            "--network=host\n--add-host=host.docker.internal:host-gateway"
+        );
+        assert_eq!(
+            values["terminalSingularityImage"],
+            "docker://nikolaik/python-nodejs:python3.11-nodejs20"
+        );
+        assert_eq!(values["terminalModalImage"], "python:3.12");
+        assert_eq!(values["terminalModalMode"], "managed");
+        assert_eq!(values["terminalVercelRuntime"], "python3.13");
+        assert_eq!(values["terminalDaytonaImage"], "ubuntu:24.04");
+        assert_eq!(values["terminalSshHost"], "build.example.com");
+        assert_eq!(values["terminalSshUser"], "deploy");
+        assert_eq!(values["terminalSshPort"], 2222);
+        assert_eq!(values["terminalSshKey"], "~/.ssh/hermes_ed25519");
+        assert_eq!(values["terminalContainerCpu"], 4);
+        assert_eq!(values["terminalContainerMemory"], 8192);
+        assert_eq!(values["terminalContainerDisk"], 102400);
+        assert_eq!(values["terminalContainerPersistent"], false);
+    }
+
+    #[test]
+    fn merge_terminal_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+terminal:
+  backend: local
+  shell_init_files:
+    - ~/.profile
+  env_passthrough:
+    - OLD_TOKEN
+  docker_image: custom/python-node
+  docker_forward_env:
+    - OLD_TOKEN
+  docker_env:
+    OLD_FLAG: keep-old
+  docker_volumes:
+    - /old:/old
+  docker_extra_args:
+    - --old
+  custom_flag: keep-terminal
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_terminal_config(
+            &mut config,
+            &json!({
+                "terminalBackend": "docker",
+                "terminalCwd": "/workspace",
+                "terminalTimeout": "900",
+                "terminalLifetimeSeconds": "1200",
+                "terminalShellInitFiles": "~/.zshrc\n${HOME}/.config/hermes/env.sh\n~/.zshrc",
+                "terminalAutoSourceBashrc": false,
+                "terminalPersistentShell": false,
+                "terminalEnvPassthrough": "OPENROUTER_API_KEY\nGITHUB_TOKEN\nOPENROUTER_API_KEY",
+                "terminalDockerMountCwdToWorkspace": true,
+                "terminalDockerRunAsHostUser": true,
+                "terminalDockerImage": "nikolaik/python-nodejs:python3.12-nodejs22",
+                "terminalDockerForwardEnv": "GITHUB_TOKEN\nNPM_TOKEN\nGITHUB_TOKEN",
+                "terminalDockerEnvJson": "{ \"PLAYWRIGHT_BROWSERS_PATH\": \"/ms-playwright\", \"PIP_CACHE_DIR\": \"/workspace/.cache/pip\" }",
+                "terminalDockerVolumes": "/data/projects:/workspace/projects\n/data/cache:/cache\n/data/projects:/workspace/projects",
+                "terminalDockerExtraArgs": "--network=host\n--add-host=host.docker.internal:host-gateway\n--network=host",
+                "terminalSingularityImage": "docker://ubuntu:24.04",
+                "terminalModalImage": "debian:bookworm",
+                "terminalModalMode": "direct",
+                "terminalVercelRuntime": "node22",
+                "terminalDaytonaImage": "ubuntu:22.04",
+                "terminalSshHost": "ssh.example.com",
+                "terminalSshUser": "hermes",
+                "terminalSshPort": "2200",
+                "terminalSshKey": "~/.ssh/id_ed25519",
+                "terminalContainerCpu": "2",
+                "terminalContainerMemory": "6144",
+                "terminalContainerDisk": "20480",
+                "terminalContainerPersistent": false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["terminal"]["backend"].as_str(), Some("docker"));
+        assert_eq!(config["terminal"]["cwd"].as_str(), Some("/workspace"));
+        assert_eq!(config["terminal"]["timeout"].as_i64(), Some(900));
+        assert_eq!(config["terminal"]["lifetime_seconds"].as_i64(), Some(1200));
+        assert_eq!(
+            config["terminal"]["shell_init_files"][0].as_str(),
+            Some("~/.zshrc")
+        );
+        assert_eq!(
+            config["terminal"]["shell_init_files"][1].as_str(),
+            Some("${HOME}/.config/hermes/env.sh")
+        );
+        assert_eq!(
+            config["terminal"]["shell_init_files"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config["terminal"]["auto_source_bashrc"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["terminal"]["persistent_shell"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["terminal"]["env_passthrough"][0].as_str(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(
+            config["terminal"]["env_passthrough"][1].as_str(),
+            Some("GITHUB_TOKEN")
+        );
+        assert_eq!(
+            config["terminal"]["env_passthrough"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config["terminal"]["docker_mount_cwd_to_workspace"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["terminal"]["docker_run_as_host_user"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["terminal"]["docker_image"].as_str(),
+            Some("nikolaik/python-nodejs:python3.12-nodejs22")
+        );
+        assert_eq!(
+            config["terminal"]["singularity_image"].as_str(),
+            Some("docker://ubuntu:24.04")
+        );
+        assert_eq!(
+            config["terminal"]["modal_image"].as_str(),
+            Some("debian:bookworm")
+        );
+        assert_eq!(config["terminal"]["modal_mode"].as_str(), Some("direct"));
+        assert_eq!(
+            config["terminal"]["vercel_runtime"].as_str(),
+            Some("node22")
+        );
+        assert_eq!(
+            config["terminal"]["daytona_image"].as_str(),
+            Some("ubuntu:22.04")
+        );
+        assert_eq!(
+            config["terminal"]["ssh_host"].as_str(),
+            Some("ssh.example.com")
+        );
+        assert_eq!(config["terminal"]["ssh_user"].as_str(), Some("hermes"));
+        assert_eq!(config["terminal"]["ssh_port"].as_i64(), Some(2200));
+        assert_eq!(
+            config["terminal"]["ssh_key"].as_str(),
+            Some("~/.ssh/id_ed25519")
+        );
+        assert_eq!(config["terminal"]["container_cpu"].as_i64(), Some(2));
+        assert_eq!(config["terminal"]["container_memory"].as_i64(), Some(6144));
+        assert_eq!(config["terminal"]["container_disk"].as_i64(), Some(20480));
+        assert_eq!(
+            config["terminal"]["container_persistent"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["terminal"]["docker_forward_env"][0].as_str(),
+            Some("GITHUB_TOKEN")
+        );
+        assert_eq!(
+            config["terminal"]["docker_forward_env"][1].as_str(),
+            Some("NPM_TOKEN")
+        );
+        assert_eq!(
+            config["terminal"]["docker_forward_env"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config["terminal"]["docker_env"]["PLAYWRIGHT_BROWSERS_PATH"].as_str(),
+            Some("/ms-playwright")
+        );
+        assert_eq!(
+            config["terminal"]["docker_env"]["PIP_CACHE_DIR"].as_str(),
+            Some("/workspace/.cache/pip")
+        );
+        assert_eq!(
+            config["terminal"]["docker_volumes"][0].as_str(),
+            Some("/data/projects:/workspace/projects")
+        );
+        assert_eq!(
+            config["terminal"]["docker_volumes"][1].as_str(),
+            Some("/data/cache:/cache")
+        );
+        assert_eq!(
+            config["terminal"]["docker_volumes"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config["terminal"]["docker_extra_args"][0].as_str(),
+            Some("--network=host")
+        );
+        assert_eq!(
+            config["terminal"]["docker_extra_args"][1].as_str(),
+            Some("--add-host=host.docker.internal:host-gateway")
+        );
+        assert_eq!(
+            config["terminal"]["docker_extra_args"]
+                .as_sequence()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config["terminal"]["custom_flag"].as_str(),
+            Some("keep-terminal")
+        );
+    }
+
+    #[test]
+    fn merge_terminal_config_removes_empty_docker_advanced_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+terminal:
+  docker_env:
+    OLD_FLAG: "1"
+  docker_volumes:
+    - /old:/old
+  docker_extra_args:
+    - --old
+  custom_flag: keep-terminal
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_terminal_config(
+            &mut config,
+            &json!({
+                "terminalDockerEnvJson": "{}",
+                "terminalDockerVolumes": "  \n",
+                "terminalDockerExtraArgs": "  \n",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["terminal"]["docker_env"].is_null());
+        assert!(config["terminal"]["docker_volumes"].is_null());
+        assert!(config["terminal"]["docker_extra_args"].is_null());
+        assert_eq!(
+            config["terminal"]["custom_flag"].as_str(),
+            Some("keep-terminal")
+        );
+    }
+
+    #[test]
+    fn merge_terminal_config_removes_empty_docker_forward_env() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+terminal:
+  docker_forward_env:
+    - GITHUB_TOKEN
+  custom_flag: keep-terminal
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_terminal_config(
+            &mut config,
+            &json!({
+                "terminalDockerForwardEnv": "  \n",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["terminal"]["docker_forward_env"].is_null());
+        assert_eq!(
+            config["terminal"]["custom_flag"].as_str(),
+            Some("keep-terminal")
+        );
+    }
+
+    #[test]
+    fn merge_terminal_config_removes_empty_shell_init_files() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+terminal:
+  shell_init_files:
+    - ~/.bashrc
+  custom_flag: keep-terminal
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_terminal_config(
+            &mut config,
+            &json!({
+                "terminalShellInitFiles": "  \n",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["terminal"]["shell_init_files"].is_null());
+        assert_eq!(
+            config["terminal"]["custom_flag"].as_str(),
+            Some("keep-terminal")
+        );
+    }
+
+    #[test]
+    fn merge_terminal_config_removes_empty_env_passthrough() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+terminal:
+  env_passthrough:
+    - OPENROUTER_API_KEY
+  custom_flag: keep-terminal
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_terminal_config(
+            &mut config,
+            &json!({
+                "terminalEnvPassthrough": "  \n",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["terminal"]["env_passthrough"].is_null());
+        assert_eq!(
+            config["terminal"]["custom_flag"].as_str(),
+            Some("keep-terminal")
+        );
+    }
+
+    #[test]
+    fn merge_terminal_config_removes_empty_images() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+terminal:
+  docker_image: old-docker
+  singularity_image: old-singularity
+  modal_image: old-modal
+  daytona_image: old-daytona
+  custom_flag: keep-terminal
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_terminal_config(
+            &mut config,
+            &json!({
+                "terminalDockerImage": "",
+                "terminalSingularityImage": "  ",
+                "terminalModalImage": "",
+                "terminalDaytonaImage": " ",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["terminal"]["docker_image"].is_null());
+        assert!(config["terminal"]["singularity_image"].is_null());
+        assert!(config["terminal"]["modal_image"].is_null());
+        assert!(config["terminal"]["daytona_image"].is_null());
+        assert_eq!(
+            config["terminal"]["custom_flag"].as_str(),
+            Some("keep-terminal")
+        );
+    }
+
+    #[test]
+    fn merge_terminal_config_removes_empty_ssh_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+terminal:
+  ssh_host: old-host
+  ssh_user: old-user
+  ssh_port: 2200
+  ssh_key: ~/.ssh/old
+  custom_flag: keep-terminal
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_terminal_config(
+            &mut config,
+            &json!({
+                "terminalSshHost": "",
+                "terminalSshUser": "  ",
+                "terminalSshPort": "22",
+                "terminalSshKey": "",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["terminal"]["ssh_host"].is_null());
+        assert!(config["terminal"]["ssh_user"].is_null());
+        assert!(config["terminal"]["ssh_key"].is_null());
+        assert_eq!(config["terminal"]["ssh_port"].as_i64(), Some(22));
+        assert_eq!(
+            config["terminal"]["custom_flag"].as_str(),
+            Some("keep-terminal")
+        );
+    }
+
+    #[test]
+    fn merge_terminal_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_terminal_config(&mut config, &json!({ "terminalBackend": "unsafe" }))
+                .unwrap_err();
+        assert!(err.contains("terminal.backend"));
+        let err =
+            merge_hermes_terminal_config(&mut config, &json!({ "terminalModalMode": "unsafe" }))
+                .unwrap_err();
+        assert!(err.contains("terminal.modal_mode"));
+        let err =
+            merge_hermes_terminal_config(&mut config, &json!({ "terminalVercelRuntime": "ruby" }))
+                .unwrap_err();
+        assert!(err.contains("terminal.vercel_runtime"));
+        let err = merge_hermes_terminal_config(&mut config, &json!({ "terminalTimeout": 0 }))
+            .unwrap_err();
+        assert!(err.contains("terminal.timeout"));
+        let err =
+            merge_hermes_terminal_config(&mut config, &json!({ "terminalLifetimeSeconds": -1 }))
+                .unwrap_err();
+        assert!(err.contains("terminal.lifetime_seconds"));
+        let err = merge_hermes_terminal_config(&mut config, &json!({ "terminalContainerCpu": 0 }))
+            .unwrap_err();
+        assert!(err.contains("terminal.container_cpu"));
+        let err =
+            merge_hermes_terminal_config(&mut config, &json!({ "terminalContainerMemory": 127 }))
+                .unwrap_err();
+        assert!(err.contains("terminal.container_memory"));
+        let err = merge_hermes_terminal_config(&mut config, &json!({ "terminalSshPort": 0 }))
+            .unwrap_err();
+        assert!(err.contains("terminal.ssh_port"));
+        let err = merge_hermes_terminal_config(&mut config, &json!({ "terminalSshPort": 65536 }))
+            .unwrap_err();
+        assert!(err.contains("terminal.ssh_port"));
+        let err = merge_hermes_terminal_config(
+            &mut config,
+            &json!({ "terminalDockerForwardEnv": "GOOD_TOKEN\nBAD TOKEN" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("terminal.docker_forward_env"));
+        let err = merge_hermes_terminal_config(
+            &mut config,
+            &json!({ "terminalShellInitFiles": "valid.sh\nbad path.sh" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("terminal.shell_init_files"));
+        let err = merge_hermes_terminal_config(
+            &mut config,
+            &json!({ "terminalEnvPassthrough": "GOOD_TOKEN\nBAD TOKEN" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("terminal.env_passthrough"));
+        let err =
+            merge_hermes_terminal_config(&mut config, &json!({ "terminalDockerEnvJson": "[]" }))
+                .unwrap_err();
+        assert!(err.contains("terminal.docker_env"));
+        let err = merge_hermes_terminal_config(
+            &mut config,
+            &json!({ "terminalDockerEnvJson": "{ \"BAD KEY\": \"value\" }" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("terminal.docker_env"));
+        let err = merge_hermes_terminal_config(
+            &mut config,
+            &json!({ "terminalDockerVolumes": "/host only" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("terminal.docker_volumes"));
+        let err = merge_hermes_terminal_config(
+            &mut config,
+            &json!({ "terminalDockerExtraArgs": "bad arg" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("terminal.docker_extra_args"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_memory_config_tests {
+    use super::{build_hermes_memory_config_values, merge_hermes_memory_config};
+    use serde_json::json;
+
+    #[test]
+    fn memory_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_memory_config_values(&config);
+        assert_eq!(values["memoryEnabled"], true);
+        assert_eq!(values["userProfileEnabled"], true);
+        assert_eq!(values["memoryCharLimit"], 2200);
+        assert_eq!(values["userCharLimit"], 1375);
+        assert_eq!(values["nudgeInterval"], 10);
+        assert_eq!(values["flushMinTurns"], 6);
+    }
+
+    #[test]
+    fn merge_memory_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+memory:
+  memory_enabled: true
+  provider: honcho
+  custom_flag: keep-me
+  flush_min_turns: 9
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_memory_config(
+            &mut config,
+            &json!({
+                "memoryEnabled": false,
+                "userProfileEnabled": false,
+                "memoryCharLimit": "2600",
+                "userCharLimit": "1500",
+                "nudgeInterval": "0",
+                "flushMinTurns": "7",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(false));
+        assert_eq!(
+            config["memory"]["user_profile_enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(config["memory"]["memory_char_limit"].as_i64(), Some(2600));
+        assert_eq!(config["memory"]["user_char_limit"].as_i64(), Some(1500));
+        assert_eq!(config["memory"]["nudge_interval"].as_i64(), Some(0));
+        assert_eq!(config["memory"]["flush_min_turns"].as_i64(), Some(7));
+        assert_eq!(config["memory"]["provider"].as_str(), Some("honcho"));
+        assert_eq!(config["memory"]["custom_flag"].as_str(), Some("keep-me"));
+    }
+
+    #[test]
+    fn merge_memory_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_memory_config(&mut config, &json!({ "memoryCharLimit": 99 })).unwrap_err();
+        assert!(err.contains("memory.memory_char_limit"));
+        let err = merge_hermes_memory_config(&mut config, &json!({ "userCharLimit": 200001 }))
+            .unwrap_err();
+        assert!(err.contains("memory.user_char_limit"));
+        let err =
+            merge_hermes_memory_config(&mut config, &json!({ "nudgeInterval": -1 })).unwrap_err();
+        assert!(err.contains("memory.nudge_interval"));
+        let err =
+            merge_hermes_memory_config(&mut config, &json!({ "nudgeInterval": 1001 })).unwrap_err();
+        assert!(err.contains("memory.nudge_interval"));
+        let err =
+            merge_hermes_memory_config(&mut config, &json!({ "flushMinTurns": -1 })).unwrap_err();
+        assert!(err.contains("memory.flush_min_turns"));
+        let err =
+            merge_hermes_memory_config(&mut config, &json!({ "flushMinTurns": 1001 })).unwrap_err();
+        assert!(err.contains("memory.flush_min_turns"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_skills_config_tests {
+    use super::{build_hermes_skills_config_values, merge_hermes_skills_config};
+    use serde_json::json;
+
+    #[test]
+    fn skills_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_skills_config_values(&config);
+        assert_eq!(values["creationNudgeInterval"], 15);
+        assert_eq!(values["externalDirs"], "");
+        assert_eq!(values["templateVars"], true);
+        assert_eq!(values["inlineShell"], false);
+        assert_eq!(values["inlineShellTimeout"], 10);
+        assert_eq!(values["guardAgentCreated"], false);
+    }
+
+    #[test]
+    fn skills_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+skills:
+  creation_nudge_interval: 30
+  external_dirs:
+    - ~/.agents/skills
+    - /home/shared/team-skills
+  template_vars: false
+  inline_shell: true
+  inline_shell_timeout: 25
+  guard_agent_created: true
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_skills_config_values(&config);
+        assert_eq!(values["creationNudgeInterval"], 30);
+        assert_eq!(
+            values["externalDirs"],
+            "~/.agents/skills\n/home/shared/team-skills"
+        );
+        assert_eq!(values["templateVars"], false);
+        assert_eq!(values["inlineShell"], true);
+        assert_eq!(values["inlineShellTimeout"], 25);
+        assert_eq!(values["guardAgentCreated"], true);
+    }
+
+    #[test]
+    fn merge_skills_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+skills:
+  creation_nudge_interval: 15
+  disabled:
+    - legacy-skill
+  custom_flag: keep-skills
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_skills_config(
+            &mut config,
+            &json!({
+                "creationNudgeInterval": "0",
+                "externalDirs": " ~/.agents/skills \n\n /home/shared/team-skills ",
+                "templateVars": false,
+                "inlineShell": true,
+                "inlineShellTimeout": "30",
+                "guardAgentCreated": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["skills"]["creation_nudge_interval"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            config["skills"]["external_dirs"][0].as_str(),
+            Some("~/.agents/skills")
+        );
+        assert_eq!(
+            config["skills"]["external_dirs"][1].as_str(),
+            Some("/home/shared/team-skills")
+        );
+        assert_eq!(config["skills"]["template_vars"].as_bool(), Some(false));
+        assert_eq!(config["skills"]["inline_shell"].as_bool(), Some(true));
+        assert_eq!(config["skills"]["inline_shell_timeout"].as_i64(), Some(30));
+        assert_eq!(
+            config["skills"]["guard_agent_created"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["skills"]["disabled"][0].as_str(),
+            Some("legacy-skill")
+        );
+        assert_eq!(
+            config["skills"]["custom_flag"].as_str(),
+            Some("keep-skills")
+        );
+    }
+
+    #[test]
+    fn merge_skills_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_skills_config(&mut config, &json!({ "creationNudgeInterval": -1 }))
+            .unwrap_err();
+        assert!(err.contains("skills.creation_nudge_interval"));
+        let err =
+            merge_hermes_skills_config(&mut config, &json!({ "creationNudgeInterval": 10001 }))
+                .unwrap_err();
+        assert!(err.contains("skills.creation_nudge_interval"));
+        let err = merge_hermes_skills_config(&mut config, &json!({ "inlineShellTimeout": 0 }))
+            .unwrap_err();
+        assert!(err.contains("skills.inline_shell_timeout"));
+        let err = merge_hermes_skills_config(&mut config, &json!({ "inlineShellTimeout": 86401 }))
+            .unwrap_err();
+        assert!(err.contains("skills.inline_shell_timeout"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_curator_config_tests {
+    use super::{build_hermes_curator_config_values, merge_hermes_curator_config};
+    use serde_json::json;
+
+    #[test]
+    fn curator_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_curator_config_values(&config);
+        assert_eq!(values["curatorEnabled"], true);
+        assert_eq!(values["curatorIntervalHours"], 168);
+        assert_eq!(values["curatorMinIdleHours"], 2);
+        assert_eq!(values["curatorStaleAfterDays"], 30);
+        assert_eq!(values["curatorArchiveAfterDays"], 90);
+        assert_eq!(values["curatorBackupEnabled"], true);
+        assert_eq!(values["curatorBackupKeep"], 5);
+    }
+
+    #[test]
+    fn curator_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+curator:
+  enabled: false
+  interval_hours: 24
+  min_idle_hours: 6
+  stale_after_days: 14
+  archive_after_days: 45
+  backup:
+    enabled: false
+    keep: 9
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_curator_config_values(&config);
+        assert_eq!(values["curatorEnabled"], false);
+        assert_eq!(values["curatorIntervalHours"], 24);
+        assert_eq!(values["curatorMinIdleHours"], 6);
+        assert_eq!(values["curatorStaleAfterDays"], 14);
+        assert_eq!(values["curatorArchiveAfterDays"], 45);
+        assert_eq!(values["curatorBackupEnabled"], false);
+        assert_eq!(values["curatorBackupKeep"], 9);
+    }
+
+    #[test]
+    fn merge_curator_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+curator:
+  enabled: true
+  backup:
+    enabled: true
+    custom_flag: keep-backup
+  custom_flag: keep-curator
+skills:
+  external_dirs:
+    - ~/.agents/skills
+model:
+  provider: anthropic
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_curator_config(
+            &mut config,
+            &json!({
+                "curatorEnabled": false,
+                "curatorIntervalHours": "48",
+                "curatorMinIdleHours": "4",
+                "curatorStaleAfterDays": "21",
+                "curatorArchiveAfterDays": "60",
+                "curatorBackupEnabled": false,
+                "curatorBackupKeep": "3",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["skills"]["external_dirs"][0].as_str(),
+            Some("~/.agents/skills")
+        );
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["curator"]["enabled"].as_bool(), Some(false));
+        assert_eq!(config["curator"]["interval_hours"].as_i64(), Some(48));
+        assert_eq!(config["curator"]["min_idle_hours"].as_i64(), Some(4));
+        assert_eq!(config["curator"]["stale_after_days"].as_i64(), Some(21));
+        assert_eq!(config["curator"]["archive_after_days"].as_i64(), Some(60));
+        assert_eq!(
+            config["curator"]["backup"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(config["curator"]["backup"]["keep"].as_i64(), Some(3));
+        assert_eq!(
+            config["curator"]["backup"]["custom_flag"].as_str(),
+            Some("keep-backup")
+        );
+        assert_eq!(
+            config["curator"]["custom_flag"].as_str(),
+            Some("keep-curator")
+        );
+    }
+
+    #[test]
+    fn merge_curator_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_curator_config(&mut config, &json!({ "curatorIntervalHours": 0 }))
+            .unwrap_err();
+        assert!(err.contains("curator.interval_hours"));
+        let err = merge_hermes_curator_config(&mut config, &json!({ "curatorMinIdleHours": -1 }))
+            .unwrap_err();
+        assert!(err.contains("curator.min_idle_hours"));
+        let err = merge_hermes_curator_config(&mut config, &json!({ "curatorBackupKeep": 1001 }))
+            .unwrap_err();
+        assert!(err.contains("curator.backup.keep"));
+        let err = merge_hermes_curator_config(
+            &mut config,
+            &json!({
+                "curatorStaleAfterDays": 90,
+                "curatorArchiveAfterDays": 30,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("curator.archive_after_days"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_quick_commands_config_tests {
+    use super::{build_hermes_quick_commands_config_values, merge_hermes_quick_commands_config};
+    use serde_json::json;
+
+    #[test]
+    fn quick_commands_values_have_empty_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_quick_commands_config_values(&config);
+        assert_eq!(values["quickCommandsJson"], "{}");
+    }
+
+    #[test]
+    fn quick_commands_values_read_yaml_mapping() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+quick_commands:
+  status:
+    type: exec
+    command: systemctl status hermes-agent
+  restart:
+    type: alias
+    target: /gateway restart
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_quick_commands_config_values(&config);
+        let parsed: serde_json::Value =
+            serde_json::from_str(values["quickCommandsJson"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["status"]["command"], "systemctl status hermes-agent");
+        assert_eq!(parsed["restart"]["target"], "/gateway restart");
+    }
+
+    #[test]
+    fn merge_quick_commands_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+quick_commands:
+  old:
+    type: exec
+    command: uptime
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_quick_commands_config(
+            &mut config,
+            &json!({
+                "quickCommandsJson": r#"{
+                  "status": { "type": "exec", "command": "systemctl status hermes-agent", "timeout": 10 },
+                  "restart": { "type": "alias", "target": "/gateway restart" }
+                }"#,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["quick_commands"]["status"]["command"].as_str(),
+            Some("systemctl status hermes-agent")
+        );
+        assert_eq!(
+            config["quick_commands"]["status"]["timeout"].as_i64(),
+            Some(10)
+        );
+        assert_eq!(
+            config["quick_commands"]["restart"]["target"].as_str(),
+            Some("/gateway restart")
+        );
+        assert!(config["quick_commands"]["old"].is_null());
+    }
+
+    #[test]
+    fn merge_quick_commands_config_removes_empty_mapping() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+quick_commands:
+  status:
+    type: exec
+    command: uptime
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_quick_commands_config(&mut config, &json!({ "quickCommandsJson": "{}" }))
+            .unwrap();
+
+        assert!(config["quick_commands"].is_null());
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_quick_commands_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_quick_commands_config(&mut config, &json!({ "quickCommandsJson": "[" }))
+                .unwrap_err();
+        assert!(err.contains("quick_commands"));
+        let err =
+            merge_hermes_quick_commands_config(&mut config, &json!({ "quickCommandsJson": "[]" }))
+                .unwrap_err();
+        assert!(err.contains("quick_commands"));
+        let err = merge_hermes_quick_commands_config(
+            &mut config,
+            &json!({ "quickCommandsJson": r#"{ "bad": "uptime" }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("quick_commands.bad"));
+        let err = merge_hermes_quick_commands_config(
+            &mut config,
+            &json!({ "quickCommandsJson": r#"{ "status": { "type": "exec", "command": "" } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("quick_commands.status.command"));
+        let err = merge_hermes_quick_commands_config(
+            &mut config,
+            &json!({ "quickCommandsJson": r#"{ "restart": { "type": "alias", "target": "gateway restart" } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("quick_commands.restart.target"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_model_config_tests {
+    use super::{build_hermes_model_config_values, merge_hermes_model_config};
+    use serde_json::json;
+
+    #[test]
+    fn model_values_have_defaults_and_read_legacy_model_key() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_model_config_values(&config);
+        assert_eq!(values["modelDefault"], "");
+        assert_eq!(values["modelProvider"], "auto");
+        assert_eq!(values["modelBaseUrl"], "");
+        assert_eq!(values["modelContextLength"], "");
+        assert_eq!(values["modelMaxTokens"], "");
+
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  model: anthropic/claude-sonnet-4-6
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  context_length: 131072
+  max_tokens: 8192
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_model_config_values(&config);
+        assert_eq!(values["modelDefault"], "anthropic/claude-sonnet-4-6");
+        assert_eq!(values["modelProvider"], "openrouter");
+        assert_eq!(values["modelBaseUrl"], "https://openrouter.ai/api/v1");
+        assert_eq!(values["modelContextLength"], "131072");
+        assert_eq!(values["modelMaxTokens"], "8192");
+    }
+
+    #[test]
+    fn merge_model_preserves_unknown_fields_and_writes_base_url() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  default: old-model
+  provider: auto
+  base_url: https://old.example/v1
+  auth_mode: env
+  context_length: 200000
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_config(
+            &mut config,
+            &json!({
+                "modelDefault": "anthropic/claude-opus-4.6",
+                "modelProvider": "openrouter",
+                "modelBaseUrl": "https://openrouter.ai/api/v1",
+                "modelContextLength": "262144",
+                "modelMaxTokens": "16384",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["model"]["default"].as_str(),
+            Some("anthropic/claude-opus-4.6")
+        );
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(
+            config["model"]["base_url"].as_str(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(config["model"]["context_length"].as_i64(), Some(262144));
+        assert_eq!(config["model"]["max_tokens"].as_i64(), Some(16384));
+        assert_eq!(config["model"]["auth_mode"].as_str(), Some("env"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_model_empty_base_url_removes_field_and_legacy_model_key() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  model: old-model
+  provider: custom
+  base_url: https://old.example/v1
+  max_tokens: 8192
+display:
+  language: zh
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_config(
+            &mut config,
+            &json!({
+                "modelDefault": "google/gemini-3-flash-preview",
+                "modelProvider": "auto",
+                "modelBaseUrl": "  ",
+                "modelContextLength": "",
+                "modelMaxTokens": " ",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["model"]["default"].as_str(),
+            Some("google/gemini-3-flash-preview")
+        );
+        assert_eq!(config["model"]["provider"].as_str(), Some("auto"));
+        assert!(config["model"]["base_url"].is_null());
+        assert!(config["model"]["model"].is_null());
+        assert!(config["model"]["context_length"].is_null());
+        assert!(config["model"]["max_tokens"].is_null());
+        assert_eq!(config["display"]["language"].as_str(), Some("zh"));
+    }
+
+    #[test]
+    fn merge_model_rejects_empty_model() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_model_config(
+            &mut config,
+            &json!({
+                "modelDefault": " ",
+                "modelProvider": "auto",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model.default"));
+    }
+
+    #[test]
+    fn merge_model_rejects_non_string_form_values() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  default: gpt-5
+  provider: auto
+"#,
+        )
+        .unwrap();
+        let err = merge_hermes_model_config(
+            &mut config,
+            &json!({
+                "modelDefault": "gpt-5",
+                "modelProvider": 123,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model.provider"));
+
+        let err = merge_hermes_model_config(
+            &mut config,
+            &json!({
+                "modelDefault": "gpt-5",
+                "modelProvider": "auto",
+                "modelBaseUrl": 123,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model.base_url"));
+
+        let err = merge_hermes_model_config(
+            &mut config,
+            &json!({
+                "modelDefault": "gpt-5",
+                "modelProvider": "auto",
+                "modelContextLength": "0",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model.context_length"));
+
+        let err = merge_hermes_model_config(
+            &mut config,
+            &json!({
+                "modelDefault": "gpt-5",
+                "modelProvider": "auto",
+                "modelMaxTokens": "1.5",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model.max_tokens"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_model_aliases_config_tests {
+    use super::{build_hermes_model_aliases_config_values, merge_hermes_model_aliases_config};
+    use serde_json::json;
+
+    #[test]
+    fn model_aliases_values_have_empty_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_model_aliases_config_values(&config);
+        assert_eq!(values["modelAliasesJson"], "{}");
+    }
+
+    #[test]
+    fn model_aliases_values_read_yaml_mapping() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_aliases:
+  opus:
+    model: claude-opus-4-6
+    provider: anthropic
+  qwen:
+    model: "qwen3.5:397b"
+    provider: custom
+    base_url: https://ollama.com/v1
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_model_aliases_config_values(&config);
+        let parsed: serde_json::Value =
+            serde_json::from_str(values["modelAliasesJson"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["opus"]["model"], "claude-opus-4-6");
+        assert_eq!(parsed["opus"]["provider"], "anthropic");
+        assert_eq!(parsed["qwen"]["model"], "qwen3.5:397b");
+        assert_eq!(parsed["qwen"]["base_url"], "https://ollama.com/v1");
+    }
+
+    #[test]
+    fn merge_model_aliases_config_preserves_unknown_fields_and_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+model_aliases:
+  opus:
+    model: old-opus
+    provider: anthropic
+    custom_flag: drop-with-replace
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_aliases_config(
+            &mut config,
+            &json!({
+                "modelAliasesJson": r#"{
+                  "opus": {
+                    "model": "claude-opus-4-6",
+                    "provider": "anthropic",
+                    "custom_flag": "keep-alias"
+                  },
+                  "qwen": {
+                    "model": "qwen3.5:397b",
+                    "provider": "custom",
+                    "base_url": "https://ollama.com/v1"
+                  }
+                }"#,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["model_aliases"]["opus"]["model"].as_str(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(
+            config["model_aliases"]["opus"]["custom_flag"].as_str(),
+            Some("keep-alias")
+        );
+        assert_eq!(
+            config["model_aliases"]["qwen"]["provider"].as_str(),
+            Some("custom")
+        );
+        assert_eq!(
+            config["model_aliases"]["qwen"]["base_url"].as_str(),
+            Some("https://ollama.com/v1")
+        );
+    }
+
+    #[test]
+    fn merge_model_aliases_config_removes_empty_mapping() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_aliases:
+  opus:
+    model: claude-opus-4-6
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_model_aliases_config(&mut config, &json!({ "modelAliasesJson": "{}" }))
+            .unwrap();
+
+        assert!(config["model_aliases"].is_null());
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_model_aliases_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_model_aliases_config(&mut config, &json!({ "modelAliasesJson": "[" }))
+                .unwrap_err();
+        assert!(err.contains("model_aliases JSON"));
+        let err =
+            merge_hermes_model_aliases_config(&mut config, &json!({ "modelAliasesJson": "[]" }))
+                .unwrap_err();
+        assert!(err.contains("model_aliases"));
+        let err = merge_hermes_model_aliases_config(
+            &mut config,
+            &json!({ "modelAliasesJson": r#"{ "bad alias": { "model": "m", "provider": "p" } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_aliases.bad alias"));
+        let err = merge_hermes_model_aliases_config(
+            &mut config,
+            &json!({ "modelAliasesJson": r#"{ "opus": "claude-opus-4-6" }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_aliases.opus"));
+        let err = merge_hermes_model_aliases_config(
+            &mut config,
+            &json!({ "modelAliasesJson": r#"{ "opus": { "provider": "anthropic" } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_aliases.opus.model"));
+        let err = merge_hermes_model_aliases_config(
+            &mut config,
+            &json!({ "modelAliasesJson": r#"{ "opus": { "model": "claude-opus-4-6", "provider": 123 } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_aliases.opus.provider"));
+        let err = merge_hermes_model_aliases_config(
+            &mut config,
+            &json!({ "modelAliasesJson": r#"{ "qwen": { "model": "qwen3.5:397b", "base_url": 123 } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("model_aliases.qwen.base_url"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_hooks_config_tests {
+    use super::{build_hermes_hooks_config_values, merge_hermes_hooks_config};
+    use serde_json::json;
+
+    #[test]
+    fn hooks_values_have_safe_defaults() {
+        let config = serde_yaml::Value::Mapping(Default::default());
+        let values = build_hermes_hooks_config_values(&config);
+
+        assert_eq!(values["hooksAutoAccept"], false);
+        assert_eq!(values["hooksJson"], "{}");
+    }
+
+    #[test]
+    fn hooks_values_read_yaml_mapping() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+hooks_auto_accept: true
+hooks:
+  pre_tool_call:
+    - matcher: terminal
+      command: ~/.hermes/agent-hooks/block-rm-rf.sh
+      timeout: 10
+  pre_llm_call:
+    - command: ~/.hermes/agent-hooks/inject-cwd-context.sh
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_hooks_config_values(&config);
+        let hooks: serde_json::Value =
+            serde_json::from_str(values["hooksJson"].as_str().unwrap()).unwrap();
+
+        assert_eq!(values["hooksAutoAccept"], true);
+        assert_eq!(hooks["pre_tool_call"][0]["matcher"], "terminal");
+        assert_eq!(
+            hooks["pre_tool_call"][0]["command"],
+            "~/.hermes/agent-hooks/block-rm-rf.sh"
+        );
+        assert_eq!(hooks["pre_tool_call"][0]["timeout"], 10);
+        assert_eq!(
+            hooks["pre_llm_call"][0]["command"],
+            "~/.hermes/agent-hooks/inject-cwd-context.sh"
+        );
+    }
+
+    #[test]
+    fn merge_hooks_config_preserves_unknown_fields_and_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+hooks:
+  pre_tool_call:
+    - matcher: terminal
+      command: old-hook.sh
+      extra_flag: keep-old
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_hooks_config(
+            &mut config,
+            &json!({
+                "hooksAutoAccept": "true",
+                "hooksJson": serde_json::to_string(&json!({
+                    "pre_tool_call": [{
+                        "matcher": "terminal",
+                        "command": "~/.hermes/agent-hooks/block-rm-rf.sh",
+                        "timeout": 10,
+                        "extra_flag": "keep-hook"
+                    }],
+                    "post_tool_call": [{
+                        "matcher": "write_file|patch",
+                        "command": "~/.hermes/agent-hooks/auto-format.sh"
+                    }]
+                })).unwrap(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(config["hooks_auto_accept"].as_bool(), Some(true));
+        assert_eq!(
+            config["hooks"]["pre_tool_call"][0]["command"].as_str(),
+            Some("~/.hermes/agent-hooks/block-rm-rf.sh")
+        );
+        assert_eq!(
+            config["hooks"]["pre_tool_call"][0]["timeout"].as_i64(),
+            Some(10)
+        );
+        assert_eq!(
+            config["hooks"]["pre_tool_call"][0]["extra_flag"].as_str(),
+            Some("keep-hook")
+        );
+        assert_eq!(
+            config["hooks"]["post_tool_call"][0]["matcher"].as_str(),
+            Some("write_file|patch")
+        );
+    }
+
+    #[test]
+    fn merge_hooks_config_removes_empty_mapping_but_keeps_auto_accept() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+hooks_auto_accept: true
+hooks:
+  pre_tool_call:
+    - command: old-hook.sh
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_hooks_config(
+            &mut config,
+            &json!({ "hooksAutoAccept": false, "hooksJson": "{}" }),
+        )
+        .unwrap();
+
+        assert!(config["hooks"].is_null());
+        assert_eq!(config["hooks_auto_accept"].as_bool(), Some(false));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_hooks_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(Default::default());
+        let err = merge_hermes_hooks_config(&mut config, &json!({ "hooksJson": "[" })).unwrap_err();
+        assert!(err.contains("hooks JSON"));
+
+        let err = merge_hermes_hooks_config(
+            &mut config,
+            &json!({ "hooksJson": serde_json::to_string(&json!({ "bad_event": [{ "command": "hook.sh" }] })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("hooks.bad_event"));
+
+        let err = merge_hermes_hooks_config(
+            &mut config,
+            &json!({ "hooksJson": serde_json::to_string(&json!({ "pre_tool_call": { "command": "hook.sh" } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("hooks.pre_tool_call"));
+
+        let err = merge_hermes_hooks_config(
+            &mut config,
+            &json!({ "hooksJson": serde_json::to_string(&json!({ "pre_tool_call": ["hook.sh"] })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("hooks.pre_tool_call.0"));
+
+        let err = merge_hermes_hooks_config(
+            &mut config,
+            &json!({ "hooksJson": serde_json::to_string(&json!({ "pre_tool_call": [{ "command": "" }] })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("hooks.pre_tool_call.0.command"));
+
+        let err = merge_hermes_hooks_config(
+            &mut config,
+            &json!({ "hooksJson": serde_json::to_string(&json!({ "pre_tool_call": [{ "command": "hook.sh", "timeout": 0 }] })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("hooks.pre_tool_call.0.timeout"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_mcp_servers_config_tests {
+    use super::{build_hermes_mcp_servers_config_values, merge_hermes_mcp_servers_config};
+    use serde_json::json;
+
+    #[test]
+    fn mcp_servers_values_have_empty_defaults() {
+        let config = serde_yaml::Value::Mapping(Default::default());
+        let values = build_hermes_mcp_servers_config_values(&config);
+
+        assert_eq!(values["mcpServersJson"], "{}");
+    }
+
+    #[test]
+    fn mcp_servers_values_read_yaml_mapping() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+mcp_servers:
+  time:
+    command: uvx
+    args:
+      - mcp-server-time
+  notion:
+    url: https://mcp.notion.com/mcp
+    connect_timeout: 30
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_mcp_servers_config_values(&config);
+        let mapping: serde_json::Value =
+            serde_json::from_str(values["mcpServersJson"].as_str().unwrap()).unwrap();
+
+        assert_eq!(mapping["time"]["command"], "uvx");
+        assert_eq!(mapping["time"]["args"][0], "mcp-server-time");
+        assert_eq!(mapping["notion"]["url"], "https://mcp.notion.com/mcp");
+        assert_eq!(mapping["notion"]["connect_timeout"], 30);
+    }
+
+    #[test]
+    fn merge_mcp_servers_config_preserves_unknown_fields_and_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+mcp_servers:
+  time:
+    command: uvx
+    args:
+      - old-server
+    sampling:
+      enabled: true
+      model: gemini-3-flash
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({
+                "mcpServersJson": serde_json::to_string(&json!({
+                    "time": {
+                        "command": "uvx",
+                        "args": ["mcp-server-time"],
+                        "timeout": 120,
+                        "sampling": {
+                            "enabled": true,
+                            "model": "gemini-3-flash",
+                            "max_tokens_cap": 4096,
+                            "timeout": 30,
+                            "max_rpm": 10,
+                            "allowed_models": ["gemini-3-flash", "gpt-5-mini"],
+                            "max_tool_rounds": 5,
+                            "log_level": "info",
+                            "custom_flag": "keep-sampling"
+                        }
+                    },
+                    "notion": {
+                        "url": "https://mcp.notion.com/mcp",
+                        "headers": {
+                            "Authorization": "Bearer token"
+                        },
+                        "connect_timeout": 30
+                    }
+                })).unwrap(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["mcp_servers"]["time"]["command"].as_str(),
+            Some("uvx")
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["args"][0].as_str(),
+            Some("mcp-server-time")
+        );
+        assert_eq!(config["mcp_servers"]["time"]["timeout"].as_i64(), Some(120));
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["model"].as_str(),
+            Some("gemini-3-flash")
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["max_tokens_cap"].as_i64(),
+            Some(4096)
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["timeout"].as_i64(),
+            Some(30)
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["max_rpm"].as_i64(),
+            Some(10)
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["allowed_models"][1].as_str(),
+            Some("gpt-5-mini")
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["max_tool_rounds"].as_i64(),
+            Some(5)
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["log_level"].as_str(),
+            Some("info")
+        );
+        assert_eq!(
+            config["mcp_servers"]["time"]["sampling"]["custom_flag"].as_str(),
+            Some("keep-sampling")
+        );
+        assert_eq!(
+            config["mcp_servers"]["notion"]["headers"]["Authorization"].as_str(),
+            Some("Bearer token")
+        );
+        assert_eq!(
+            config["mcp_servers"]["notion"]["connect_timeout"].as_i64(),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn merge_mcp_servers_config_removes_empty_mapping() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+mcp_servers:
+  time:
+    command: uvx
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_mcp_servers_config(&mut config, &json!({ "mcpServersJson": "{}" })).unwrap();
+
+        assert!(config["mcp_servers"].is_null());
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_mcp_servers_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(Default::default());
+        let err = merge_hermes_mcp_servers_config(&mut config, &json!({ "mcpServersJson": "[" }))
+            .unwrap_err();
+        assert!(err.contains("mcp_servers JSON"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "bad server": { "command": "uvx" } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.bad server"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": "uvx" })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "" } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.command"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "notion": { "url": "ftp://example.com/mcp" } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.notion.url"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "uvx", "args": "mcp-server-time" } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.args"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "uvx", "timeout": 0 } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.timeout"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "uvx", "sampling": [] } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.sampling"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "uvx", "sampling": { "enabled": "yes" } } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.sampling.enabled"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "uvx", "sampling": { "allowed_models": "gpt-5" } } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.sampling.allowed_models"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "uvx", "sampling": { "max_tool_rounds": -1 } } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.sampling.max_tool_rounds"));
+
+        let err = merge_hermes_mcp_servers_config(
+            &mut config,
+            &json!({ "mcpServersJson": serde_json::to_string(&json!({ "time": { "command": "uvx", "sampling": { "log_level": "trace" } } })).unwrap() }),
+        )
+        .unwrap_err();
+        assert!(err.contains("mcp_servers.time.sampling.log_level"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_provider_overrides_config_tests {
+    use super::{
+        build_hermes_provider_overrides_config_values, merge_hermes_provider_overrides_config,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn provider_overrides_values_have_empty_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_provider_overrides_config_values(&config);
+        assert_eq!(values["providerOverridesJson"], "{}");
+    }
+
+    #[test]
+    fn provider_overrides_values_read_yaml_mapping() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+providers:
+  ollama-local:
+    request_timeout_seconds: 300
+    stale_timeout_seconds: 900
+  anthropic:
+    request_timeout_seconds: 30
+    models:
+      claude-opus-4.6:
+        timeout_seconds: 600
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_provider_overrides_config_values(&config);
+        let mapping: serde_json::Value =
+            serde_json::from_str(values["providerOverridesJson"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            mapping["ollama-local"]["request_timeout_seconds"].as_i64(),
+            Some(300)
+        );
+        assert_eq!(
+            mapping["ollama-local"]["stale_timeout_seconds"].as_i64(),
+            Some(900)
+        );
+        assert_eq!(
+            mapping["anthropic"]["models"]["claude-opus-4.6"]["timeout_seconds"].as_i64(),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn merge_provider_overrides_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: openrouter
+providers:
+  anthropic:
+    request_timeout_seconds: 30
+    custom_flag: keep-provider
+    models:
+      claude-opus-4.6:
+        timeout_seconds: 600
+        custom_flag: keep-model
+openrouter:
+  response_cache: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_provider_overrides_config(
+            &mut config,
+            &json!({
+                "providerOverridesJson": r#"{
+                  "anthropic": {
+                    "request_timeout_seconds": 45,
+                    "stale_timeout_seconds": 300,
+                    "custom_flag": "keep-provider",
+                    "models": {
+                      "claude-opus-4.6": {
+                        "timeout_seconds": 900,
+                        "stale_timeout_seconds": 1200,
+                        "custom_flag": "keep-model"
+                      }
+                    }
+                  },
+                  "openai-codex": {
+                    "models": {
+                      "gpt-5.4": {
+                        "stale_timeout_seconds": 1800
+                      }
+                    }
+                  }
+                }"#,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["openrouter"]["response_cache"].as_bool(), Some(true));
+        assert_eq!(
+            config["providers"]["anthropic"]["request_timeout_seconds"].as_i64(),
+            Some(45)
+        );
+        assert_eq!(
+            config["providers"]["anthropic"]["stale_timeout_seconds"].as_i64(),
+            Some(300)
+        );
+        assert_eq!(
+            config["providers"]["anthropic"]["custom_flag"].as_str(),
+            Some("keep-provider")
+        );
+        assert_eq!(
+            config["providers"]["anthropic"]["models"]["claude-opus-4.6"]["timeout_seconds"]
+                .as_i64(),
+            Some(900)
+        );
+        assert_eq!(
+            config["providers"]["anthropic"]["models"]["claude-opus-4.6"]["stale_timeout_seconds"]
+                .as_i64(),
+            Some(1200)
+        );
+        assert_eq!(
+            config["providers"]["anthropic"]["models"]["claude-opus-4.6"]["custom_flag"].as_str(),
+            Some("keep-model")
+        );
+        assert_eq!(
+            config["providers"]["openai-codex"]["models"]["gpt-5.4"]["stale_timeout_seconds"]
+                .as_i64(),
+            Some(1800)
+        );
+    }
+
+    #[test]
+    fn merge_provider_overrides_config_removes_empty_mapping() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+providers:
+  anthropic:
+    request_timeout_seconds: 30
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_provider_overrides_config(
+            &mut config,
+            &json!({ "providerOverridesJson": "{}" }),
+        )
+        .unwrap();
+
+        assert!(config["providers"].is_null());
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_provider_overrides_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_provider_overrides_config(
+            &mut config,
+            &json!({ "providerOverridesJson": "[" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("providers JSON"));
+        let err = merge_hermes_provider_overrides_config(
+            &mut config,
+            &json!({ "providerOverridesJson": r#"{ "bad provider": { "request_timeout_seconds": 30 } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("providers.bad provider"));
+        let err = merge_hermes_provider_overrides_config(
+            &mut config,
+            &json!({ "providerOverridesJson": r#"{ "anthropic": { "request_timeout_seconds": 0 } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("providers.anthropic.request_timeout_seconds"));
+        let err = merge_hermes_provider_overrides_config(
+            &mut config,
+            &json!({ "providerOverridesJson": r#"{ "anthropic": { "models": { "../secret": { "timeout_seconds": 30 } } } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("providers.anthropic.models.../secret"));
+        let err = merge_hermes_provider_overrides_config(
+            &mut config,
+            &json!({ "providerOverridesJson": r#"{ "anthropic": { "models": { "opus": { "timeout_seconds": "slow" } } } }"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("providers.anthropic.models.opus.timeout_seconds"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_agent_toolsets_config_tests {
+    use super::{build_hermes_agent_toolsets_config_values, merge_hermes_agent_toolsets_config};
+    use serde_json::json;
+
+    #[test]
+    fn agent_toolsets_values_have_empty_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_agent_toolsets_config_values(&config);
+        assert_eq!(values["disabledToolsets"], "");
+    }
+
+    #[test]
+    fn agent_toolsets_values_read_yaml_sequence() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+agent:
+  disabled_toolsets:
+    - memory
+    - web
+    - browser
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_agent_toolsets_config_values(&config);
+        assert_eq!(values["disabledToolsets"], "memory\nweb\nbrowser");
+    }
+
+    #[test]
+    fn merge_agent_toolsets_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+agent:
+  disabled_toolsets:
+    - memory
+  max_turns: 80
+  custom_flag: keep-agent
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_agent_toolsets_config(
+            &mut config,
+            &json!({
+                "disabledToolsets": " terminal \n browser \n\n memory\nbrowser ",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["agent"]["disabled_toolsets"][0].as_str(),
+            Some("terminal")
+        );
+        assert_eq!(
+            config["agent"]["disabled_toolsets"][1].as_str(),
+            Some("browser")
+        );
+        assert_eq!(
+            config["agent"]["disabled_toolsets"][2].as_str(),
+            Some("memory")
+        );
+        assert_eq!(config["agent"]["max_turns"].as_i64(), Some(80));
+        assert_eq!(config["agent"]["custom_flag"].as_str(), Some("keep-agent"));
+    }
+
+    #[test]
+    fn merge_agent_toolsets_config_writes_empty_sequence() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+agent:
+  disabled_toolsets:
+    - memory
+  custom_flag: keep-agent
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_agent_toolsets_config(&mut config, &json!({ "disabledToolsets": "  \n " }))
+            .unwrap();
+
+        assert!(config["agent"]["disabled_toolsets"]
+            .as_sequence()
+            .unwrap()
+            .is_empty());
+        assert_eq!(config["agent"]["custom_flag"].as_str(), Some("keep-agent"));
+    }
+
+    #[test]
+    fn merge_agent_toolsets_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_agent_toolsets_config(
+            &mut config,
+            &json!({ "disabledToolsets": "bad tool" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("agent.disabled_toolsets"));
+        let err = merge_hermes_agent_toolsets_config(
+            &mut config,
+            &json!({ "disabledToolsets": "../secret" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("agent.disabled_toolsets"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_platform_toolsets_config_tests {
+    use super::{
+        build_hermes_platform_toolsets_config_values, merge_hermes_platform_toolsets_config,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn platform_toolsets_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_platform_toolsets_config_values(&config);
+        let mapping: serde_json::Value =
+            serde_json::from_str(values["platformToolsetsJson"].as_str().unwrap()).unwrap();
+
+        assert_eq!(mapping["cli"][0].as_str(), Some("hermes-cli"));
+        assert_eq!(mapping["telegram"][0].as_str(), Some("hermes-telegram"));
+        assert_eq!(mapping["discord"][0].as_str(), Some("hermes-discord"));
+        assert_eq!(mapping["whatsapp"][0].as_str(), Some("hermes-whatsapp"));
+        assert_eq!(
+            mapping["google_chat"][0].as_str(),
+            Some("hermes-google_chat")
+        );
+    }
+
+    #[test]
+    fn platform_toolsets_values_read_yaml_mapping() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+platform_toolsets:
+  cli:
+    - web
+    - terminal
+    - file
+  telegram:
+    - hermes-telegram
+  custom_platform:
+    - safe
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_platform_toolsets_config_values(&config);
+        let mapping: serde_json::Value =
+            serde_json::from_str(values["platformToolsetsJson"].as_str().unwrap()).unwrap();
+
+        assert_eq!(mapping["cli"][0].as_str(), Some("web"));
+        assert_eq!(mapping["cli"][1].as_str(), Some("terminal"));
+        assert_eq!(mapping["cli"][2].as_str(), Some("file"));
+        assert_eq!(mapping["telegram"][0].as_str(), Some("hermes-telegram"));
+        assert_eq!(mapping["custom_platform"][0].as_str(), Some("safe"));
+    }
+
+    #[test]
+    fn merge_platform_toolsets_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+platform_toolsets:
+  cli:
+    - hermes-cli
+agent:
+  max_turns: 80
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_platform_toolsets_config(
+            &mut config,
+            &json!({
+                "platformToolsetsJson": serde_json::to_string(&json!({
+                    "cli": ["web", "terminal", "file", "web"],
+                    "telegram": ["hermes-telegram"],
+                    "custom_platform": ["safe"]
+                })).unwrap()
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["agent"]["max_turns"].as_i64(), Some(80));
+        assert_eq!(config["platform_toolsets"]["cli"][0].as_str(), Some("web"));
+        assert_eq!(
+            config["platform_toolsets"]["cli"][1].as_str(),
+            Some("terminal")
+        );
+        assert_eq!(config["platform_toolsets"]["cli"][2].as_str(), Some("file"));
+        assert_eq!(
+            config["platform_toolsets"]["telegram"][0].as_str(),
+            Some("hermes-telegram")
+        );
+        assert_eq!(
+            config["platform_toolsets"]["custom_platform"][0].as_str(),
+            Some("safe")
+        );
+    }
+
+    #[test]
+    fn merge_platform_toolsets_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_platform_toolsets_config(
+            &mut config,
+            &json!({ "platformToolsetsJson": "[" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("platform_toolsets JSON"));
+
+        let err = merge_hermes_platform_toolsets_config(
+            &mut config,
+            &json!({ "platformToolsetsJson": r#"{"bad platform":["web"]}"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("platform_toolsets.bad platform"));
+
+        let err = merge_hermes_platform_toolsets_config(
+            &mut config,
+            &json!({ "platformToolsetsJson": r#"{"cli":["bad tool"]}"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("platform_toolsets.cli"));
+
+        let err = merge_hermes_platform_toolsets_config(
+            &mut config,
+            &json!({ "platformToolsetsJson": r#"{"cli":[]}"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("platform_toolsets.cli"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_agent_runtime_config_tests {
+    use super::{build_hermes_agent_runtime_config_values, merge_hermes_agent_runtime_config};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn agent_runtime_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_agent_runtime_config_values(&config);
+        assert_eq!(values["agentMaxTurns"], 90);
+        assert_eq!(values["gatewayTimeout"], 1800);
+        assert_eq!(values["restartDrainTimeout"], 180);
+        assert_eq!(values["apiMaxRetries"], 3);
+        assert_eq!(values["gatewayTimeoutWarning"], 900);
+        assert_eq!(values["clarifyTimeout"], 600);
+        assert_eq!(values["gatewayNotifyInterval"], 180);
+        assert_eq!(values["gatewayAutoContinueFreshness"], 3600);
+        assert_eq!(values["imageInputMode"], "auto");
+        assert_eq!(values["agentVerbose"], false);
+        assert_eq!(values["reasoningEffort"], "medium");
+        assert_eq!(values["personalitiesJson"], "{}");
+    }
+
+    #[test]
+    fn agent_runtime_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+agent:
+  max_turns: 240
+  gateway_timeout: 7200
+  restart_drain_timeout: 600
+  api_max_retries: 5
+  gateway_timeout_warning: 1200
+  clarify_timeout: 900
+  gateway_notify_interval: 240
+  gateway_auto_continue_freshness: 5400
+  image_input_mode: native
+  verbose: true
+  reasoning_effort: high
+  personalities:
+    concise: Keep answers short.
+    teacher: Explain with examples.
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_agent_runtime_config_values(&config);
+        assert_eq!(values["agentMaxTurns"], 240);
+        assert_eq!(values["gatewayTimeout"], 7200);
+        assert_eq!(values["restartDrainTimeout"], 600);
+        assert_eq!(values["apiMaxRetries"], 5);
+        assert_eq!(values["gatewayTimeoutWarning"], 1200);
+        assert_eq!(values["clarifyTimeout"], 900);
+        assert_eq!(values["gatewayNotifyInterval"], 240);
+        assert_eq!(values["gatewayAutoContinueFreshness"], 5400);
+        assert_eq!(values["imageInputMode"], "native");
+        assert_eq!(values["agentVerbose"], true);
+        assert_eq!(values["reasoningEffort"], "high");
+        let personalities: Value =
+            serde_json::from_str(values["personalitiesJson"].as_str().unwrap()).unwrap();
+        assert_eq!(personalities["concise"], "Keep answers short.");
+        assert_eq!(personalities["teacher"], "Explain with examples.");
+    }
+
+    #[test]
+    fn merge_agent_runtime_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+agent:
+  max_turns: 90
+  disabled_toolsets:
+    - terminal
+  custom_flag: keep-agent
+streaming:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_agent_runtime_config(
+            &mut config,
+            &json!({
+                "agentMaxTurns": "180",
+                "gatewayTimeout": "3600",
+                "restartDrainTimeout": "300",
+                "apiMaxRetries": "2",
+                "gatewayTimeoutWarning": "600",
+                "clarifyTimeout": "300",
+                "gatewayNotifyInterval": "120",
+                "gatewayAutoContinueFreshness": "1800",
+                "imageInputMode": "text",
+                "agentVerbose": true,
+                "reasoningEffort": "low",
+                "personalitiesJson": r#"{"concise":" Keep replies brief. ","ops":"Focus on operational risk."}"#,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["agent"]["max_turns"].as_i64(), Some(180));
+        assert_eq!(config["agent"]["gateway_timeout"].as_i64(), Some(3600));
+        assert_eq!(config["agent"]["restart_drain_timeout"].as_i64(), Some(300));
+        assert_eq!(config["agent"]["api_max_retries"].as_i64(), Some(2));
+        assert_eq!(
+            config["agent"]["gateway_timeout_warning"].as_i64(),
+            Some(600)
+        );
+        assert_eq!(config["agent"]["clarify_timeout"].as_i64(), Some(300));
+        assert_eq!(
+            config["agent"]["gateway_notify_interval"].as_i64(),
+            Some(120)
+        );
+        assert_eq!(
+            config["agent"]["gateway_auto_continue_freshness"].as_i64(),
+            Some(1800)
+        );
+        assert_eq!(config["agent"]["image_input_mode"].as_str(), Some("text"));
+        assert_eq!(config["agent"]["verbose"].as_bool(), Some(true));
+        assert_eq!(config["agent"]["reasoning_effort"].as_str(), Some("low"));
+        assert_eq!(
+            config["agent"]["personalities"]["concise"].as_str(),
+            Some("Keep replies brief.")
+        );
+        assert_eq!(
+            config["agent"]["personalities"]["ops"].as_str(),
+            Some("Focus on operational risk.")
+        );
+        assert_eq!(
+            config["agent"]["disabled_toolsets"][0].as_str(),
+            Some("terminal")
+        );
+        assert_eq!(config["agent"]["custom_flag"].as_str(), Some("keep-agent"));
+    }
+
+    #[test]
+    fn merge_agent_runtime_config_removes_empty_personalities() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+agent:
+  personalities:
+    concise: Keep answers short.
+  custom_flag: keep-agent
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_agent_runtime_config(
+            &mut config,
+            &json!({
+                "personalitiesJson": "{}",
+            }),
+        )
+        .unwrap();
+
+        assert!(config["agent"].get("personalities").is_none());
+        assert_eq!(config["agent"]["custom_flag"].as_str(), Some("keep-agent"));
+    }
+
+    #[test]
+    fn merge_agent_runtime_config_allows_zero_disable_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        merge_hermes_agent_runtime_config(
+            &mut config,
+            &json!({
+                "gatewayTimeout": "0",
+                "restartDrainTimeout": "0",
+                "gatewayTimeoutWarning": "0",
+                "gatewayNotifyInterval": "0",
+                "gatewayAutoContinueFreshness": "0",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["agent"]["gateway_timeout"].as_i64(), Some(0));
+        assert_eq!(config["agent"]["restart_drain_timeout"].as_i64(), Some(0));
+        assert_eq!(config["agent"]["gateway_timeout_warning"].as_i64(), Some(0));
+        assert_eq!(config["agent"]["gateway_notify_interval"].as_i64(), Some(0));
+        assert_eq!(
+            config["agent"]["gateway_auto_continue_freshness"].as_i64(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn merge_agent_runtime_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_agent_runtime_config(&mut config, &json!({ "imageInputMode": "pixel" }))
+                .unwrap_err();
+        assert!(err.contains("agent.image_input_mode"));
+        let err = merge_hermes_agent_runtime_config(&mut config, &json!({ "agentMaxTurns": "0" }))
+            .unwrap_err();
+        assert!(err.contains("agent.max_turns"));
+        let err = merge_hermes_agent_runtime_config(&mut config, &json!({ "apiMaxRetries": "0" }))
+            .unwrap_err();
+        assert!(err.contains("agent.api_max_retries"));
+        let err =
+            merge_hermes_agent_runtime_config(&mut config, &json!({ "clarifyTimeout": "-1" }))
+                .unwrap_err();
+        assert!(err.contains("agent.clarify_timeout"));
+        let err =
+            merge_hermes_agent_runtime_config(&mut config, &json!({ "reasoningEffort": "max" }))
+                .unwrap_err();
+        assert!(err.contains("agent.reasoning_effort"));
+        let err = merge_hermes_agent_runtime_config(
+            &mut config,
+            &json!({ "personalitiesJson": r#"{"bad name":"x"}"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("agent.personalities.bad name"));
+        let err = merge_hermes_agent_runtime_config(
+            &mut config,
+            &json!({ "personalitiesJson": r#"{"concise":123}"# }),
+        )
+        .unwrap_err();
+        assert!(err.contains("agent.personalities.concise"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_unauthorized_dm_config_tests {
+    use super::{build_hermes_unauthorized_dm_config_values, merge_hermes_unauthorized_dm_config};
+    use serde_json::json;
+
+    #[test]
+    fn unauthorized_dm_values_have_pair_default() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_unauthorized_dm_config_values(&config);
+        assert_eq!(values["unauthorizedDmBehavior"], "pair");
+    }
+
+    #[test]
+    fn unauthorized_dm_values_normalize_existing_behavior() {
+        let config: serde_yaml::Value =
+            serde_yaml::from_str("unauthorized_dm_behavior: IGNORE").unwrap();
+        let values = build_hermes_unauthorized_dm_config_values(&config);
+        assert_eq!(values["unauthorizedDmBehavior"], "ignore");
+
+        let config: serde_yaml::Value =
+            serde_yaml::from_str("unauthorized_dm_behavior: silent").unwrap();
+        let values = build_hermes_unauthorized_dm_config_values(&config);
+        assert_eq!(values["unauthorizedDmBehavior"], "pair");
+    }
+
+    #[test]
+    fn merge_unauthorized_dm_config_preserves_unrelated_yaml() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+unauthorized_dm_behavior: pair
+platforms:
+  telegram:
+    enabled: true
+    custom_flag: keep-platform
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_unauthorized_dm_config(
+            &mut config,
+            &json!({ "unauthorizedDmBehavior": "ignore" }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["platforms"]["telegram"]["custom_flag"].as_str(),
+            Some("keep-platform")
+        );
+        assert_eq!(config["unauthorized_dm_behavior"].as_str(), Some("ignore"));
+    }
+
+    #[test]
+    fn merge_unauthorized_dm_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_unauthorized_dm_config(
+            &mut config,
+            &json!({ "unauthorizedDmBehavior": "silent" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("unauthorized_dm_behavior"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_human_delay_config_tests {
+    use super::{build_hermes_human_delay_config_values, merge_hermes_human_delay_config};
+    use serde_json::json;
+
+    #[test]
+    fn human_delay_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_human_delay_config_values(&config);
+        assert_eq!(values["humanDelayMode"], "off");
+        assert_eq!(values["humanDelayMinMs"], 800);
+        assert_eq!(values["humanDelayMaxMs"], 2500);
+    }
+
+    #[test]
+    fn human_delay_values_normalize_existing_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+human_delay:
+  mode: CUSTOM
+  min_ms: 1200
+  max_ms: 3600
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_human_delay_config_values(&config);
+        assert_eq!(values["humanDelayMode"], "custom");
+        assert_eq!(values["humanDelayMinMs"], 1200);
+        assert_eq!(values["humanDelayMaxMs"], 3600);
+    }
+
+    #[test]
+    fn merge_human_delay_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+human_delay:
+  mode: off
+  custom_flag: keep-delay
+streaming:
+  enabled: true
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_human_delay_config(
+            &mut config,
+            &json!({
+                "humanDelayMode": "custom",
+                "humanDelayMinMs": "900",
+                "humanDelayMaxMs": "2400",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["streaming"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["human_delay"]["custom_flag"].as_str(),
+            Some("keep-delay")
+        );
+        assert_eq!(config["human_delay"]["mode"].as_str(), Some("custom"));
+        assert_eq!(config["human_delay"]["min_ms"].as_i64(), Some(900));
+        assert_eq!(config["human_delay"]["max_ms"].as_i64(), Some(2400));
+    }
+
+    #[test]
+    fn merge_human_delay_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_human_delay_config(&mut config, &json!({ "humanDelayMode": "slow" }))
+                .unwrap_err();
+        assert!(err.contains("human_delay.mode"));
+
+        let err = merge_hermes_human_delay_config(
+            &mut config,
+            &json!({
+                "humanDelayMode": "custom",
+                "humanDelayMinMs": 3000,
+                "humanDelayMaxMs": 1000,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("human_delay.max_ms"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_display_config_tests {
+    use super::{build_hermes_display_config_values, merge_hermes_display_config};
+    use serde_json::json;
+
+    #[test]
+    fn display_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_display_config_values(&config);
+        assert_eq!(values["displayToolProgress"], "all");
+        assert_eq!(values["displayCompact"], false);
+        assert_eq!(values["displaySkin"], "default");
+        assert_eq!(values["displayToolPrefix"], "┊");
+        assert_eq!(values["displayShowReasoning"], false);
+        assert_eq!(values["displayToolPreviewLength"], 0);
+        assert_eq!(values["displayCleanupProgress"], false);
+        assert_eq!(values["displayToolProgressCommand"], false);
+        assert_eq!(values["displayInterimAssistantMessages"], true);
+        assert_eq!(values["displayRuntimeFooterEnabled"], false);
+        assert_eq!(
+            values["displayRuntimeFooterFields"],
+            "model\ncontext_pct\ncwd"
+        );
+        assert_eq!(values["displayFileMutationVerifier"], true);
+        assert_eq!(values["displayShowCost"], false);
+        assert_eq!(values["dashboardShowTokenAnalytics"], false);
+        assert_eq!(values["displayLanguage"], "en");
+        assert_eq!(values["displayResumeDisplay"], "full");
+        assert_eq!(values["displayBusyInputMode"], "interrupt");
+        assert_eq!(values["displayBackgroundProcessNotifications"], "all");
+        assert_eq!(values["displayFinalResponseMarkdown"], "strip");
+        assert_eq!(values["displayTimestamps"], false);
+        assert_eq!(values["displayBellOnComplete"], false);
+        assert_eq!(values["displayPersistentOutput"], true);
+        assert_eq!(values["displayPersistentOutputMaxLines"], 200);
+        assert_eq!(values["displayInlineDiffs"], true);
+        assert_eq!(values["displayTuiAutoResumeRecent"], false);
+        assert_eq!(values["displayTuiStatusIndicator"], "kaomoji");
+        assert_eq!(values["displayUserMessagePreviewFirstLines"], 2);
+        assert_eq!(values["displayUserMessagePreviewLastLines"], 2);
+        assert_eq!(values["displayEphemeralSystemTtl"], 0);
+        assert_eq!(values["displayCopyShortcut"], "auto");
+    }
+
+    #[test]
+    fn display_values_normalize_existing_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+display:
+  tool_progress: VERBOSE
+  compact: true
+  skin: MONO
+  tool_prefix: "╎"
+  show_reasoning: true
+  tool_preview_length: 80
+  cleanup_progress: true
+  tool_progress_command: true
+  interim_assistant_messages: false
+  runtime_footer:
+    enabled: true
+    fields:
+      - model
+      - duration
+      - cost
+  file_mutation_verifier: false
+  show_cost: true
+  language: ZH
+  resume_display: minimal
+  busy_input_mode: QUEUE
+  background_process_notifications: ERROR
+  final_response_markdown: RAW
+  timestamps: true
+  bell_on_complete: true
+  persistent_output: false
+  persistent_output_max_lines: 80
+  inline_diffs: false
+  tui_auto_resume_recent: true
+  tui_status_indicator: EMOJI
+  user_message_preview:
+    first_lines: 3
+    last_lines: 1
+  ephemeral_system_ttl: 120
+  copy_shortcut: CTRL_SHIFT_C
+dashboard:
+  show_token_analytics: true
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_display_config_values(&config);
+        assert_eq!(values["displayToolProgress"], "verbose");
+        assert_eq!(values["displayCompact"], true);
+        assert_eq!(values["displaySkin"], "mono");
+        assert_eq!(values["displayToolPrefix"], "╎");
+        assert_eq!(values["displayShowReasoning"], true);
+        assert_eq!(values["displayToolPreviewLength"], 80);
+        assert_eq!(values["displayCleanupProgress"], true);
+        assert_eq!(values["displayToolProgressCommand"], true);
+        assert_eq!(values["displayInterimAssistantMessages"], false);
+        assert_eq!(values["displayRuntimeFooterEnabled"], true);
+        assert_eq!(
+            values["displayRuntimeFooterFields"],
+            "model\nduration\ncost"
+        );
+        assert_eq!(values["displayFileMutationVerifier"], false);
+        assert_eq!(values["displayShowCost"], true);
+        assert_eq!(values["dashboardShowTokenAnalytics"], true);
+        assert_eq!(values["displayLanguage"], "zh");
+        assert_eq!(values["displayResumeDisplay"], "minimal");
+        assert_eq!(values["displayBusyInputMode"], "queue");
+        assert_eq!(values["displayBackgroundProcessNotifications"], "error");
+        assert_eq!(values["displayFinalResponseMarkdown"], "raw");
+        assert_eq!(values["displayTimestamps"], true);
+        assert_eq!(values["displayBellOnComplete"], true);
+        assert_eq!(values["displayPersistentOutput"], false);
+        assert_eq!(values["displayPersistentOutputMaxLines"], 80);
+        assert_eq!(values["displayInlineDiffs"], false);
+        assert_eq!(values["displayTuiAutoResumeRecent"], true);
+        assert_eq!(values["displayTuiStatusIndicator"], "emoji");
+        assert_eq!(values["displayUserMessagePreviewFirstLines"], 3);
+        assert_eq!(values["displayUserMessagePreviewLastLines"], 1);
+        assert_eq!(values["displayEphemeralSystemTtl"], 120);
+        assert_eq!(values["displayCopyShortcut"], "ctrl_shift_c");
+    }
+
+    #[test]
+    fn merge_display_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+display:
+  skin: midnight
+  runtime_footer:
+    enabled: false
+    custom_flag: keep-footer
+  user_message_preview:
+    custom_flag: keep-preview
+  platforms:
+    telegram:
+      tool_progress: new
+  custom_flag: keep-display
+dashboard:
+  custom_flag: keep-dashboard
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_display_config(
+            &mut config,
+            &json!({
+                "displayToolProgress": "off",
+                "displayCompact": true,
+                "displaySkin": "slate",
+                "displayToolPrefix": "│",
+                "displayShowReasoning": true,
+                "displayToolPreviewLength": 120,
+                "displayCleanupProgress": true,
+                "displayToolProgressCommand": true,
+                "displayInterimAssistantMessages": false,
+                "displayRuntimeFooterEnabled": true,
+                "displayRuntimeFooterFields": "model\ncontext_pct\nduration",
+                "displayFileMutationVerifier": true,
+                "displayShowCost": true,
+                "dashboardShowTokenAnalytics": true,
+                "displayLanguage": "zh-hant",
+                "displayResumeDisplay": "minimal",
+                "displayBusyInputMode": "steer",
+                "displayBackgroundProcessNotifications": "result",
+                "displayFinalResponseMarkdown": "render",
+                "displayTimestamps": true,
+                "displayBellOnComplete": true,
+                "displayPersistentOutput": false,
+                "displayPersistentOutputMaxLines": 120,
+                "displayInlineDiffs": false,
+                "displayTuiAutoResumeRecent": true,
+                "displayTuiStatusIndicator": "ascii",
+                "displayUserMessagePreviewFirstLines": 4,
+                "displayUserMessagePreviewLastLines": 0,
+                "displayEphemeralSystemTtl": 360,
+                "displayCopyShortcut": "disabled",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["dashboard"]["custom_flag"].as_str(),
+            Some("keep-dashboard")
+        );
+        assert_eq!(
+            config["dashboard"]["show_token_analytics"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(config["display"]["compact"].as_bool(), Some(true));
+        assert_eq!(config["display"]["skin"].as_str(), Some("slate"));
+        assert_eq!(config["display"]["tool_prefix"].as_str(), Some("│"));
+        assert_eq!(config["display"]["show_reasoning"].as_bool(), Some(true));
+        assert_eq!(config["display"]["tool_preview_length"].as_i64(), Some(120));
+        assert_eq!(config["display"]["cleanup_progress"].as_bool(), Some(true));
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["tool_progress"].as_str(),
+            Some("new")
+        );
+        assert_eq!(config["display"]["tool_progress"].as_str(), Some("off"));
+        assert_eq!(
+            config["display"]["tool_progress_command"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["display"]["interim_assistant_messages"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["display"]["runtime_footer"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["display"]["runtime_footer"]["custom_flag"].as_str(),
+            Some("keep-footer")
+        );
+        assert_eq!(
+            config["display"]["runtime_footer"]["fields"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model", "context_pct", "duration"]
+        );
+        assert_eq!(
+            config["display"]["file_mutation_verifier"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(config["display"]["show_cost"].as_bool(), Some(true));
+        assert_eq!(config["display"]["language"].as_str(), Some("zh-hant"));
+        assert_eq!(
+            config["display"]["resume_display"].as_str(),
+            Some("minimal")
+        );
+        assert_eq!(config["display"]["busy_input_mode"].as_str(), Some("steer"));
+        assert_eq!(
+            config["display"]["background_process_notifications"].as_str(),
+            Some("result")
+        );
+        assert_eq!(
+            config["display"]["final_response_markdown"].as_str(),
+            Some("render")
+        );
+        assert_eq!(config["display"]["timestamps"].as_bool(), Some(true));
+        assert_eq!(config["display"]["bell_on_complete"].as_bool(), Some(true));
+        assert_eq!(
+            config["display"]["persistent_output"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["display"]["persistent_output_max_lines"].as_i64(),
+            Some(120)
+        );
+        assert_eq!(config["display"]["inline_diffs"].as_bool(), Some(false));
+        assert_eq!(
+            config["display"]["tui_auto_resume_recent"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["display"]["tui_status_indicator"].as_str(),
+            Some("ascii")
+        );
+        assert_eq!(
+            config["display"]["user_message_preview"]["first_lines"].as_i64(),
+            Some(4)
+        );
+        assert_eq!(
+            config["display"]["user_message_preview"]["last_lines"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            config["display"]["user_message_preview"]["custom_flag"].as_str(),
+            Some("keep-preview")
+        );
+        assert_eq!(
+            config["display"]["ephemeral_system_ttl"].as_i64(),
+            Some(360)
+        );
+        assert_eq!(
+            config["display"]["copy_shortcut"].as_str(),
+            Some("disabled")
+        );
+        assert_eq!(
+            config["display"]["custom_flag"].as_str(),
+            Some("keep-display")
+        );
+    }
+
+    #[test]
+    fn merge_display_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayToolProgress": "everything" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.tool_progress"));
+
+        let err = merge_hermes_display_config(&mut config, &json!({ "displaySkin": "unknown" }))
+            .unwrap_err();
+        assert!(err.contains("display.skin"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayToolPrefix": "too-long-prefix" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.tool_prefix"));
+
+        let err =
+            merge_hermes_display_config(&mut config, &json!({ "displayResumeDisplay": "compact" }))
+                .unwrap_err();
+        assert!(err.contains("display.resume_display"));
+
+        let err = merge_hermes_display_config(&mut config, &json!({ "displayLanguage": "cn" }))
+            .unwrap_err();
+        assert!(err.contains("display.language"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayRuntimeFooterFields": "model\npassword" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.runtime_footer.fields"));
+
+        let err =
+            merge_hermes_display_config(&mut config, &json!({ "displayBusyInputMode": "replace" }))
+                .unwrap_err();
+        assert!(err.contains("display.busy_input_mode"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayBackgroundProcessNotifications": "silent" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.background_process_notifications"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayFinalResponseMarkdown": "html" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.final_response_markdown"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayPersistentOutputMaxLines": -1 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.persistent_output_max_lines"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayToolPreviewLength": 200001 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.tool_preview_length"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayTuiStatusIndicator": "rainbow" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.tui_status_indicator"));
+
+        let err =
+            merge_hermes_display_config(&mut config, &json!({ "displayCopyShortcut": "cmd_c" }))
+                .unwrap_err();
+        assert!(err.contains("display.copy_shortcut"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayUserMessagePreviewFirstLines": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.user_message_preview.first_lines"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayUserMessagePreviewLastLines": 101 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.user_message_preview.last_lines"));
+
+        let err = merge_hermes_display_config(
+            &mut config,
+            &json!({ "displayEphemeralSystemTtl": 86401 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.ephemeral_system_ttl"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_kanban_config_tests {
+    use super::{build_hermes_kanban_config_values, merge_hermes_kanban_config};
+    use serde_json::json;
+
+    #[test]
+    fn kanban_values_have_upstream_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_kanban_config_values(&config);
+        assert_eq!(values["dispatchInGateway"], true);
+        assert_eq!(values["dispatchIntervalSeconds"], 60);
+        assert_eq!(values["maxSpawn"], 0);
+        assert_eq!(values["maxInProgress"], 0);
+        assert_eq!(values["failureLimit"], 2);
+        assert_eq!(values["autoDecompose"], true);
+        assert_eq!(values["autoDecomposePerTick"], 3);
+        assert_eq!(values["workerLogRotateBytes"], 2097152);
+        assert_eq!(values["workerLogBackupCount"], 1);
+        assert_eq!(values["orchestratorProfile"], "");
+        assert_eq!(values["defaultAssignee"], "");
+        assert_eq!(values["dispatchStaleTimeoutSeconds"], 14400);
+    }
+
+    #[test]
+    fn kanban_values_normalize_existing_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kanban:
+  dispatch_in_gateway: false
+  dispatch_interval_seconds: "120"
+  max_spawn: "4"
+  max_in_progress: "6"
+  failure_limit: "5"
+  auto_decompose: false
+  auto_decompose_per_tick: "7"
+  worker_log_rotate_bytes: "4194304"
+  worker_log_backup_count: "3"
+  orchestrator_profile: triage
+  default_assignee: builder
+  dispatch_stale_timeout_seconds: "7200"
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_kanban_config_values(&config);
+        assert_eq!(values["dispatchInGateway"], false);
+        assert_eq!(values["dispatchIntervalSeconds"], 120);
+        assert_eq!(values["maxSpawn"], 4);
+        assert_eq!(values["maxInProgress"], 6);
+        assert_eq!(values["failureLimit"], 5);
+        assert_eq!(values["autoDecompose"], false);
+        assert_eq!(values["autoDecomposePerTick"], 7);
+        assert_eq!(values["workerLogRotateBytes"], 4194304);
+        assert_eq!(values["workerLogBackupCount"], 3);
+        assert_eq!(values["orchestratorProfile"], "triage");
+        assert_eq!(values["defaultAssignee"], "builder");
+        assert_eq!(values["dispatchStaleTimeoutSeconds"], 7200);
+    }
+
+    #[test]
+    fn merge_kanban_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+kanban:
+  dispatch_interval_seconds: 30
+  max_spawn: 9
+  max_in_progress: 11
+  custom_flag: keep-me
+memory:
+  memory_enabled: true
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_kanban_config(
+            &mut config,
+            &json!({
+                "dispatchInGateway": false,
+                "dispatchIntervalSeconds": 15,
+                "maxSpawn": 4,
+                "maxInProgress": 6,
+                "failureLimit": 4,
+                "autoDecompose": false,
+                "autoDecomposePerTick": 2,
+                "workerLogRotateBytes": 1048576,
+                "workerLogBackupCount": 0,
+                "orchestratorProfile": "triage",
+                "defaultAssignee": "builder",
+                "dispatchStaleTimeoutSeconds": 0,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["memory"]["memory_enabled"].as_bool(), Some(true));
+        assert_eq!(config["kanban"]["custom_flag"].as_str(), Some("keep-me"));
+        assert_eq!(
+            config["kanban"]["dispatch_in_gateway"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["kanban"]["dispatch_interval_seconds"].as_i64(),
+            Some(15)
+        );
+        assert_eq!(config["kanban"]["max_spawn"].as_i64(), Some(4));
+        assert_eq!(config["kanban"]["max_in_progress"].as_i64(), Some(6));
+        assert_eq!(config["kanban"]["failure_limit"].as_i64(), Some(4));
+        assert_eq!(config["kanban"]["auto_decompose"].as_bool(), Some(false));
+        assert_eq!(
+            config["kanban"]["auto_decompose_per_tick"].as_i64(),
+            Some(2)
+        );
+        assert_eq!(
+            config["kanban"]["worker_log_rotate_bytes"].as_i64(),
+            Some(1048576)
+        );
+        assert_eq!(
+            config["kanban"]["worker_log_backup_count"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            config["kanban"]["orchestrator_profile"].as_str(),
+            Some("triage")
+        );
+        assert_eq!(
+            config["kanban"]["default_assignee"].as_str(),
+            Some("builder")
+        );
+        assert_eq!(
+            config["kanban"]["dispatch_stale_timeout_seconds"].as_i64(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn merge_kanban_config_removes_optional_profile_routes() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kanban:
+  orchestrator_profile: triage
+  default_assignee: builder
+  custom_flag: keep-me
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_kanban_config(
+            &mut config,
+            &json!({
+                "orchestratorProfile": "   ",
+                "defaultAssignee": "",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["kanban"]["custom_flag"].as_str(), Some("keep-me"));
+        assert!(config["kanban"].get("orchestrator_profile").is_none());
+        assert!(config["kanban"].get("default_assignee").is_none());
+    }
+
+    #[test]
+    fn merge_kanban_config_removes_optional_concurrency_limits() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kanban:
+  max_spawn: 4
+  max_in_progress: 6
+  custom_flag: keep-me
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_kanban_config(
+            &mut config,
+            &json!({
+                "maxSpawn": 0,
+                "maxInProgress": 0,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["kanban"]["custom_flag"].as_str(), Some("keep-me"));
+        assert!(config["kanban"].get("max_spawn").is_none());
+        assert!(config["kanban"].get("max_in_progress").is_none());
+    }
+
+    #[test]
+    fn merge_kanban_config_rejects_invalid_timeout() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "dispatchIntervalSeconds": 0 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.dispatch_interval_seconds"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "maxSpawn": -1 })).unwrap_err();
+        assert!(err.contains("kanban.max_spawn"));
+
+        let err =
+            merge_hermes_kanban_config(&mut config, &json!({ "maxInProgress": -1 })).unwrap_err();
+        assert!(err.contains("kanban.max_in_progress"));
+
+        let err =
+            merge_hermes_kanban_config(&mut config, &json!({ "failureLimit": 0 })).unwrap_err();
+        assert!(err.contains("kanban.failure_limit"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "autoDecomposePerTick": 0 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.auto_decompose_per_tick"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "workerLogRotateBytes": 0 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.worker_log_rotate_bytes"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "workerLogBackupCount": -1 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.worker_log_backup_count"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "orchestratorProfile": 123 }))
+            .unwrap_err();
+        assert!(err.contains("kanban.orchestrator_profile"));
+
+        let err = merge_hermes_kanban_config(&mut config, &json!({ "defaultAssignee": false }))
+            .unwrap_err();
+        assert!(err.contains("kanban.default_assignee"));
+
+        let err =
+            merge_hermes_kanban_config(&mut config, &json!({ "dispatchStaleTimeoutSeconds": -1 }))
+                .unwrap_err();
+        assert!(err.contains("kanban.dispatch_stale_timeout_seconds"));
+
+        let err = merge_hermes_kanban_config(
+            &mut config,
+            &json!({ "dispatchStaleTimeoutSeconds": 604801 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("kanban.dispatch_stale_timeout_seconds"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_security_config_tests {
+    use super::{build_hermes_security_config_values, merge_hermes_security_config};
+    use serde_json::json;
+
+    #[test]
+    fn security_values_have_tirith_defaults() {
+        let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let values = build_hermes_security_config_values(&config);
+        assert_eq!(values["tirithEnabled"], true);
+        assert_eq!(values["tirithPath"], "tirith");
+        assert_eq!(values["tirithTimeout"], 5);
+        assert_eq!(values["tirithFailOpen"], true);
+    }
+
+    #[test]
+    fn security_values_read_yaml_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+security:
+  tirith_enabled: false
+  tirith_path: C:/tools/tirith.exe
+  tirith_timeout: 12
+  tirith_fail_open: false
+"#,
+        )
+        .unwrap();
+        let values = build_hermes_security_config_values(&config);
+        assert_eq!(values["tirithEnabled"], false);
+        assert_eq!(values["tirithPath"], "C:/tools/tirith.exe");
+        assert_eq!(values["tirithTimeout"], 12);
+        assert_eq!(values["tirithFailOpen"], false);
+    }
+
+    #[test]
+    fn merge_security_config_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+security:
+  allow_private_urls: false
+  website_blocklist:
+    enabled: true
+    domains:
+      - example.com
+  custom_flag: keep-security
+terminal:
+  backend: docker
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_security_config(
+            &mut config,
+            &json!({
+                "tirithEnabled": false,
+                "tirithPath": "~/bin/tirith",
+                "tirithTimeout": 9,
+                "tirithFailOpen": false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["model"]["provider"].as_str(), Some("anthropic"));
+        assert_eq!(config["terminal"]["backend"].as_str(), Some("docker"));
+        assert_eq!(
+            config["security"]["custom_flag"].as_str(),
+            Some("keep-security")
+        );
+        assert_eq!(config["security"]["tirith_enabled"].as_bool(), Some(false));
+        assert_eq!(
+            config["security"]["tirith_path"].as_str(),
+            Some("~/bin/tirith")
+        );
+        assert_eq!(config["security"]["tirith_timeout"].as_i64(), Some(9));
+        assert_eq!(
+            config["security"]["tirith_fail_open"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn merge_security_config_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err =
+            merge_hermes_security_config(&mut config, &json!({ "tirithTimeout": 0 })).unwrap_err();
+        assert!(err.contains("security.tirith_timeout"));
+
+        let err =
+            merge_hermes_security_config(&mut config, &json!({ "tirithPath": "" })).unwrap_err();
+        assert!(err.contains("security.tirith_path"));
+    }
+}
+
+#[cfg(test)]
+mod hermes_channel_tests {
+    use super::{
+        build_hermes_channel_config_values, build_hermes_channel_env_updates,
+        merge_hermes_channel_config,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn merge_telegram_channel_keeps_unknown_extra_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model:
+  provider: anthropic
+  default: claude-sonnet-4-6
+platforms:
+  telegram:
+    enabled: false
+    token: old
+    extra:
+      unknown_option: keep-me
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_channel_config(
+            &mut config,
+            "telegram",
+            &json!({
+                "enabled": true,
+                "botToken": "123:token",
+                "dmPolicy": "pair",
+                "groupPolicy": "allowlist",
+                "allowFrom": "1001, 1002",
+                "requireMention": true,
+                "replyToMode": "off",
+                "guestMode": true,
+                "disableLinkPreviews": true,
+            }),
+        )
+        .unwrap();
+
+        let values = build_hermes_channel_config_values(&config, &HashMap::new());
+        assert_eq!(values["telegram"]["enabled"], true);
+        assert_eq!(values["telegram"]["botToken"], "");
+        assert_eq!(values["telegram"]["allowFrom"], "1001, 1002");
+        assert_eq!(
+            config["platforms"]["telegram"]["token"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["telegram"]["extra"]["unknown_option"].as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            config["platforms"]["telegram"]["extra"]["reply_to_mode"].as_str(),
+            Some("off")
+        );
+        assert_eq!(
+            config["platforms"]["telegram"]["extra"]["guest_mode"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["platforms"]["telegram"]["extra"]["disable_link_previews"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(values["telegram"]["replyToMode"], "off");
+        assert_eq!(values["telegram"]["guestMode"], true);
+        assert_eq!(values["telegram"]["disableLinkPreviews"], true);
+        let env = build_hermes_channel_env_updates(
+            "telegram",
+            &json!({
+                "botToken": "123:token",
+                "allowFrom": "1001, 1002",
+                "requireMention": true,
+                "replyToMode": "off",
+                "guestMode": true,
+                "disableLinkPreviews": true,
+            }),
+        );
+        assert!(env.contains(&("TELEGRAM_BOT_TOKEN".to_string(), "123:token".to_string())));
+        assert!(env.contains(&("TELEGRAM_REPLY_TO_MODE".to_string(), "off".to_string())));
+        assert!(env.contains(&("TELEGRAM_GUEST_MODE".to_string(), "true".to_string())));
+        assert!(env.contains(&(
+            "TELEGRAM_DISABLE_LINK_PREVIEWS".to_string(),
+            "true".to_string()
+        )));
+    }
+
+    #[test]
+    fn build_channel_values_prefers_runtime_env_credentials() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+platforms:
+  telegram:
+    enabled: true
+    token: yaml-token
+    extra:
+      allow_from: ["1001"]
+  feishu:
+    enabled: true
+    extra:
+      app_id: yaml-app-id
+      app_secret: yaml-secret
+      domain: lark
+      connection_mode: webhook
+  dingtalk:
+    enabled: true
+    extra:
+      client_id: yaml-client-id
+      client_secret: yaml-client-secret
+      allowed_users: ["staff-1"]
+      allowed_chats: ["cid-1"]
+"#,
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "env-token".to_string());
+        env.insert("FEISHU_APP_ID".to_string(), "env-app-id".to_string());
+        env.insert("FEISHU_APP_SECRET".to_string(), "env-secret".to_string());
+        env.insert("FEISHU_DOMAIN".to_string(), "feishu".to_string());
+        env.insert(
+            "FEISHU_CONNECTION_MODE".to_string(),
+            "websocket".to_string(),
+        );
+        env.insert(
+            "DINGTALK_CLIENT_ID".to_string(),
+            "env-client-id".to_string(),
+        );
+        env.insert(
+            "DINGTALK_CLIENT_SECRET".to_string(),
+            "env-client-secret".to_string(),
+        );
+
+        let values = build_hermes_channel_config_values(&config, &env);
+
+        assert_eq!(values["telegram"]["botToken"], "env-token");
+        assert_eq!(values["telegram"]["allowFrom"], "1001");
+        assert_eq!(values["feishu"]["appId"], "env-app-id");
+        assert_eq!(values["feishu"]["appSecret"], "env-secret");
+        assert_eq!(values["feishu"]["domain"], "feishu");
+        assert_eq!(values["feishu"]["connectionMode"], "websocket");
+        assert_eq!(values["dingtalk"]["clientId"], "env-client-id");
+        assert_eq!(values["dingtalk"]["clientSecret"], "env-client-secret");
+        assert_eq!(values["dingtalk"]["allowFrom"], "staff-1");
+        assert_eq!(values["dingtalk"]["groupAllowFrom"], "cid-1");
+    }
+
+    #[test]
+    fn merge_feishu_channel_fills_runtime_defaults() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        merge_hermes_channel_config(
+            &mut config,
+            "feishu",
+            &json!({
+                "enabled": true,
+                "appId": "cli_xxx",
+                "appSecret": "secret",
+                "domain": "",
+                "connectionMode": "",
+                "webhookPath": "",
+                "reactionNotifications": "",
+                "typingIndicator": true,
+                "resolveSenderNames": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["feishu"]["extra"]["app_id"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["feishu"]["extra"]["app_secret"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["feishu"]["extra"]["domain"].as_str(),
+            Some("feishu")
+        );
+        assert_eq!(
+            config["platforms"]["feishu"]["extra"]["connection_mode"].as_str(),
+            Some("websocket")
+        );
+        assert_eq!(
+            config["platforms"]["feishu"]["extra"]["webhook_path"].as_str(),
+            Some("/feishu/webhook")
+        );
+        assert_eq!(
+            config["platforms"]["feishu"]["extra"]["reaction_notifications"].as_str(),
+            Some("off")
+        );
+
+        let env = build_hermes_channel_env_updates(
+            "feishu",
+            &json!({
+                "appId": "cli_xxx",
+                "appSecret": "secret",
+                "domain": "",
+                "connectionMode": "",
+                "webhookPath": "",
+                "groupPolicy": "allowlist",
+            }),
+        );
+        assert!(env.contains(&("FEISHU_DOMAIN".to_string(), "feishu".to_string())));
+        assert!(env.contains(&(
+            "FEISHU_CONNECTION_MODE".to_string(),
+            "websocket".to_string()
+        )));
+        assert!(env.contains(&(
+            "FEISHU_WEBHOOK_PATH".to_string(),
+            "/feishu/webhook".to_string()
+        )));
+    }
+
+    #[test]
+    fn discord_channel_supports_plugin_runtime_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+platforms:
+  discord:
+    enabled: true
+    token: old-token
+    extra:
+      unknown_option: keep-me
+      free_response_channels: ["yaml-free"]
+      auto_thread: true
+"#,
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "DISCORD_BOT_TOKEN".to_string(),
+            "env-discord-token".to_string(),
+        );
+        env.insert(
+            "DISCORD_FREE_RESPONSE_CHANNELS".to_string(),
+            "env-free".to_string(),
+        );
+        env.insert("DISCORD_AUTO_THREAD".to_string(), "false".to_string());
+        env.insert("DISCORD_HOME_CHANNEL".to_string(), "home-1".to_string());
+
+        let values = build_hermes_channel_config_values(&config, &env);
+        assert_eq!(values["discord"]["token"], "env-discord-token");
+        assert_eq!(values["discord"]["freeResponseChannels"], "env-free");
+        assert_eq!(values["discord"]["autoThread"], false);
+        assert_eq!(values["discord"]["homeChannel"], "home-1");
+
+        merge_hermes_channel_config(
+            &mut config,
+            "discord",
+            &json!({
+                "enabled": true,
+                "token": "discord-token",
+                "allowFrom": "1001, 1002",
+                "requireMention": true,
+                "freeResponseChannels": "free-a\nfree-b",
+                "allowedChannels": "allow-a",
+                "ignoredChannels": "ignore-a",
+                "noThreadChannels": "plain-a",
+                "autoThread": false,
+                "reactions": true,
+                "threadRequireMention": true,
+                "historyBackfill": true,
+                "historyBackfillLimit": "12",
+                "replyToMode": "off",
+                "homeChannel": "home-1",
+                "homeChannelName": "ops-home",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["discord"]["token"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["free_response_channels"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["free-a", "free-b"]
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["allowed_channels"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allow-a"]
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["auto_thread"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["reactions"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["thread_require_mention"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["history_backfill"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["history_backfill_limit"].as_str(),
+            Some("12")
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["reply_to_mode"].as_str(),
+            Some("off")
+        );
+        assert_eq!(
+            config["platforms"]["discord"]["extra"]["unknown_option"].as_str(),
+            Some("keep-me")
+        );
+
+        let env_updates = build_hermes_channel_env_updates(
+            "discord",
+            &json!({
+                "token": "discord-token",
+                "allowFrom": "1001, 1002",
+                "requireMention": true,
+                "freeResponseChannels": "free-a\nfree-b",
+                "allowedChannels": "allow-a",
+                "ignoredChannels": "ignore-a",
+                "noThreadChannels": "plain-a",
+                "autoThread": false,
+                "reactions": true,
+                "threadRequireMention": true,
+                "historyBackfill": true,
+                "historyBackfillLimit": "12",
+                "replyToMode": "off",
+                "homeChannel": "home-1",
+                "homeChannelName": "ops-home",
+            }),
+        );
+
+        assert!(
+            env_updates.contains(&("DISCORD_BOT_TOKEN".to_string(), "discord-token".to_string()))
+        );
+        assert!(env_updates.contains(&(
+            "DISCORD_FREE_RESPONSE_CHANNELS".to_string(),
+            "free-a,free-b".to_string()
+        )));
+        assert!(env_updates.contains(&("DISCORD_AUTO_THREAD".to_string(), "false".to_string())));
+        assert!(env_updates.contains(&(
+            "DISCORD_THREAD_REQUIRE_MENTION".to_string(),
+            "true".to_string()
+        )));
+        assert!(env_updates.contains(&("DISCORD_HOME_CHANNEL".to_string(), "home-1".to_string())));
+    }
+
+    #[test]
+    fn merge_dingtalk_channel_uses_runtime_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+platforms:
+  dingtalk:
+    enabled: true
+    extra:
+      client_id: old-client-id
+      client_secret: old-client-secret
+      group_allow_from: ["legacy-chat"]
+      unknown_option: keep-me
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_channel_config(
+            &mut config,
+            "dingtalk",
+            &json!({
+                "enabled": true,
+                "clientId": "ding-app-key",
+                "clientSecret": "ding-secret",
+                "allowFrom": "staff-1, staff-2",
+                "groupAllowFrom": "cid-1\ncid-2",
+                "requireMention": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["platforms"]["dingtalk"]["enabled"], true);
+        assert_eq!(
+            config["platforms"]["dingtalk"]["extra"]["client_id"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["dingtalk"]["extra"]["client_secret"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["dingtalk"]["extra"]["group_allow_from"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["dingtalk"]["extra"]["allowed_users"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["staff-1", "staff-2"]
+        );
+        assert_eq!(
+            config["platforms"]["dingtalk"]["extra"]["allowed_chats"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cid-1", "cid-2"]
+        );
+        assert_eq!(
+            config["platforms"]["dingtalk"]["extra"]["require_mention"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["platforms"]["dingtalk"]["extra"]["unknown_option"].as_str(),
+            Some("keep-me")
+        );
+
+        let env = build_hermes_channel_env_updates(
+            "dingtalk",
+            &json!({
+                "clientId": "ding-app-key",
+                "clientSecret": "ding-secret",
+                "allowFrom": "staff-1, staff-2",
+                "groupAllowFrom": "cid-1\ncid-2",
+                "requireMention": true,
+            }),
+        );
+
+        assert!(env.contains(&("DINGTALK_CLIENT_ID".to_string(), "ding-app-key".to_string())));
+        assert!(env.contains(&(
+            "DINGTALK_CLIENT_SECRET".to_string(),
+            "ding-secret".to_string()
+        )));
+        assert!(env.contains(&(
+            "DINGTALK_ALLOWED_USERS".to_string(),
+            "staff-1,staff-2".to_string()
+        )));
+        assert!(env.contains(&(
+            "DINGTALK_ALLOWED_CHATS".to_string(),
+            "cid-1,cid-2".to_string()
+        )));
+        assert!(env.contains(&("DINGTALK_REQUIRE_MENTION".to_string(), "true".to_string())));
+    }
+
+    #[test]
+    fn merge_channel_config_removes_yaml_secrets() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+platforms:
+  slack:
+    enabled: true
+    token: old-bot-token
+    extra:
+      app_token: old-app-token
+      signing_secret: old-signing-secret
+      webhook_path: /old/events
+      unknown_option: keep-me
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_channel_config(
+            &mut config,
+            "slack",
+            &json!({
+                "enabled": true,
+                "botToken": "xoxb-new",
+                "appToken": "xapp-new",
+                "signingSecret": "new-signing-secret",
+                "webhookPath": "/slack/events",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["slack"]["token"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["slack"]["extra"]["app_token"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["slack"]["extra"]["signing_secret"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["slack"]["extra"]["webhook_path"].as_str(),
+            Some("/slack/events")
+        );
+        assert_eq!(
+            config["platforms"]["slack"]["extra"]["unknown_option"].as_str(),
+            Some("keep-me")
+        );
+    }
+
+    #[test]
+    fn plugin_platform_values_prefer_env_and_preserve_yaml_runtime_fields() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r##"
+platforms:
+  teams:
+    enabled: true
+    extra:
+      client_id: yaml-teams-client
+      client_secret: yaml-teams-secret
+      tenant_id: yaml-tenant
+      port: 3978
+      service_url: https://smba.trafficmanager.net/teams/
+      allow_from: ["aad-1"]
+  google_chat:
+    enabled: true
+    extra:
+      project_id: yaml-project
+      subscription_name: projects/yaml-project/subscriptions/hermes
+      service_account_json: yaml-sa.json
+      allow_from: ["user@example.com"]
+  irc:
+    enabled: true
+    extra:
+      server: irc.libera.chat
+      channel: "#hermes"
+      nickname: hermes-bot
+      use_tls: true
+      allowed_users: ["alice"]
+  line:
+    enabled: true
+    extra:
+      channel_access_token: yaml-line-token
+      channel_secret: yaml-line-secret
+      host: 0.0.0.0
+      port: 8646
+      public_url: https://line.example.com
+      allowed_users: ["U1"]
+      allowed_groups: ["C1"]
+      allowed_rooms: ["R1"]
+      slow_response_threshold: "45"
+  simplex:
+    enabled: true
+    extra:
+      ws_url: ws://127.0.0.1:5225
+      allowed_users: ["contact-1"]
+"##,
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "TEAMS_CLIENT_ID".to_string(),
+            "env-teams-client".to_string(),
+        );
+        env.insert(
+            "TEAMS_CLIENT_SECRET".to_string(),
+            "env-teams-secret".to_string(),
+        );
+        env.insert("TEAMS_TENANT_ID".to_string(), "env-tenant".to_string());
+        env.insert("TEAMS_HOME_CHANNEL".to_string(), "teams-home".to_string());
+        env.insert(
+            "GOOGLE_CHAT_PROJECT_ID".to_string(),
+            "env-project".to_string(),
+        );
+        env.insert(
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME".to_string(),
+            "projects/env-project/subscriptions/hermes".to_string(),
+        );
+        env.insert(
+            "GOOGLE_CHAT_SERVICE_ACCOUNT_JSON".to_string(),
+            "env-sa.json".to_string(),
+        );
+        env.insert(
+            "GOOGLE_CHAT_HOME_CHANNEL".to_string(),
+            "spaces/AAA".to_string(),
+        );
+        env.insert("IRC_SERVER".to_string(), "irc.oftc.net".to_string());
+        env.insert("IRC_CHANNEL".to_string(), "#ops".to_string());
+        env.insert("IRC_NICKNAME".to_string(), "ops-bot".to_string());
+        env.insert("IRC_HOME_CHANNEL".to_string(), "#reports".to_string());
+        env.insert(
+            "LINE_CHANNEL_ACCESS_TOKEN".to_string(),
+            "env-line-token".to_string(),
+        );
+        env.insert(
+            "LINE_CHANNEL_SECRET".to_string(),
+            "env-line-secret".to_string(),
+        );
+        env.insert("LINE_HOME_CHANNEL".to_string(), "U-home".to_string());
+        env.insert(
+            "SIMPLEX_WS_URL".to_string(),
+            "ws://127.0.0.1:5226".to_string(),
+        );
+        env.insert(
+            "SIMPLEX_HOME_CHANNEL".to_string(),
+            "contact-home".to_string(),
+        );
+
+        let values = build_hermes_channel_config_values(&config, &env);
+
+        assert_eq!(values["teams"]["clientId"], "env-teams-client");
+        assert_eq!(values["teams"]["clientSecret"], "env-teams-secret");
+        assert_eq!(values["teams"]["tenantId"], "env-tenant");
+        assert_eq!(values["teams"]["homeChannel"], "teams-home");
+        assert_eq!(values["teams"]["allowFrom"], "aad-1");
+        assert_eq!(values["google_chat"]["projectId"], "env-project");
+        assert_eq!(
+            values["google_chat"]["subscriptionName"],
+            "projects/env-project/subscriptions/hermes"
+        );
+        assert_eq!(values["google_chat"]["serviceAccountJson"], "env-sa.json");
+        assert_eq!(values["google_chat"]["homeChannel"], "spaces/AAA");
+        assert_eq!(values["irc"]["server"], "irc.oftc.net");
+        assert_eq!(values["irc"]["channel"], "#ops");
+        assert_eq!(values["irc"]["nickname"], "ops-bot");
+        assert_eq!(values["irc"]["homeChannel"], "#reports");
+        assert_eq!(values["irc"]["useTls"], true);
+        assert_eq!(values["irc"]["allowFrom"], "alice");
+        assert_eq!(values["line"]["channelAccessToken"], "env-line-token");
+        assert_eq!(values["line"]["channelSecret"], "env-line-secret");
+        assert_eq!(values["line"]["homeChannel"], "U-home");
+        assert_eq!(values["line"]["allowedGroups"], "C1");
+        assert_eq!(values["line"]["allowedRooms"], "R1");
+        assert_eq!(values["simplex"]["wsUrl"], "ws://127.0.0.1:5226");
+        assert_eq!(values["simplex"]["homeChannel"], "contact-home");
+        assert_eq!(values["simplex"]["allowFrom"], "contact-1");
+    }
+
+    #[test]
+    fn plugin_platform_save_writes_runtime_fields_and_env() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        merge_hermes_channel_config(
+            &mut config,
+            "teams",
+            &json!({
+                "enabled": true,
+                "clientId": "teams-client",
+                "clientSecret": "teams-secret",
+                "tenantId": "tenant-1",
+                "port": "3978",
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                "allowFrom": "aad-1, aad-2",
+                "allowAllUsers": false,
+                "homeChannel": "19:abc@thread.tacv2",
+                "homeChannelName": "Ops",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["teams"]["extra"]["client_id"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["teams"]["extra"]["client_secret"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["teams"]["extra"]["tenant_id"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["teams"]["extra"]["port"].as_i64(),
+            Some(3978)
+        );
+        assert_eq!(
+            config["platforms"]["teams"]["extra"]["service_url"].as_str(),
+            Some("https://smba.trafficmanager.net/teams/")
+        );
+        assert_eq!(
+            config["platforms"]["teams"]["extra"]["allow_from"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aad-1", "aad-2"]
+        );
+
+        merge_hermes_channel_config(
+            &mut config,
+            "google_chat",
+            &json!({
+                "enabled": true,
+                "projectId": "project-1",
+                "subscriptionName": "projects/project-1/subscriptions/hermes",
+                "serviceAccountJson": "C:\\keys\\sa.json",
+                "allowFrom": "user@example.com",
+                "allowAllUsers": true,
+                "homeChannel": "spaces/AAA",
+                "homeChannelName": "Ops Space",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["google_chat"]["extra"]["project_id"].as_str(),
+            Some("project-1")
+        );
+        assert_eq!(
+            config["platforms"]["google_chat"]["extra"]["subscription_name"].as_str(),
+            Some("projects/project-1/subscriptions/hermes")
+        );
+        assert_eq!(
+            config["platforms"]["google_chat"]["extra"]["service_account_json"],
+            serde_yaml::Value::Null
+        );
+
+        merge_hermes_channel_config(
+            &mut config,
+            "irc",
+            &json!({
+                "enabled": true,
+                "server": "irc.libera.chat",
+                "port": "6697",
+                "nickname": "hermes-bot",
+                "channel": "#hermes",
+                "useTls": true,
+                "serverPassword": "server-secret",
+                "nickservPassword": "nick-secret",
+                "allowFrom": "alice, bob",
+                "allowAllUsers": false,
+                "homeChannel": "#reports",
+                "homeChannelName": "reports",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["irc"]["extra"]["server"].as_str(),
+            Some("irc.libera.chat")
+        );
+        assert_eq!(
+            config["platforms"]["irc"]["extra"]["port"].as_i64(),
+            Some(6697)
+        );
+        assert_eq!(
+            config["platforms"]["irc"]["extra"]["use_tls"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["platforms"]["irc"]["extra"]["server_password"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["irc"]["extra"]["nickserv_password"],
+            serde_yaml::Value::Null
+        );
+
+        merge_hermes_channel_config(
+            &mut config,
+            "line",
+            &json!({
+                "enabled": true,
+                "channelAccessToken": "line-token",
+                "channelSecret": "line-secret",
+                "port": "8646",
+                "host": "0.0.0.0",
+                "publicUrl": "https://line.example.com",
+                "allowFrom": "U1",
+                "allowedGroups": "C1",
+                "allowedRooms": "R1",
+                "allowAllUsers": false,
+                "homeChannel": "U-home",
+                "slowResponseThreshold": "45",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["line"]["extra"]["channel_access_token"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["line"]["extra"]["channel_secret"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["platforms"]["line"]["extra"]["port"].as_i64(),
+            Some(8646)
+        );
+        assert_eq!(
+            config["platforms"]["line"]["extra"]["allowed_groups"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C1"]
+        );
+
+        merge_hermes_channel_config(
+            &mut config,
+            "simplex",
+            &json!({
+                "enabled": true,
+                "wsUrl": "ws://127.0.0.1:5225",
+                "allowFrom": "contact-1",
+                "allowAllUsers": true,
+                "homeChannel": "group:ops",
+                "homeChannelName": "Ops",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["platforms"]["simplex"]["extra"]["ws_url"].as_str(),
+            Some("ws://127.0.0.1:5225")
+        );
+
+        let env = build_hermes_channel_env_updates(
+            "line",
+            &json!({
+                "channelAccessToken": "line-token",
+                "channelSecret": "line-secret",
+                "port": "8646",
+                "host": "0.0.0.0",
+                "publicUrl": "https://line.example.com",
+                "allowFrom": "U1",
+                "allowedGroups": "C1",
+                "allowedRooms": "R1",
+                "allowAllUsers": false,
+                "homeChannel": "U-home",
+                "slowResponseThreshold": "45",
+            }),
+        );
+
+        assert!(env.contains(&(
+            "LINE_CHANNEL_ACCESS_TOKEN".to_string(),
+            "line-token".to_string()
+        )));
+        assert!(env.contains(&("LINE_ALLOWED_GROUPS".to_string(), "C1".to_string())));
+        assert!(env.contains(&("LINE_HOME_CHANNEL".to_string(), "U-home".to_string())));
+    }
+
+    #[test]
+    fn channel_display_values_read_platform_overrides_and_legacy_fallback() {
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+display:
+  tool_progress: all
+  show_reasoning: false
+  cleanup_progress: false
+  tool_progress_overrides:
+    discord: off
+  platforms:
+    telegram:
+      tool_progress: new
+      show_reasoning: true
+      tool_preview_length: 80
+      streaming: false
+      cleanup_progress: true
+      custom_flag: keep-me
+"#,
+        )
+        .unwrap();
+
+        let values = build_hermes_channel_config_values(&config, &HashMap::new());
+
+        assert_eq!(values["telegram"]["displayToolProgress"], "new");
+        assert_eq!(values["telegram"]["displayShowReasoning"], true);
+        assert_eq!(values["telegram"]["displayToolPreviewLength"], 80);
+        assert_eq!(values["telegram"]["displayStreaming"], "false");
+        assert_eq!(values["telegram"]["displayCleanupProgress"], true);
+        assert_eq!(values["discord"]["displayToolProgress"], "off");
+        assert_eq!(values["discord"]["displayStreaming"], "inherit");
+    }
+
+    #[test]
+    fn merge_channel_display_writes_platform_overrides_and_preserves_unknown_fields() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+display:
+  tool_progress: all
+  tool_progress_overrides:
+    telegram: off
+  platforms:
+    telegram:
+      tool_progress: new
+      streaming: false
+      custom_flag: keep-me
+      runtime_footer:
+        enabled: true
+platforms:
+  telegram:
+    enabled: true
+    extra:
+      unknown_option: keep-platform
+"#,
+        )
+        .unwrap();
+
+        merge_hermes_channel_config(
+            &mut config,
+            "telegram",
+            &json!({
+                "enabled": true,
+                "botToken": "",
+                "displayToolProgress": "verbose",
+                "displayShowReasoning": false,
+                "displayToolPreviewLength": "120",
+                "displayStreaming": "inherit",
+                "displayCleanupProgress": false,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(config["display"]["tool_progress"].as_str(), Some("all"));
+        assert_eq!(
+            config["display"]["tool_progress_overrides"]["telegram"].as_str(),
+            Some("off")
+        );
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["tool_progress"].as_str(),
+            Some("verbose")
+        );
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["show_reasoning"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["tool_preview_length"].as_i64(),
+            Some(120)
+        );
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["streaming"],
+            serde_yaml::Value::Null
+        );
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["cleanup_progress"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["custom_flag"].as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            config["display"]["platforms"]["telegram"]["runtime_footer"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["platforms"]["telegram"]["extra"]["unknown_option"].as_str(),
+            Some("keep-platform")
+        );
+    }
+
+    #[test]
+    fn merge_channel_display_rejects_invalid_values() {
+        let mut config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let err = merge_hermes_channel_config(
+            &mut config,
+            "telegram",
+            &json!({
+                "enabled": true,
+                "displayToolProgress": "everything",
+                "displayToolPreviewLength": 80,
+                "displayStreaming": "inherit",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.platforms.telegram.tool_progress"));
+
+        let err = merge_hermes_channel_config(
+            &mut config,
+            "telegram",
+            &json!({
+                "enabled": true,
+                "displayToolProgress": "all",
+                "displayToolPreviewLength": 200001,
+                "displayStreaming": "inherit",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.platforms.telegram.tool_preview_length"));
+
+        let err = merge_hermes_channel_config(
+            &mut config,
+            "telegram",
+            &json!({
+                "enabled": true,
+                "displayToolProgress": "all",
+                "displayToolPreviewLength": 80,
+                "displayStreaming": "global",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("display.platforms.telegram.streaming"));
     }
 }

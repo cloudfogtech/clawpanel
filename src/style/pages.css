@@ -1005,6 +1005,7 @@
   align-items: center;
   gap: var(--space-sm);
   margin-bottom: var(--space-md);
+  flex-wrap: wrap;
 }
 .platform-emoji {
   font-size: 22px;
@@ -1033,6 +1034,156 @@
   display: flex;
   gap: var(--space-xs);
   flex-wrap: wrap;
+}
+.platform-card-actions .btn,
+.account-actions .btn {
+  min-height: 36px;
+  justify-content: center;
+}
+.platform-card-actions .btn-danger,
+.account-actions .btn-danger {
+  min-width: 44px;
+}
+
+.channel-runtime-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-sm);
+  padding: 10px 12px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  line-height: 1.55;
+  margin-bottom: var(--space-md);
+}
+.channel-runtime-notice.warning {
+  color: var(--warning);
+  background: var(--warning-muted);
+  border-color: rgba(217, 119, 6, 0.25);
+}
+.channel-runtime-notice.error {
+  color: var(--error);
+  background: var(--error-muted);
+  border-color: rgba(220, 38, 38, 0.25);
+}
+.runtime-badge,
+.runtime-account {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.runtime-badge.success,
+.runtime-account.success {
+  color: var(--success);
+  background: var(--success-muted);
+}
+.runtime-badge.error,
+.runtime-account.error {
+  color: var(--error);
+  background: var(--error-muted);
+}
+.runtime-badge.warning,
+.runtime-account.warning {
+  color: var(--warning);
+  background: var(--warning-muted);
+}
+.runtime-badge.accent,
+.runtime-account.accent {
+  color: var(--accent);
+  background: var(--accent-muted);
+}
+.runtime-badge.muted,
+.runtime-account.muted {
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+}
+.channel-runtime-summary {
+  margin: -4px 0 var(--space-md);
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 1.55;
+  word-break: break-word;
+}
+.channel-runtime-summary.error {
+  color: var(--error);
+  background: var(--error-muted);
+}
+.channel-runtime-summary.connected {
+  color: var(--success);
+  background: var(--success-muted);
+}
+.channel-runtime-summary.running {
+  color: var(--accent);
+  background: var(--accent-muted);
+}
+.channel-runtime-summary.configured {
+  color: var(--warning);
+  background: var(--warning-muted);
+}
+.platform-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin-bottom: var(--space-md);
+}
+.account-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+.account-id {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.account-appid {
+  min-width: 0;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+.account-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+@media (max-width: 640px) {
+  .platforms-grid {
+    grid-template-columns: 1fr;
+  }
+  .platform-card {
+    padding: var(--space-md);
+  }
+  .platform-card-actions .btn {
+    min-height: 44px;
+  }
+  .account-actions .btn {
+    min-height: 40px;
+  }
+  .account-actions {
+    width: 100%;
+    margin-left: 0;
+  }
 }
 
 /* 可接入平台选择按钮 */

@@ -7,6 +7,70 @@
 
 ## [未发布]
 
+## [0.17.0] - 2026-05-28
+
+### 新功能 (Features)
+
+#### Hermes Agent 配置面板完整覆盖
+
+以前 Hermes 的 `~/.hermes/config.yaml` 只有少数项能在面板里改，剩下都得手动编 YAML。这一版把 50+ 个配置项全部做成可视化表单，按主题聚合：
+
+- **会话与运行时** — Session Runtime / Streaming / Memory / Compression / Tool Loop Guardrails / Channel Display / Quick Commands / Worktree Session / Prompt Caching / Logging / Cron Output / Memory Flush 等表单
+- **模型管理** — Base Model / Model Aliases / Token Limits / Model Catalog / Auxiliary Model / Delegation Override / Provider Routing / Provider Timeout / OpenRouter Cache / Agent Quality
+- **终端与沙箱** — Sandbox Image / SSH / Docker Env Forwarding / Docker Advanced / Cloud Runtime / Shell Environment / Env Passthrough / Execution Limits / Terminal Execution / Shell Hooks
+- **看板（Kanban）** — Dispatch Config / Dispatcher / Concurrency / Worker Log / Profile Routing 五块运维参数全可视化
+- **安全 / 隐私 / 审批** — Approval Safety / Checkpoint Rollback / Agent Runtime Guard / Tirith Security / Privacy Redaction / Input-Output Safety / Human Delay / Unauthorized DM Policy / Global Toolset Disable / Skills Security
+- **Display / Skin / TUI** — TUI / Analytics / Skin / Defaults / Output / Run / Reliability / Tool Prefix 一整套显示策略
+- **工具集 / 浏览器 / 语音** — Browser Advanced / Browser Camofox / Browser Tool / TTS Voice / STT / Web Tool Backend / X Search / LSP Diagnostic / Context Engine / Platform Toolsets / MCP Servers / Skills / Bundled Plugin Channels
+
+每个面板都走 `<feature>_config_read` + `<feature>_config_save` 命令对，保留原 YAML 注释与未托管字段，写入前自动备份。
+
+#### Hermes 维护与升级控制
+
+- **Update Backup** — 升级前自动备份 `~/.hermes/config.yaml`，并展示备份历史可一键回滚
+- **Session Store Maintenance** — 浏览会话存储统计、压缩与清理
+- **Curator Maintenance** — 调度 curator 维护任务
+
+#### Hermes 消息渠道矩阵扩充
+
+新接入或恢复 **14 个渠道** 的可视化配置：
+
+- iMessage、WhatsApp、Telegram（runtime options）、Discord（plugin runtime + guild 白名单 + app id）、Signal、Microsoft Teams
+- LINE、Mattermost、Synology Chat、Google Chat、Zalo、DingTalk（钉钉）
+- Tlon、IRC、Nostr、Twitch、Nextcloud Talk、ClickClack
+
+同时新增**统一渠道配置编辑器**、`channel_config_read/save` 命令对、Gateway runtime 状态、多账户保存、SecretRef 保护、跨渠道通用 diagnostics。
+
+### 改进 (Improvements)
+
+- **Node.js 版本检测优先命中 nvm 管理版** — 修复用户装了 nvm 但 PATH 里还有系统 Node 时，被系统 Node 抢先识别的问题（[#295](https://github.com/qingchencloud/clawpanel/pull/295)）
+- **agent models 与 merged openclaw.json 同步** — 写入 agent 配置后从合并后的配置读回 models，避免落盘与界面不一致（[#297](https://github.com/qingchencloud/clawpanel/pull/297)）
+- **Dashboard 抑制过时加载** — 防止快速切换 Profile / 刷新时被取消的旧加载请求覆盖最新状态（[#301](https://github.com/qingchencloud/clawpanel/pull/301)）
+- **Hermes Dashboard 触摸目标更大** — 移动端 / 触屏点击体验改进
+- **Hermes Chat 健康横幅稳定化** — 不再因瞬时网络抖动反复闪烁
+- **CI 触发条件扩展** — PR 从 `ready_for_review` 状态进入时也跑工作流
+
+### 修复 (Fixes)
+
+- **关键：上游 hermes-agent 0.14.0 漏装兼容兜底** — 上游 wheel 漏装了 `hermes_cli/dashboard_auth/` 子包（6 个文件）和 `hermes_cli/web_dist/` SPA 资源，导致 `hermes dashboard` 启动直接崩，进而让 ClawPanel 的 Profile / 多 Gateway 看板 / OAuth / Channels / Sessions 详情等所有依赖 9119 的页面集体报「请求被目标计算机拒绝」。本版在 `install_hermes` / `update_hermes` / `hermes_dashboard_start` 三处注入幂等的 pass-through stub，loopback 模式下安全；若上游补回真实文件，stub 自动让位
+- **关键：Hermes 升级路径补齐 runtime extras** — `update_hermes` 与 `install_hermes` 现在统一附加 `--with croniter --with httpx --with openai --with aiohttp --with websockets`，避免升级后 Gateway 启动 platform 模块时报 `No module named ...`
+- **关键：`hermes_venv_python` 感知 `uv tool install` 路径** — 早期只查 `HERMES_PYTHON` 与 `~/.hermes-venv`，但 ClawPanel 默认走 `uv tool install`，导致「可选依赖管理」「多 Gateway 看板」等页面对 99% 用户都误报「Hermes venv 未找到」。现在按优先级 `HERMES_PYTHON` → `~/.hermes-venv` → `<uv tool dir>/hermes-agent/{Scripts,bin}/python` fallback
+- **群聊气泡显示 run_xxx 而非真实回复** — `hermes_agent_run` 返回的是 run_id 字符串而非结果对象，原代码把 run_id 当回复内容渲染。现在监听 `hermes-run-{started,delta,done,error,cancelled}` 事件，从 `payload.output` 取最终输出，按 run_id 过滤事件保证多 Profile 串行调度 race-safe
+- **Hermes 原始配置保存校验** — 直接编辑 raw YAML 时校验 schema，避免写入非法配置导致 Gateway 启动失败
+- **Hermes MCP Sampling 配置校验** — 防止非法 sampling 字段写入 config.yaml
+- **渠道配置稳健性** — 多账户保存 / SecretRef 凭据保护 / Discord guild allowlist 暴露 / Discord application id 保留 / 默认账户选择稳定化 / 凭据字段校验 / OpenClaw 渠道策略归一化
+- **Hermes 渠道密钥与运行时 env 对齐** — 避免面板存的 `${env:KEY}` 与 Gateway 进程实际读到的环境变量不一致
+- **Web 端 OpenClaw 路径冲突扫描兼容** — Web 模式下 PATH CLI 冲突扫描接口对齐桌面端
+
+### 测试与验证 (Testing)
+
+- **回归** — `npm run build`、`cargo fmt --check`、`cargo check`、`cargo clippy --all-targets -- -D warnings` 全绿；Python 端在用户 uv-tool venv 实测 `from tools.lazy_deps import LAZY_DEPS` 返回 25 个 feature
+- **关键路径手测** — 桌面端 Hermes 安装/升级、Gateway 启停、Profile / Channels / Dashboard / 可选依赖管理 / 群聊页面端到端通过
+
+### 热更新兼容性 (Compatibility)
+
+本版本 `src-tauri/src/lib.rs` 注册了 40+ 对新 Tauri 命令（各 `hermes_*_config_read/save`、渠道 / 维护命令），因此 `docs/update/latest.json` 的 `minAppVersion` 提升到 **0.17.0**：低于此版本的桌面端不会通过热更新拉到新前端，避免命令缺失导致页面崩溃。
+
 ## [0.16.5] - 2026-05-22
 
 ### 修复 (Fixes)

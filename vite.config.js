@@ -1,5 +1,5 @@
 import { defineConfig } from 'vite'
-import { devApiPlugin } from './scripts/dev-api.js'
+import { devApiPlugin, readJsonFileRelaxed } from './scripts/dev-api.js'
 import fs from 'fs'
 import path from 'path'
 import { homedir } from 'os'
@@ -13,7 +13,7 @@ let gatewayPort = 18789
 try {
   const cfgPath = path.join(homedir(), '.openclaw', 'openclaw.json')
   if (fs.existsSync(cfgPath)) {
-    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+    const cfg = readJsonFileRelaxed(cfgPath)
     // 端口必须 > 0 且 < 65536
     const port = cfg?.gateway?.port
     if (port && typeof port === 'number' && port > 0 && port < 65536) {

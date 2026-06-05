@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url'
 import net from 'net'
 import http from 'http'
 import crypto from 'crypto'
+import * as YAML from 'yaml'
 import * as skillhubSdk from './lib/skillhub-sdk.js'
 const DOCKER_TASK_TIMEOUT_MS = 10 * 60 * 1000
 
@@ -63,6 +64,23 @@ const HERMES_PROVIDER_REGISTRY = [
 
 function hermesHome() {
   return process.env.HERMES_HOME || HERMES_HOME
+}
+
+export function validateHermesConfigYamlText(yamlText = '') {
+  const raw = String(yamlText || '')
+  if (!raw.trim()) return {}
+
+  let parsed
+  try {
+    parsed = YAML.parse(raw)
+  } catch (err) {
+    throw new Error(`config.yaml YAML 格式错误: ${err?.message || String(err)}`)
+  }
+
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('config.yaml 顶层必须是对象')
+  }
+  return parsed
 }
 
 /** Resolve memory kind (memory|user|soul) → markdown file name. */
@@ -630,6 +648,96 @@ function scanAllOpenclawInstallations(activePath = resolveOpenclawCliPath()) {
     if (sourceCmp !== 0) return sourceCmp
     return String(a.path || '').localeCompare(String(b.path || ''))
   })
+}
+
+function sourceLabelForCliConflict(source) {
+  switch (source) {
+    case 'cherrystudio': return 'Cherry Studio 内嵌'
+    case 'cursor': return 'Cursor 内嵌'
+    case 'npm-zh': return 'npm 汉化版安装'
+    case 'npm-official':
+    case 'npm-global': return 'npm 官方/全局安装'
+    case 'standalone': return 'ClawPanel standalone'
+    default: return '未识别来源'
+  }
+}
+
+function canonicalLowerPathForConflict(rawPath) {
+  const normalized = normalizeCliPath(rawPath)
+  if (!normalized) return ''
+  let resolved = normalized
+  try { resolved = fs.realpathSync.native(normalized) } catch {}
+  let text = resolved.replace(/\\/g, '/').toLowerCase()
+  if (text.startsWith('//?/')) text = text.slice(4)
+  while (text.endsWith('/')) text = text.slice(0, -1)
+  return text
+}
+
+function standaloneConflictDirs() {
+  const dirs = []
+  try { dirs.push(standaloneInstallDir()) } catch {}
+  dirs.push(path.join(homedir(), '.openclaw-bin'))
+  return dirs.map(canonicalLowerPathForConflict).filter(Boolean)
+}
+
+function isStandaloneConflictPath(cliPath, source = '') {
+  if (source === 'standalone') return true
+  const canon = canonicalLowerPathForConflict(cliPath)
+  if (!canon) return false
+  return standaloneConflictDirs().some(dir => canon === dir || canon.startsWith(`${dir}/`))
+}
+
+export function buildOpenclawPathConflictRecords(installations = scanAllOpenclawInstallations()) {
+  const seen = new Set()
+  const records = []
+  for (const item of Array.isArray(installations) ? installations : []) {
+    const cliPath = item?.path
+    if (!cliPath || isStandaloneConflictPath(cliPath, item.source)) continue
+    const key = canonicalLowerPathForConflict(cliPath) || String(cliPath)
+    if (seen.has(key)) continue
+    seen.add(key)
+    const stat = (() => {
+      try { return fs.statSync(cliPath) } catch { return null }
+    })()
+    records.push({
+      path: cliPath,
+      source: item.source || classifyCliSource(cliPath) || 'unknown',
+      sourceLabel: sourceLabelForCliConflict(item.source || classifyCliSource(cliPath) || 'unknown'),
+      version: item.version || readVersionFromInstallation(cliPath) || null,
+      sizeBytes: stat?.isFile() ? stat.size : null,
+    })
+  }
+  return records
+}
+
+function formatConflictTimestamp(now = new Date()) {
+  const pad = n => String(n).padStart(2, '0')
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+}
+
+export function quarantineOpenclawPathForWeb(rawPath, options = {}) {
+  const original = normalizeCliPath(rawPath)
+  if (!original || !fs.existsSync(original)) throw new Error(`文件不存在: ${rawPath}`)
+  const stat = fs.statSync(original)
+  if (!stat.isFile()) throw new Error(`不是文件: ${rawPath}`)
+  if (isStandaloneConflictPath(original, classifyCliSource(original))) {
+    throw new Error('拒绝隔离 standalone 安装目录下的 OpenClaw（这是当前运行版本）')
+  }
+  const fileName = path.basename(original)
+  if (!fileName.toLowerCase().startsWith('openclaw')) {
+    throw new Error(`拒绝隔离非 openclaw 文件: ${fileName}`)
+  }
+  const ts = formatConflictTimestamp(options.now || new Date())
+  const quarantinedPath = path.join(path.dirname(original), `${fileName}.disabled-by-clawpanel-${ts}.bak`)
+  if (fs.existsSync(quarantinedPath)) {
+    throw new Error(`目标文件已存在，请稍后再试: ${quarantinedPath}`)
+  }
+  fs.renameSync(original, quarantinedPath)
+  return {
+    originalPath: original,
+    quarantinedPath,
+    quarantinedAt: new Date().toISOString(),
+  }
 }
 
 function resolveOpenclawCliInput(rawPath) {
@@ -1519,7 +1627,10 @@ function readPanelConfig() {
   }
   try {
     if (fs.existsSync(PANEL_CONFIG_PATH)) {
-      _panelConfigCache = JSON.parse(fs.readFileSync(PANEL_CONFIG_PATH, 'utf8'))
+      _panelConfigCache = readJsonFileRelaxed(PANEL_CONFIG_PATH)
+      if (!_panelConfigCache || typeof _panelConfigCache !== 'object' || Array.isArray(_panelConfigCache)) {
+        throw new Error('clawpanel.json 格式错误')
+      }
       _panelConfigCacheTime = now
       applyOpenclawPathConfig(_panelConfigCache)
       return JSON.parse(JSON.stringify(_panelConfigCache))
@@ -1794,7 +1905,7 @@ function generateCalibrationToken() {
   return `cp-${crypto.randomBytes(16).toString('hex')}`
 }
 
-function decodeJsonFileContent(filePath) {
+export function decodeJsonFileContent(filePath) {
   const raw = fs.readFileSync(filePath)
   if (raw.length >= 3 && raw[0] === 0xEF && raw[1] === 0xBB && raw[2] === 0xBF) {
     return raw.subarray(3).toString('utf8')
@@ -1802,7 +1913,7 @@ function decodeJsonFileContent(filePath) {
   return raw.toString('utf8')
 }
 
-function readJsonFileRelaxed(filePath) {
+export function readJsonFileRelaxed(filePath) {
   if (!fs.existsSync(filePath)) return null
   try {
     return JSON.parse(decodeJsonFileContent(filePath))
@@ -2091,7 +2202,7 @@ function wsReadLoop(socket, onMessage, timeoutMs = DOCKER_TASK_TIMEOUT_MS) {
 
 function patchGatewayOrigins() {
   if (!fs.existsSync(CONFIG_PATH)) return false
-  const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+  const config = readOpenclawConfigRequired()
   const origins = requiredControlUiOrigins()
   const existing = config?.gateway?.controlUi?.allowedOrigins || []
   // 合并：保留用户已有的 origins，只追加 ClawPanel 需要的
@@ -2107,12 +2218,18 @@ function patchGatewayOrigins() {
 
 function readOpenclawConfigOptional() {
   if (!fs.existsSync(CONFIG_PATH)) return {}
-  return cleanLoadedConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
+  const config = readJsonFileRelaxed(CONFIG_PATH)
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return {}
+  return cleanLoadedConfig(config)
 }
 
 function readOpenclawConfigRequired() {
   if (!fs.existsSync(CONFIG_PATH)) throw new Error('openclaw.json 不存在')
-  return cleanLoadedConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
+  const config = readJsonFileRelaxed(CONFIG_PATH)
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error('openclaw.json 格式错误')
+  }
+  return cleanLoadedConfig(config)
 }
 
 function mergeConfigsPreservingFields(existing, next) {
@@ -2296,13 +2413,4448 @@ function platformBindingChannel(platform) {
   return platformListId(storageKey)
 }
 
+function csvToStringArray(raw) {
+  if (Array.isArray(raw)) return raw.map(item => String(item).trim()).filter(Boolean)
+  if (typeof raw !== 'string') return []
+  return raw.split(/[,;\n]/).map(item => item.trim()).filter(Boolean)
+}
+
+function normalizeDmPolicy(raw, fallback = 'pairing') {
+  const value = String(raw || '').trim()
+  if (!value) return fallback
+  if (value === 'allow') return 'open'
+  if (value === 'deny') return 'disabled'
+  if (['pairing', 'allowlist', 'open', 'disabled'].includes(value)) return value
+  return fallback
+}
+
+function normalizeGroupPolicy(raw, fallback = 'allowlist') {
+  const value = String(raw || '').trim()
+  if (!value) return fallback
+  if (value === 'all') return 'open'
+  if (value === 'mentioned') return 'open'
+  if (value === 'deny') return 'disabled'
+  if (['open', 'allowlist', 'disabled'].includes(value)) return value
+  return fallback
+}
+
+function putWildcardAllowFromWhenOpen(entry, previousAllowFrom) {
+  if (entry.dmPolicy !== 'open') return
+  const allowFrom = csvToStringArray(previousAllowFrom)
+  if (!allowFrom.includes('*')) allowFrom.push('*')
+  entry.allowFrom = allowFrom
+}
+
+function platformSupportsTopLevelRequireMention(platform) {
+  return ['feishu', 'slack', 'msteams', 'mattermost', 'googlechat', 'nextcloud-talk', 'twitch'].includes(platformStorageKey(platform))
+}
+
+function buildIrcGroupsFromForm(form = {}) {
+  const groupIds = csvToStringArray(form.groups)
+  if (!groupIds.length) return null
+  const groups = {}
+  for (const groupId of groupIds) {
+    groups[groupId] = {}
+    if (typeof form.requireMention === 'boolean') groups[groupId].requireMention = form.requireMention
+  }
+  return groups
+}
+
+function putIrcGroupFormValues(form, saved = {}) {
+  const groups = saved?.groups && typeof saved.groups === 'object' && !Array.isArray(saved.groups)
+    ? saved.groups
+    : null
+  if (!groups) return
+  const groupIds = Object.keys(groups).filter(Boolean)
+  if (groupIds.length) form.groups = groupIds.join(', ')
+  const mentionValues = groupIds
+    .map(groupId => groups[groupId]?.requireMention)
+    .filter(value => typeof value === 'boolean')
+  if (mentionValues.length && mentionValues.every(value => value === mentionValues[0])) {
+    form.requireMention = mentionValues[0] ? 'true' : 'false'
+  }
+}
+
+export function normalizeMessagingPlatformForm(platform, form = {}) {
+  const storageKey = platformStorageKey(platform)
+  const normalized = { ...(form || {}) }
+  if (!Object.hasOwn(normalized, 'allowFrom') && Object.hasOwn(normalized, 'allowedUsers')) {
+    normalized.allowFrom = normalized.allowedUsers
+  }
+  const needsAccessDefaults = ['telegram', 'discord', 'feishu', 'slack', 'signal', 'msteams', 'whatsapp', 'zalo', 'zalouser', 'line', 'mattermost', 'googlechat', 'nextcloud-talk', 'imessage', 'irc'].includes(storageKey)
+  const hasDmField = Object.hasOwn(normalized, 'dmPolicy') || needsAccessDefaults
+  const hasGroupField = Object.hasOwn(normalized, 'groupPolicy') || needsAccessDefaults
+
+  if (hasDmField) {
+    normalized.dmPolicy = normalizeDmPolicy(normalized.dmPolicy)
+    if (Object.hasOwn(normalized, 'allowFrom')) normalized.allowFrom = csvToStringArray(normalized.allowFrom)
+    putWildcardAllowFromWhenOpen(normalized, normalized.allowFrom)
+  } else if (Object.hasOwn(normalized, 'allowFrom')) {
+    normalized.allowFrom = csvToStringArray(normalized.allowFrom)
+  }
+
+  if (hasGroupField) {
+    const requestedGroupPolicy = String(normalized.groupPolicy || '').trim()
+    normalized.groupPolicy = normalizeGroupPolicy(requestedGroupPolicy)
+    if (requestedGroupPolicy === 'mentioned' && platformSupportsTopLevelRequireMention(storageKey)) {
+      normalized.requireMention = true
+    } else if (requestedGroupPolicy !== 'mentioned') {
+      if (platformSupportsTopLevelRequireMention(storageKey)) {
+        normalized.requireMention = false
+      } else if (Object.hasOwn(normalized, 'requireMention')) {
+        normalized.requireMention = normalized.requireMention === true || normalized.requireMention === 'true'
+      }
+    }
+  }
+
+  if (Object.hasOwn(normalized, 'groupAllowFrom')) {
+    normalized.groupAllowFrom = csvToStringArray(normalized.groupAllowFrom)
+  }
+
+  if (Object.hasOwn(normalized, 'allowedUserIds')) {
+    normalized.allowedUserIds = csvToStringArray(normalized.allowedUserIds)
+  }
+
+  for (const key of ['promptStarters', 'delegatedAuthScopes', 'attachmentRoots', 'remoteAttachmentRoots', 'toolsAllow', 'allowedRoles', 'relays', 'channels', 'groups', 'mentionPatterns', 'groupChannels', 'dmAllowlist', 'groupInviteAllowlist', 'defaultAuthorizedShips']) {
+    if (Object.hasOwn(normalized, key)) normalized[key] = csvToStringArray(normalized[key])
+  }
+
+  for (const key of ['mediaMaxMb', 'historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'probeTimeoutMs', 'debounceMs', 'rateLimitPerMinute', 'httpPort', 'webhookPort', 'feedbackReflectionCooldownMs', 'timeoutSeconds', 'reconnectMs', 'expiresIn', 'obtainmentTimestamp', 'port']) {
+    if (!Object.hasOwn(normalized, key)) continue
+    const value = String(normalized[key] || '').trim()
+    if (!value) {
+      delete normalized[key]
+      continue
+    }
+    const numberValue = Number(value)
+    if (Number.isFinite(numberValue) && numberValue >= 0) {
+      normalized[key] = numberValue
+    }
+  }
+
+  for (const key of ['dangerouslyAllowNameMatching', 'dangerouslyAllowPrivateNetwork', 'dangerouslyAllowInheritedWebhookPath', 'allowInsecureSsl', 'enabled', 'allowBots', 'blockStreaming', 'useManagedIdentity', 'typingIndicator', 'welcomeCard', 'groupWelcomeCard', 'feedbackEnabled', 'feedbackReflection', 'delegatedAuthEnabled', 'ssoEnabled', 'configWrites', 'includeAttachments', 'sendReadReceipts', 'coalesceSameSenderDms', 'selfChatMode', 'ackDirect', 'senderIsOwner', 'requireMention', 'tls', 'nickservEnabled', 'nickservRegister', 'autoDiscoverChannels', 'showModelSignature', 'autoAcceptDmInvites', 'autoAcceptGroupInvites']) {
+    if (Object.hasOwn(normalized, key)) {
+      const value = typeof normalized[key] === 'boolean'
+        ? String(normalized[key])
+        : String(normalized[key] || '').trim()
+      if (!value) {
+        delete normalized[key]
+      } else {
+        normalized[key] = value === 'true'
+      }
+    }
+  }
+
+  if (storageKey === 'feishu') {
+    normalized.domain = String(normalized.domain || '').trim() || 'feishu'
+    normalized.connectionMode = normalized.connectionMode || 'websocket'
+    normalized.webhookPath = normalized.webhookPath || '/feishu/events'
+    normalized.reactionNotifications = normalized.reactionNotifications || 'off'
+    if (!Object.hasOwn(normalized, 'typingIndicator')) normalized.typingIndicator = true
+    if (!Object.hasOwn(normalized, 'resolveSenderNames')) normalized.resolveSenderNames = true
+  }
+
+  if (storageKey === 'slack') {
+    normalized.mode = normalized.mode || 'socket'
+    normalized.webhookPath = normalized.webhookPath || '/slack/events'
+    if (!Object.hasOwn(normalized, 'userTokenReadOnly')) normalized.userTokenReadOnly = false
+  }
+
+  return normalized
+}
+
+function csvForForm(raw) {
+  return csvToStringArray(raw).join(', ')
+}
+
+function putStringFormValue(form, source, key) {
+  if (typeof source?.[key] === 'string') form[key] = source[key]
+}
+
+function putBoolFormValue(form, source, key) {
+  if (typeof source?.[key] === 'boolean') form[key] = source[key] ? 'true' : 'false'
+}
+
+function putCsvFormValue(form, source, key) {
+  const value = csvForForm(source?.[key])
+  if (value) form[key] = value
+}
+
+function putAccessPolicyFormValues(form, source, { telegramCompat = false, mentionCompat = false } = {}) {
+  putStringFormValue(form, source, 'dmPolicy')
+  putStringFormValue(form, source, 'groupPolicy')
+  if (mentionCompat && form.groupPolicy === 'open' && source?.requireMention === true) {
+    form.groupPolicy = 'mentioned'
+  }
+  putCsvFormValue(form, source, 'allowFrom')
+  if (telegramCompat && form.allowFrom) form.allowedUsers = form.allowFrom
+}
+
+function normalizeSecretRef(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const source = String(value.source || '').trim()
+  if (!['env', 'file', 'exec'].includes(source)) return null
+  const provider = String(value.provider || 'default').trim() || 'default'
+  const id = String(value.id || '').trim()
+  if (!id) return null
+  return { source, provider, id }
+}
+
+function formatSecretRefPlaceholder(ref) {
+  const normalized = normalizeSecretRef(ref)
+  if (!normalized) return ''
+  return `SecretRef(${normalized.source}:${normalized.provider}:${normalized.id})`
+}
+
+function putSecretAwareFormValue(form, source, key) {
+  if (typeof source?.[key] === 'string') {
+    form[key] = source[key]
+    return
+  }
+  const ref = normalizeSecretRef(source?.[key])
+  if (!ref) return
+  form[key] = formatSecretRefPlaceholder(ref)
+  form.__secretRefs = {
+    ...(form.__secretRefs || {}),
+    [key]: ref,
+  }
+}
+
+function putSecretAwareFormAlias(form, source, sourceKey, formKey) {
+  if (typeof source?.[sourceKey] === 'string') {
+    form[formKey] = source[sourceKey]
+    return
+  }
+  const ref = normalizeSecretRef(source?.[sourceKey])
+  if (!ref) return
+  form[formKey] = formatSecretRefPlaceholder(ref)
+  form.__secretRefs = {
+    ...(form.__secretRefs || {}),
+    [formKey]: ref,
+  }
+}
+
+function resolveMessagingCredentialFormValueForSave({ form = {}, current = {}, formKey, currentKey = formKey }) {
+  const rawValue = form?.[formKey]
+  if (typeof rawValue !== 'string') return rawValue
+  const value = rawValue.trim()
+  const currentRef = normalizeSecretRef(current?.[currentKey])
+  if (currentRef && (!value || value === formatSecretRefPlaceholder(currentRef))) {
+    return currentRef
+  }
+  return value || undefined
+}
+
+export function resolveMessagingCredentialValueForSave({ form = {}, current = {}, key }) {
+  return resolveMessagingCredentialFormValueForSave({ form, current, formKey: key })
+}
+
+const MESSAGING_CREDENTIAL_FIELDS = [
+  'accessToken',
+  'appId',
+  'appPassword',
+  'appSecret',
+  'appToken',
+  'apiPassword',
+  'apiPasswordFile',
+  'botSecret',
+  'botSecretFile',
+  'botToken',
+  'channelAccessToken',
+  'channelSecret',
+  'code',
+  'clientId',
+  'clientSecret',
+  'refreshToken',
+  'gatewayPassword',
+  'gatewayToken',
+  'password',
+  'passwordFile',
+  'privateKey',
+  'secretFile',
+  'serviceAccount',
+  'serviceAccountFile',
+  'serviceAccountRef',
+  'signingSecret',
+  'token',
+  'tokenFile',
+  'webhookSecret',
+]
+
+function hasConfiguredMessagingValue(value) {
+  if (typeof value === 'string') return value.trim().length > 0
+  if (normalizeSecretRef(value)) return true
+  return value !== undefined && value !== null
+}
+
+function isEnabledFormFlag(value) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    return ['true', '1', 'yes', 'on', 'enabled'].includes(value.trim().toLowerCase())
+  }
+  return false
+}
+
+function msteamsCredentialMissingLabels(form = {}) {
+  const missing = []
+  if (!hasConfiguredMessagingValue(form?.appId)) missing.push('App ID')
+  if (missing.length) return missing
+
+  if (hasConfiguredMessagingValue(form?.appPassword)) return []
+  if (isEnabledFormFlag(form?.useManagedIdentity)) return []
+
+  const authType = String(form?.authType || '').trim().toLowerCase()
+  const hasFederatedCredential = hasConfiguredMessagingValue(form?.certificatePath) || hasConfiguredMessagingValue(form?.certificateThumbprint)
+  if (authType === 'federated' && hasFederatedCredential) return []
+
+  if (authType === 'federated') {
+    return ['Certificate Path / Certificate Thumbprint / Managed Identity / App Password']
+  }
+  return ['App Password']
+}
+
+function channelRootHasMessagingCredential(root) {
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return false
+  return MESSAGING_CREDENTIAL_FIELDS.some(key => hasConfiguredMessagingValue(root[key]))
+}
+
+function channelAnyCredentialFields(platform) {
+  const storageKey = platformStorageKey(platform)
+  if (storageKey === 'zalo') {
+    return [['botToken', 'Bot Token'], ['tokenFile', 'Token File']]
+  }
+  if (storageKey === 'googlechat') {
+    return [
+      ['serviceAccountFile', 'Service Account File'],
+      ['serviceAccount', 'Service Account JSON'],
+      ['serviceAccountRef', 'Service Account SecretRef'],
+    ]
+  }
+  return []
+}
+
+function channelAnyCredentialGroups(platform) {
+  const storageKey = platformStorageKey(platform)
+  if (storageKey === 'line') {
+    return [
+      { label: 'Channel Access Token 或 Token File', fields: [['channelAccessToken', 'Channel Access Token'], ['tokenFile', 'Token File']] },
+      { label: 'Channel Secret 或 Secret File', fields: [['channelSecret', 'Channel Secret'], ['secretFile', 'Secret File']] },
+    ]
+  }
+  if (storageKey === 'nextcloud-talk') {
+    return [
+      { label: 'Bot Secret 或 Secret File', fields: [['botSecret', 'Bot Secret'], ['botSecretFile', 'Secret File']] },
+    ]
+  }
+  return []
+}
+
+const CHANNEL_DIAG_REQUIRED_FIELDS = {
+  telegram: [['botToken', 'Bot Token']],
+  discord: [['token', 'Bot Token']],
+  feishu: [['appId', 'App ID'], ['appSecret', 'App Secret']],
+  dingtalk: [['clientId', 'Client ID'], ['clientSecret', 'Client Secret']],
+  'dingtalk-connector': [['clientId', 'Client ID'], ['clientSecret', 'Client Secret']],
+  mattermost: [['botToken', 'Bot Token'], ['baseUrl', 'Base URL']],
+  'synology-chat': [['token', 'Token'], ['incomingUrl', 'Incoming URL']],
+  clickclack: [['baseUrl', 'Base URL'], ['token', 'Token'], ['workspace', 'Workspace']],
+  'nextcloud-talk': [['baseUrl', 'Base URL']],
+  nostr: [['privateKey', 'Private Key']],
+  irc: [['host', 'Host'], ['nick', 'Nick']],
+  tlon: [['ship', 'Ship'], ['url', 'URL'], ['code', 'Code']],
+  twitch: [['username', 'Username'], ['accessToken', 'Access Token'], ['clientId', 'Client ID'], ['channel', 'Channel']],
+  signal: [['account', 'Signal 账号']],
+}
+
+function requiredChannelCredentialFields(platform, form = {}) {
+  const storageKey = platformStorageKey(platform)
+  if (storageKey === 'slack') {
+    const mode = String(form.mode || 'socket').trim() || 'socket'
+    return [
+      ['botToken', 'Bot Token'],
+      mode === 'http' ? ['signingSecret', 'Signing Secret'] : ['appToken', 'App Token'],
+    ]
+  }
+  if (storageKey === 'matrix') {
+    if (form.accessToken) return [['accessToken', 'Access Token']]
+    return [['homeserver', 'Homeserver'], ['userId', 'User ID'], ['password', 'Password']]
+  }
+  if (storageKey === 'msteams') {
+    return msteamsCredentialMissingLabels(form).map(label => [label === 'App ID' ? 'appId' : '__msteamsAuth', label])
+  }
+  return CHANNEL_DIAG_REQUIRED_FIELDS[storageKey] || []
+}
+
+function channelDiagnosisCredentialsReady(platform, form = {}) {
+  if (['zalouser', 'whatsapp'].includes(platformStorageKey(platform))) return true
+  if (platformStorageKey(platform) === 'msteams') return msteamsCredentialMissingLabels(form).length === 0
+  const requiredFields = requiredChannelCredentialFields(platform, form)
+  const anyGroups = channelAnyCredentialGroups(platform)
+  if (requiredFields.length) {
+    return requiredFields.every(([key]) => hasConfiguredMessagingValue(form?.[key]))
+      && anyGroups.every(group => group.fields.some(([key]) => hasConfiguredMessagingValue(form?.[key])))
+  }
+  if (anyGroups.length) {
+    return anyGroups.every(group => group.fields.some(([key]) => hasConfiguredMessagingValue(form?.[key])))
+  }
+  const anyFields = channelAnyCredentialFields(platform)
+  if (anyFields.length) {
+    return anyFields.some(([key]) => hasConfiguredMessagingValue(form?.[key]))
+  }
+  return channelRootHasMessagingCredential(form)
+}
+
+function compactDiagnosticDetails(values = []) {
+  return values.map(value => String(value || '').trim()).filter(Boolean).join('；')
+}
+
+export function buildOpenClawChannelDiagnosis({
+  platform,
+  accountId = '',
+  configExists = false,
+  channelEnabled = true,
+  form = {},
+  verifyResult = null,
+  verifyError = '',
+} = {}) {
+  const storageKey = platformStorageKey(platform)
+  const displayPlatform = platformListId(storageKey)
+  const checks = []
+
+  checks.push({
+    id: 'config_exists',
+    ok: !!configExists,
+    title: '渠道配置已保存',
+    detail: configExists
+      ? `已读取 channels.${storageKey}${accountId ? `.accounts.${accountId}` : ''} 的配置。`
+      : `未在 openclaw.json 中找到 ${displayPlatform} 渠道配置，请先在「渠道列表」接入并保存。`,
+  })
+
+  checks.push({
+    id: 'channel_enabled',
+    ok: !!channelEnabled,
+    title: '渠道已启用',
+    detail: channelEnabled
+      ? '渠道未被显式禁用，Gateway 重启/重载后会尝试加载。'
+      : `channels.${storageKey}.enabled 为 false，请先在渠道列表中启用该渠道。`,
+  })
+
+  const requiredFields = requiredChannelCredentialFields(storageKey, form)
+  const anyFields = channelAnyCredentialFields(storageKey)
+  const anyGroups = channelAnyCredentialGroups(storageKey)
+  const missing = storageKey === 'msteams'
+    ? msteamsCredentialMissingLabels(form)
+    : requiredFields
+        .filter(([key]) => !hasConfiguredMessagingValue(form?.[key]))
+        .map(([, label]) => label)
+  const missingGroups = anyGroups
+    .filter(group => !group.fields.some(([key]) => hasConfiguredMessagingValue(form?.[key])))
+    .map(group => group.label)
+  const hasAnyCredential = channelRootHasMessagingCredential(form)
+  const anyCredentialOk = anyFields.length ? anyFields.some(([key]) => hasConfiguredMessagingValue(form?.[key])) : false
+  const credentialOk = ['zalouser', 'imessage', 'whatsapp'].includes(storageKey)
+    ? !!configExists
+    : (requiredFields.length
+        ? missing.length === 0 && missingGroups.length === 0
+        : (anyGroups.length
+            ? missingGroups.length === 0
+            : (anyFields.length ? anyCredentialOk : hasAnyCredential)))
+  const anyLabels = anyFields.map(([, label]) => label).join(' / ')
+  checks.push({
+    id: 'credentials',
+    ok: credentialOk,
+    title: storageKey === 'zalouser'
+      ? '登录/会话配置'
+      : (storageKey === 'imessage'
+          ? '桥接运行配置'
+          : (storageKey === 'whatsapp' ? '扫码/会话配置' : '必要凭证字段')),
+    detail: storageKey === 'zalouser'
+      ? 'Zalo Personal 通过二维码登录保存本地会话；配置已保存后，请按手动命令完成或刷新登录。'
+      : storageKey === 'imessage'
+        ? (configExists
+            ? 'iMessage 使用本机或远端桥接运行，不需要 Bot Token；已保存基础运行配置。'
+            : '尚未保存 iMessage 渠道配置，请先填写并保存。')
+      : storageKey === 'whatsapp'
+        ? (configExists
+            ? 'WhatsApp 通过扫码登录保存本地会话，不需要 Bot Token；请使用扫码登录完成设备连接。'
+            : '尚未保存 WhatsApp 渠道配置，请先填写并保存。')
+      : (credentialOk
+          ? (requiredFields.length
+              ? `已填写 ${requiredFields.map(([, label]) => label).join(' / ')}${anyGroups.length ? `；${anyGroups.map(group => group.label).join('；')}` : ''}。`
+              : (anyGroups.length
+                  ? `已填写 ${anyGroups.map(group => group.label).join('；')}。`
+                  : (anyFields.length ? `已填写 ${anyLabels} 其中一项。` : '已检测到可用凭证字段。')))
+          : (missing.length
+              ? `缺少 ${missing.join(' / ')}，请补齐后保存。`
+              : (missingGroups.length
+                  ? `缺少 ${missingGroups.join('；')}，请补齐后保存。`
+                  : (anyFields.length ? `缺少 ${anyLabels}，至少填写一项后保存。` : '未检测到可用凭证字段，请检查渠道配置。')))),
+  })
+
+  if (verifyError) {
+    checks.push({
+      id: 'online_verify',
+      ok: false,
+      title: '平台在线校验',
+      detail: verifyError,
+    })
+  } else if (verifyResult) {
+    const valid = verifyResult.valid === true
+    const errors = Array.isArray(verifyResult.errors) ? verifyResult.errors : []
+    const warnings = Array.isArray(verifyResult.warnings) ? verifyResult.warnings : []
+    const details = Array.isArray(verifyResult.details) ? verifyResult.details : []
+    checks.push({
+      id: 'online_verify',
+      ok: valid || (!valid && warnings.length > 0 && errors.length === 0),
+      title: '平台在线校验',
+      detail: valid
+        ? (compactDiagnosticDetails(details) || '平台 API 已接受当前凭证。')
+        : (compactDiagnosticDetails(errors) || compactDiagnosticDetails(warnings) || '该平台暂不支持在线校验。'),
+    })
+  } else {
+    checks.push({
+      id: 'online_verify',
+      ok: true,
+      title: '平台在线校验',
+      detail: '未执行在线校验，仅完成本地配置检查。',
+    })
+  }
+
+  const failed = checks.filter(check => !check.ok)
+  return {
+    ok: failed.length === 0,
+    overallReady: failed.length === 0,
+    platform: displayPlatform,
+    accountId: accountId || null,
+    checks,
+    userHints: failed.length
+      ? [
+          '先修复未通过的检查项，保存渠道后重启或重载 Gateway。',
+          '在线校验只能证明平台凭证可用；群聊白名单、机器人邀请和平台回调仍需在对应平台控制台确认。',
+        ]
+      : [
+          '配置侧检查已通过。若仍收不到消息，请确认 Gateway 已重启、机器人已加入目标会话，并检查 Gateway 日志。',
+        ],
+  }
+}
+
+function preserveMessagingCredentialRefs(entry, form, current) {
+  delete entry.__secretRefs
+  for (const key of MESSAGING_CREDENTIAL_FIELDS) {
+    if (!Object.hasOwn(form || {}, key)) continue
+    const value = resolveMessagingCredentialValueForSave({ form, current, key })
+    if (value === undefined) {
+      delete entry[key]
+    } else {
+      entry[key] = value
+    }
+  }
+  return entry
+}
+
+export function buildMessagingPlatformFormValues(platform, saved = {}, options = {}) {
+  if (!saved || typeof saved !== 'object') return {}
+  const form = {}
+  const storageKey = platformStorageKey(platform)
+
+  if (storageKey === 'telegram') {
+    putSecretAwareFormValue(form, saved, 'botToken')
+    putAccessPolicyFormValues(form, saved, { telegramCompat: true })
+    return form
+  }
+
+  if (storageKey === 'discord') {
+    putSecretAwareFormValue(form, saved, 'token')
+    putStringFormValue(form, saved, 'applicationId')
+    putAccessPolicyFormValues(form, saved)
+    const guilds = saved.guilds && typeof saved.guilds === 'object' ? saved.guilds : null
+    const guildId = guilds ? Object.keys(guilds)[0] : ''
+    if (guildId) {
+      form.guildId = guildId
+      const channels = guilds[guildId]?.channels && typeof guilds[guildId].channels === 'object'
+        ? guilds[guildId].channels
+        : null
+      const channelId = channels ? Object.keys(channels).find(id => id !== '*') : ''
+      if (channelId) form.channelId = channelId
+    }
+    return form
+  }
+
+  if (storageKey === 'feishu') {
+    putSecretAwareFormValue(form, saved, 'appId')
+    putSecretAwareFormValue(form, saved, 'appSecret')
+    const shared = options.channelRoot && typeof options.channelRoot === 'object'
+      ? { ...saved, ...options.channelRoot }
+      : saved
+    for (const key of ['domain', 'connectionMode', 'webhookPath', 'reactionNotifications', 'textChunkLimit', 'mediaMaxMb']) {
+      putStringFormValue(form, shared, key)
+    }
+    putAccessPolicyFormValues(form, shared, { mentionCompat: true })
+    putBoolFormValue(form, shared, 'typingIndicator')
+    putBoolFormValue(form, shared, 'resolveSenderNames')
+    putBoolFormValue(form, shared, 'requireMention')
+    return form
+  }
+
+  if (storageKey === 'slack') {
+    for (const key of ['mode', 'botToken', 'appToken', 'signingSecret', 'webhookPath', 'teamId', 'appId', 'socketMode']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putAccessPolicyFormValues(form, saved, { mentionCompat: true })
+    putBoolFormValue(form, saved, 'userTokenReadOnly')
+    putBoolFormValue(form, saved, 'requireMention')
+    return form
+  }
+
+  if (storageKey === 'whatsapp') {
+    putAccessPolicyFormValues(form, saved)
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    putBoolFormValue(form, saved, 'enabled')
+    for (const key of ['configWrites', 'sendReadReceipts', 'selfChatMode', 'blockStreaming']) {
+      putBoolFormValue(form, saved, key)
+    }
+    for (const key of ['defaultTo', 'contextVisibility', 'chunkMode', 'reactionLevel', 'replyToMode', 'messagePrefix', 'responsePrefix']) {
+      putStringFormValue(form, saved, key)
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'mediaMaxMb', 'debounceMs', 'textChunkLimit']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    if (saved?.ackReaction && typeof saved.ackReaction === 'object') {
+      putStringFormValue(form, saved.ackReaction, 'emoji')
+      if (form.emoji) {
+        form.ackEmoji = form.emoji
+        delete form.emoji
+      }
+      putBoolFormValue(form, saved.ackReaction, 'direct')
+      if (form.direct) {
+        form.ackDirect = form.direct
+        delete form.direct
+      }
+      putStringFormValue(form, saved.ackReaction, 'group')
+      if (form.group) {
+        form.ackGroup = form.group
+        delete form.group
+      }
+    }
+    return form
+  }
+
+  if (storageKey === 'signal') {
+    for (const key of ['account', 'cliPath', 'httpUrl', 'httpHost', 'httpPort', 'responsePrefix']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putAccessPolicyFormValues(form, saved)
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    putBoolFormValue(form, saved, 'blockStreaming')
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    return form
+  }
+
+  if (storageKey === 'matrix') {
+    for (const key of ['homeserver', 'accessToken', 'userId', 'password', 'deviceId']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putAccessPolicyFormValues(form, saved)
+    putBoolFormValue(form, saved, 'e2ee')
+    if (form.accessToken) form.authMode = 'token'
+    else if (form.userId || form.password) form.authMode = 'password'
+    return form
+  }
+
+  if (storageKey === 'msteams') {
+    for (const key of ['appId', 'appPassword', 'tenantId', 'authType', 'certificatePath', 'certificateThumbprint', 'managedIdentityClientId', 'botEndpoint', 'replyStyle', 'sharePointSiteId', 'responsePrefix', 'ssoConnectionName']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putStringFormValue(form, saved?.webhook, 'path')
+    if (form.path) {
+      form.webhookPath = form.path
+      delete form.path
+    }
+    if (typeof saved?.webhook?.port === 'number') form.webhookPort = String(saved.webhook.port)
+    putAccessPolicyFormValues(form, saved, { mentionCompat: true })
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    putBoolFormValue(form, saved, 'requireMention')
+    for (const key of ['useManagedIdentity', 'blockStreaming', 'typingIndicator', 'welcomeCard', 'groupWelcomeCard', 'feedbackEnabled', 'feedbackReflection']) {
+      putBoolFormValue(form, saved, key)
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb', 'feedbackReflectionCooldownMs']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    putCsvFormValue(form, saved, 'promptStarters')
+    putBoolFormValue(form, saved?.delegatedAuth, 'enabled')
+    if (form.enabled) {
+      form.delegatedAuthEnabled = form.enabled
+      delete form.enabled
+    }
+    putCsvFormValue(form, saved?.delegatedAuth, 'scopes')
+    if (form.scopes) {
+      form.delegatedAuthScopes = form.scopes
+      delete form.scopes
+    }
+    putBoolFormValue(form, saved?.sso, 'enabled')
+    if (form.enabled) {
+      form.ssoEnabled = form.enabled
+      delete form.enabled
+    }
+    putStringFormValue(form, saved?.sso, 'connectionName')
+    if (form.connectionName) {
+      form.ssoConnectionName = form.connectionName
+      delete form.connectionName
+    }
+    return form
+  }
+
+  if (storageKey === 'line') {
+    for (const key of ['channelAccessToken', 'tokenFile', 'channelSecret', 'secretFile', 'webhookPath', 'responsePrefix']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putAccessPolicyFormValues(form, saved)
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    if (typeof saved.mediaMaxMb === 'number') form.mediaMaxMb = String(saved.mediaMaxMb)
+    return form
+  }
+
+  if (storageKey === 'mattermost') {
+    for (const key of ['botToken', 'baseUrl', 'name', 'replyToMode', 'responsePrefix']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putAccessPolicyFormValues(form, saved, { mentionCompat: true })
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    putBoolFormValue(form, saved, 'dangerouslyAllowNameMatching')
+    putBoolFormValue(form, saved?.network, 'dangerouslyAllowPrivateNetwork')
+    putStringFormValue(form, saved?.commands, 'callbackPath')
+    putStringFormValue(form, saved?.commands, 'callbackUrl')
+    return form
+  }
+
+  if (storageKey === 'clickclack') {
+    for (const key of ['name', 'baseUrl', 'token', 'workspace', 'botUserId', 'agentId', 'replyMode', 'model', 'systemPrompt', 'defaultTo']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putBoolFormValue(form, saved, 'enabled')
+    putBoolFormValue(form, saved, 'senderIsOwner')
+    putCsvFormValue(form, saved, 'toolsAllow')
+    putCsvFormValue(form, saved, 'allowFrom')
+    for (const key of ['timeoutSeconds', 'reconnectMs']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    return form
+  }
+
+  if (storageKey === 'nextcloud-talk') {
+    for (const key of ['name', 'baseUrl', 'botSecret', 'botSecretFile', 'apiUser', 'apiPassword', 'apiPasswordFile', 'webhookHost', 'webhookPath', 'webhookPublicUrl', 'chunkMode', 'responsePrefix']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putBoolFormValue(form, saved, 'enabled')
+    putAccessPolicyFormValues(form, saved, { mentionCompat: true })
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    putBoolFormValue(form, saved, 'blockStreaming')
+    putBoolFormValue(form, saved?.network, 'dangerouslyAllowPrivateNetwork')
+    for (const key of ['webhookPort', 'historyLimit', 'dmHistoryLimit', 'mediaMaxMb', 'textChunkLimit']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    return form
+  }
+
+  if (storageKey === 'twitch') {
+    for (const key of ['username', 'accessToken', 'clientId', 'channel', 'responsePrefix', 'clientSecret', 'refreshToken']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putBoolFormValue(form, saved, 'enabled')
+    putCsvFormValue(form, saved, 'allowFrom')
+    putCsvFormValue(form, saved, 'allowedRoles')
+    putBoolFormValue(form, saved, 'requireMention')
+    for (const key of ['expiresIn', 'obtainmentTimestamp']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    return form
+  }
+
+  if (storageKey === 'nostr') {
+    putSecretAwareFormValue(form, saved, 'privateKey')
+    for (const key of ['name', 'defaultAccount', 'dmPolicy']) {
+      putStringFormValue(form, saved, key)
+    }
+    putBoolFormValue(form, saved, 'enabled')
+    putCsvFormValue(form, saved, 'relays')
+    putCsvFormValue(form, saved, 'allowFrom')
+    const profile = saved.profile && typeof saved.profile === 'object' ? saved.profile : {}
+    const profileMap = {
+      name: 'profileName',
+      displayName: 'profileDisplayName',
+      about: 'profileAbout',
+      picture: 'profilePicture',
+      banner: 'profileBanner',
+      website: 'profileWebsite',
+      nip05: 'profileNip05',
+      lud16: 'profileLud16',
+    }
+    for (const [sourceKey, formKey] of Object.entries(profileMap)) {
+      if (typeof profile[sourceKey] === 'string') form[formKey] = profile[sourceKey]
+    }
+    return form
+  }
+
+  if (storageKey === 'irc') {
+    for (const key of ['name', 'host', 'nick', 'username', 'realname', 'password', 'passwordFile', 'defaultTo', 'chunkMode', 'responsePrefix']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putBoolFormValue(form, saved, 'enabled')
+    putBoolFormValue(form, saved, 'tls')
+    putBoolFormValue(form, saved, 'blockStreaming')
+    putBoolFormValue(form, saved, 'dangerouslyAllowNameMatching')
+    putAccessPolicyFormValues(form, saved)
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    putCsvFormValue(form, saved, 'channels')
+    putCsvFormValue(form, saved, 'mentionPatterns')
+    putIrcGroupFormValues(form, saved)
+    for (const key of ['port', 'historyLimit', 'dmHistoryLimit', 'mediaMaxMb', 'textChunkLimit']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    const nickserv = saved.nickserv && typeof saved.nickserv === 'object' ? saved.nickserv : {}
+    if (typeof nickserv.enabled === 'boolean') {
+      form.nickservEnabled = nickserv.enabled ? 'true' : 'false'
+    }
+    putSecretAwareFormAlias(form, nickserv, 'service', 'nickservService')
+    putSecretAwareFormAlias(form, nickserv, 'password', 'nickservPassword')
+    putSecretAwareFormAlias(form, nickserv, 'passwordFile', 'nickservPasswordFile')
+    if (typeof nickserv.register === 'boolean') {
+      form.nickservRegister = nickserv.register ? 'true' : 'false'
+    }
+    if (typeof nickserv.registerEmail === 'string') {
+      form.nickservRegisterEmail = nickserv.registerEmail
+    }
+    return form
+  }
+
+  if (storageKey === 'tlon') {
+    const shared = options.channelRoot && typeof options.channelRoot === 'object'
+      ? { ...options.channelRoot, ...saved }
+      : saved
+    if (options.channelRoot?.network && !saved.network) shared.network = options.channelRoot.network
+    for (const key of ['name', 'ship', 'url', 'code', 'responsePrefix', 'ownerShip']) {
+      putSecretAwareFormValue(form, shared, key)
+    }
+    putBoolFormValue(form, shared, 'enabled')
+    putBoolFormValue(form, shared?.network, 'dangerouslyAllowPrivateNetwork')
+    putCsvFormValue(form, shared, 'groupChannels')
+    putCsvFormValue(form, shared, 'dmAllowlist')
+    putCsvFormValue(form, shared, 'groupInviteAllowlist')
+    putCsvFormValue(form, shared, 'defaultAuthorizedShips')
+    for (const key of ['autoDiscoverChannels', 'showModelSignature', 'autoAcceptDmInvites', 'autoAcceptGroupInvites']) {
+      putBoolFormValue(form, shared, key)
+    }
+    return form
+  }
+
+  if (storageKey === 'synology-chat') {
+    for (const key of ['token', 'incomingUrl', 'nasHost', 'webhookPath', 'botName']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    putStringFormValue(form, saved, 'dmPolicy')
+    putCsvFormValue(form, saved, 'allowedUserIds')
+    if (typeof saved.rateLimitPerMinute === 'number') form.rateLimitPerMinute = String(saved.rateLimitPerMinute)
+    putBoolFormValue(form, saved, 'dangerouslyAllowNameMatching')
+    putBoolFormValue(form, saved, 'dangerouslyAllowInheritedWebhookPath')
+    putBoolFormValue(form, saved, 'allowInsecureSsl')
+    return form
+  }
+
+  if (storageKey === 'googlechat') {
+    for (const key of ['serviceAccount', 'serviceAccountFile', 'serviceAccountRef', 'audienceType', 'audience', 'appPrincipal', 'webhookPath', 'webhookUrl', 'botUser', 'chunkMode', 'replyToMode', 'typingIndicator', 'responsePrefix']) {
+      putSecretAwareFormValue(form, saved, key)
+    }
+    const dm = saved.dm && typeof saved.dm === 'object' ? saved.dm : {}
+    putStringFormValue(form, dm, 'policy')
+    if (form.policy && !form.dmPolicy) {
+      form.dmPolicy = form.policy
+      delete form.policy
+    }
+    putCsvFormValue(form, dm, 'allowFrom')
+    putStringFormValue(form, saved, 'groupPolicy')
+    putCsvFormValue(form, saved, 'groupAllowFrom')
+    putBoolFormValue(form, saved, 'requireMention')
+    putBoolFormValue(form, saved, 'dangerouslyAllowNameMatching')
+    putBoolFormValue(form, saved, 'allowBots')
+    putBoolFormValue(form, saved, 'blockStreaming')
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb']) {
+      if (typeof saved[key] === 'number') form[key] = String(saved[key])
+    }
+    return form
+  }
+
+  for (const [key, value] of Object.entries(saved)) {
+    if (key === 'enabled' || key === 'accounts') continue
+    if (typeof value === 'string') form[key] = value
+    else if (normalizeSecretRef(value)) putSecretAwareFormValue(form, saved, key)
+    else if (Array.isArray(value)) {
+      const csv = csvForForm(value)
+      if (csv) form[key] = csv
+    } else if (typeof value === 'boolean') {
+      form[key] = value ? 'true' : 'false'
+    } else if (typeof value === 'number') {
+      form[key] = String(value)
+    }
+  }
+  return form
+}
+
+const HERMES_CHANNEL_PLATFORMS = [
+  'telegram',
+  'discord',
+  'slack',
+  'feishu',
+  'dingtalk',
+  'teams',
+  'google_chat',
+  'irc',
+  'line',
+  'simplex',
+]
+
+function normalizeHermesPlatform(platform) {
+  const p = String(platform || '').trim().toLowerCase()
+  return HERMES_CHANNEL_PLATFORMS.includes(p) ? p : ''
+}
+
+const HERMES_SESSION_RESET_MODES = new Set(['both', 'idle', 'daily', 'none'])
+const HERMES_STREAMING_TRANSPORTS = new Set(['auto', 'draft', 'edit', 'off'])
+const HERMES_CODE_EXECUTION_MODES = new Set(['project', 'strict'])
+const HERMES_TERMINAL_BACKENDS = new Set(['local', 'ssh', 'docker', 'singularity', 'modal', 'daytona', 'vercel_sandbox'])
+const HERMES_TERMINAL_MODAL_MODES = new Set(['auto', 'managed', 'direct'])
+const HERMES_TERMINAL_VERCEL_RUNTIMES = new Set(['node24', 'node22', 'python3.13'])
+const HERMES_BROWSER_ENGINES = new Set(['auto', 'lightpanda', 'chrome'])
+const HERMES_BROWSER_DIALOG_POLICIES = new Set(['must_respond', 'auto_dismiss', 'auto_accept'])
+const HERMES_WEB_BACKENDS = new Set(['tavily', 'firecrawl', 'parallel', 'exa', 'searxng', 'brave', 'brave_free', 'ddgs', 'xai', 'native'])
+const HERMES_LSP_WAIT_MODES = new Set(['document', 'full'])
+const HERMES_LSP_INSTALL_STRATEGIES = new Set(['auto', 'manual', 'off'])
+const HERMES_MODEL_CATALOG_DEFAULT_URL = 'https://hermes-agent.nousresearch.com/docs/api/model-catalog.json'
+const HERMES_STT_PROVIDERS = new Set(['auto', 'local', 'groq', 'openai', 'mistral'])
+const HERMES_STT_LOCAL_MODELS = new Set(['tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'])
+const HERMES_STT_OPENAI_MODELS = new Set(['whisper-1', 'gpt-4o-mini-transcribe', 'gpt-4o-transcribe'])
+const HERMES_STT_MISTRAL_MODELS = new Set(['voxtral-mini-latest', 'voxtral-mini-2602'])
+const HERMES_TTS_PROVIDERS = new Set(['edge', 'elevenlabs', 'openai', 'xai', 'minimax', 'mistral', 'gemini', 'neutts', 'kittentts', 'piper'])
+const HERMES_TTS_OPENAI_VOICES = new Set(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'])
+const HERMES_AUXILIARY_PROVIDERS = new Set(['auto', 'openrouter', 'nous', 'gemini', 'ollama-cloud', 'codex', 'main'])
+const HERMES_APPROVAL_MODES = new Set(['manual', 'smart', 'off'])
+const HERMES_APPROVAL_CRON_MODES = new Set(['deny', 'approve'])
+const HERMES_LOGGING_LEVELS = new Set(['DEBUG', 'INFO', 'WARNING'])
+const HERMES_AGENT_IMAGE_INPUT_MODES = new Set(['auto', 'native', 'text'])
+const HERMES_AGENT_REASONING_EFFORTS = new Set(['xhigh', 'high', 'medium', 'low', 'minimal', 'none'])
+const HERMES_PROMPT_CACHE_TTLS = new Set(['5m', '1h'])
+const HERMES_PROVIDER_ROUTING_SORTS = new Set(['price', 'throughput', 'latency'])
+const HERMES_PROVIDER_ROUTING_DATA_COLLECTION = new Set(['allow', 'deny'])
+const HERMES_DISPLAY_TOOL_PROGRESS_VALUES = new Set(['off', 'new', 'all', 'verbose'])
+const HERMES_DISPLAY_STREAMING_VALUES = new Set(['inherit', 'true', 'false'])
+const HERMES_TELEGRAM_REPLY_TO_MODE_VALUES = new Set(['off', 'first', 'all'])
+const HERMES_DISPLAY_RESUME_VALUES = new Set(['full', 'minimal'])
+const HERMES_DISPLAY_BUSY_INPUT_MODES = new Set(['interrupt', 'queue', 'steer'])
+const HERMES_DISPLAY_BACKGROUND_PROCESS_NOTIFICATIONS = new Set(['off', 'result', 'error', 'all'])
+const HERMES_DISPLAY_FINAL_RESPONSE_MARKDOWN_VALUES = new Set(['render', 'strip', 'raw'])
+const HERMES_DISPLAY_LANGUAGE_VALUES = new Set(['en', 'zh', 'zh-hant', 'ja', 'de', 'es', 'fr', 'tr', 'uk', 'af', 'ko', 'it', 'ga', 'pt', 'ru', 'hu'])
+const HERMES_DISPLAY_SKINS = new Set(['default', 'ares', 'mono', 'slate', 'daylight', 'warm-lightmode', 'poseidon', 'sisyphus', 'charizard'])
+const HERMES_RUNTIME_FOOTER_FIELDS = new Set(['model', 'context_pct', 'cwd', 'duration', 'tokens', 'cost'])
+const HERMES_TUI_STATUS_INDICATORS = new Set(['kaomoji', 'emoji', 'unicode', 'ascii'])
+const HERMES_COPY_SHORTCUTS = new Set(['auto', 'ctrl_c', 'ctrl_shift_c', 'disabled'])
+const HERMES_HOOK_EVENTS = new Set([
+  'pre_tool_call',
+  'post_tool_call',
+  'pre_llm_call',
+  'post_llm_call',
+  'pre_api_request',
+  'post_api_request',
+  'on_session_start',
+  'on_session_end',
+  'on_session_finalize',
+  'on_session_reset',
+  'subagent_stop',
+])
+const HERMES_DEFAULT_PLATFORM_TOOLSETS = {
+  cli: ['hermes-cli'],
+  telegram: ['hermes-telegram'],
+  discord: ['hermes-discord'],
+  whatsapp: ['hermes-whatsapp'],
+  slack: ['hermes-slack'],
+  signal: ['hermes-signal'],
+  homeassistant: ['hermes-homeassistant'],
+  qqbot: ['hermes-qqbot'],
+  yuanbao: ['hermes-yuanbao'],
+  teams: ['hermes-teams'],
+  google_chat: ['hermes-google_chat'],
+}
+
+function parseHermesInteger(value, key, fallback, min, max, strict = false) {
+  const raw = String(value ?? '').trim()
+  if (!raw) {
+    if (strict) throw new Error(`${key} 不能为空`)
+    return fallback
+  }
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || String(parsed) !== raw.replace(/^\+/, '')) {
+    if (strict) throw new Error(`${key} 必须是整数`)
+    return fallback
+  }
+  if (parsed < min || parsed > max) {
+    if (strict) throw new Error(`${key} 必须在 ${min}-${max} 范围内`)
+    return fallback
+  }
+  return parsed
+}
+
+function parseHermesFloat(value, key, fallback, min, max, strict = false) {
+  const raw = String(value ?? '').trim()
+  if (!raw) {
+    if (strict) throw new Error(`${key} 不能为空`)
+    return fallback
+  }
+  const parsed = Number.parseFloat(raw)
+  if (!Number.isFinite(parsed)) {
+    if (strict) throw new Error(`${key} 必须是数字`)
+    return fallback
+  }
+  if (parsed < min || parsed > max) {
+    if (strict) throw new Error(`${key} 必须在 ${min}-${max} 范围内`)
+    return fallback
+  }
+  return Number(parsed.toFixed(4))
+}
+
+function readHermesBool(value, fallback) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (['true', '1', 'yes', 'on'].includes(normalized)) return true
+    if (['false', '0', 'no', 'off'].includes(normalized)) return false
+  }
+  return fallback
+}
+
+function formHermesBool(form, key, fallback) {
+  return readHermesBool(form?.[key], fallback)
+}
+
+function normalizeHermesKanbanOptionalString(value, key, strict = false) {
+  if (value === undefined || value === null) return ''
+  if (typeof value !== 'string') {
+    if (strict) throw new Error(`${key} must be a string`)
+    return ''
+  }
+  return value.trim()
+}
+
+function normalizeHermesStreamingTransport(value, strict = false) {
+  const transport = String(value ?? '').trim().toLowerCase() || 'edit'
+  if (HERMES_STREAMING_TRANSPORTS.has(transport)) return transport
+  if (strict) throw new Error('streaming.transport 必须是 auto、draft、edit 或 off')
+  return 'edit'
+}
+
+function normalizeHermesCodeExecutionMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'project'
+  if (HERMES_CODE_EXECUTION_MODES.has(mode)) return mode
+  if (strict) throw new Error('code_execution.mode 必须是 project 或 strict')
+  return 'project'
+}
+
+function normalizeHermesTerminalBackend(value, strict = false) {
+  const backend = String(value ?? '').trim().toLowerCase() || 'local'
+  if (HERMES_TERMINAL_BACKENDS.has(backend)) return backend
+  if (strict) throw new Error('terminal.backend 必须是 local、ssh、docker、singularity、modal、daytona 或 vercel_sandbox')
+  return 'local'
+}
+
+function normalizeHermesTerminalModalMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_TERMINAL_MODAL_MODES.has(mode)) return mode
+  if (strict) throw new Error('terminal.modal_mode 必须是 auto、managed 或 direct')
+  return 'auto'
+}
+
+function normalizeHermesTerminalVercelRuntime(value, strict = false) {
+  const runtime = String(value ?? '').trim().toLowerCase() || 'node24'
+  if (HERMES_TERMINAL_VERCEL_RUNTIMES.has(runtime)) return runtime
+  if (strict) throw new Error('terminal.vercel_runtime 必须是 node24、node22 或 python3.13')
+  return 'node24'
+}
+
+function normalizeHermesBrowserEngine(value, strict = false) {
+  const engine = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_BROWSER_ENGINES.has(engine)) return engine
+  if (strict) throw new Error('browser.engine 必须是 auto、lightpanda 或 chrome')
+  return 'auto'
+}
+
+function normalizeHermesBrowserDialogPolicy(value, strict = false) {
+  const policy = String(value ?? '').trim().toLowerCase() || 'must_respond'
+  if (HERMES_BROWSER_DIALOG_POLICIES.has(policy)) return policy
+  if (strict) throw new Error('browser.dialog_policy 必须是 must_respond、auto_dismiss 或 auto_accept')
+  return 'must_respond'
+}
+
+function normalizeHermesWebBackend(value, key, strict = false) {
+  const backend = String(value ?? '').trim().toLowerCase()
+  if (!backend) return ''
+  if (HERMES_WEB_BACKENDS.has(backend)) return backend
+  if (strict) throw new Error(`${key} 必须为空或 tavily、firecrawl、parallel、exa、searxng、brave、brave_free、ddgs、xai、native`)
+  return ''
+}
+
+function normalizeHermesHttpUrl(value, key, fallback = '', strict = false) {
+  const raw = String(value ?? '').trim()
+  if (!raw) {
+    if (strict && !fallback) throw new Error(`${key} 不能为空`)
+    return fallback
+  }
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return raw
+  } catch (_) {
+    // 统一在下面抛出可读错误
+  }
+  if (strict) throw new Error(`${key} 必须是 http:// 或 https:// URL`)
+  return fallback
+}
+
+function normalizeHermesLspWaitMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'document'
+  if (HERMES_LSP_WAIT_MODES.has(mode)) return mode
+  if (strict) throw new Error('lsp.wait_mode 必须是 document 或 full')
+  return 'document'
+}
+
+function normalizeHermesLspInstallStrategy(value, strict = false) {
+  const strategy = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_LSP_INSTALL_STRATEGIES.has(strategy)) return strategy
+  if (strict) throw new Error('lsp.install_strategy 必须是 auto、manual 或 off')
+  return 'auto'
+}
+
+function normalizeHermesSttProvider(value, strict = false) {
+  const provider = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_STT_PROVIDERS.has(provider)) return provider
+  if (strict) throw new Error('stt.provider 必须是 auto、local、groq、openai 或 mistral')
+  return 'auto'
+}
+
+function normalizeHermesSttLocalModel(value, strict = false) {
+  const model = String(value ?? '').trim().toLowerCase() || 'base'
+  if (HERMES_STT_LOCAL_MODELS.has(model)) return model
+  if (strict) throw new Error('stt.local.model 必须是 tiny、base、small、medium、large-v3 或 turbo')
+  return 'base'
+}
+
+function normalizeHermesSttOpenaiModel(value, strict = false) {
+  const model = String(value ?? '').trim() || 'whisper-1'
+  if (HERMES_STT_OPENAI_MODELS.has(model)) return model
+  if (strict) throw new Error('stt.openai.model 必须是 whisper-1、gpt-4o-mini-transcribe 或 gpt-4o-transcribe')
+  return 'whisper-1'
+}
+
+function normalizeHermesSttMistralModel(value, strict = false) {
+  const model = String(value ?? '').trim() || 'voxtral-mini-latest'
+  if (HERMES_STT_MISTRAL_MODELS.has(model)) return model
+  if (strict) throw new Error('stt.mistral.model 必须是 voxtral-mini-latest 或 voxtral-mini-2602')
+  return 'voxtral-mini-latest'
+}
+
+function normalizeHermesSttLanguage(value, strict = false) {
+  const language = String(value ?? '').trim()
+  if (!language) return ''
+  if (/^[a-z]{2,3}(-[A-Za-z0-9]+)?$/.test(language)) return language
+  if (strict) throw new Error('stt.local.language 必须为空或合法语言标签，例如 zh、en、pt-BR')
+  return ''
+}
+
+function normalizeHermesTtsProvider(value, strict = false) {
+  const provider = String(value ?? '').trim().toLowerCase() || 'edge'
+  if (HERMES_TTS_PROVIDERS.has(provider)) return provider
+  if (strict) throw new Error('tts.provider 必须是 edge、elevenlabs、openai、xai、minimax、mistral、gemini、neutts、kittentts 或 piper')
+  return 'edge'
+}
+
+function normalizeHermesTtsOpenaiVoice(value, strict = false) {
+  const voice = String(value ?? '').trim().toLowerCase() || 'alloy'
+  if (HERMES_TTS_OPENAI_VOICES.has(voice)) return voice
+  if (strict) throw new Error('tts.openai.voice 必须是 alloy、echo、fable、onyx、nova 或 shimmer')
+  return 'alloy'
+}
+
+function normalizeHermesVoiceLanguage(value, strict = false, key = 'tts.xai.language') {
+  const language = String(value ?? '').trim()
+  if (!language) return 'en'
+  if (/^[a-z]{2,3}(-[A-Za-z0-9]+)?$/.test(language)) return language
+  if (strict) throw new Error(`${key} 必须是合法语言标签，例如 en、zh、pt-BR`)
+  return 'en'
+}
+
+function normalizeHermesApprovalMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'manual'
+  if (HERMES_APPROVAL_MODES.has(mode)) return mode
+  if (strict) throw new Error('approvals.mode 必须是 manual、smart 或 off')
+  return 'manual'
+}
+
+function normalizeHermesApprovalCronMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'deny'
+  if (HERMES_APPROVAL_CRON_MODES.has(mode)) return mode
+  if (strict) throw new Error('approvals.cron_mode 必须是 deny 或 approve')
+  return 'deny'
+}
+
+function normalizeHermesLoggingLevel(value, strict = false) {
+  const level = String(value ?? '').trim().toUpperCase() || 'INFO'
+  if (HERMES_LOGGING_LEVELS.has(level)) return level
+  if (strict) throw new Error('logging.level 必须是 DEBUG、INFO 或 WARNING')
+  return 'INFO'
+}
+
+function normalizeHermesImageInputMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_AGENT_IMAGE_INPUT_MODES.has(mode)) return mode
+  if (strict) throw new Error('agent.image_input_mode 必须是 auto、native 或 text')
+  return 'auto'
+}
+
+function normalizeHermesReasoningEffort(value, strict = false) {
+  const effort = String(value ?? '').trim().toLowerCase() || 'medium'
+  if (HERMES_AGENT_REASONING_EFFORTS.has(effort)) return effort
+  if (strict) throw new Error('agent.reasoning_effort 必须是 xhigh、high、medium、low、minimal 或 none')
+  return 'medium'
+}
+
+function normalizeHermesPromptCacheTtl(value, strict = false) {
+  const ttl = String(value ?? '').trim().toLowerCase() || '5m'
+  if (HERMES_PROMPT_CACHE_TTLS.has(ttl)) return ttl
+  if (strict) throw new Error('prompt_caching.cache_ttl 必须是 5m 或 1h')
+  return '5m'
+}
+
+function normalizeHermesProviderRoutingSort(value, strict = false) {
+  const sort = String(value ?? '').trim().toLowerCase() || 'price'
+  if (HERMES_PROVIDER_ROUTING_SORTS.has(sort)) return sort
+  if (strict) throw new Error('provider_routing.sort 必须是 price、throughput 或 latency')
+  return 'price'
+}
+
+function normalizeHermesProviderRoutingDataCollection(value, strict = false) {
+  const policy = String(value ?? '').trim().toLowerCase() || 'allow'
+  if (HERMES_PROVIDER_ROUTING_DATA_COLLECTION.has(policy)) return policy
+  if (strict) throw new Error('provider_routing.data_collection 必须是 allow 或 deny')
+  return 'allow'
+}
+
+function normalizeHermesProviderRoutingList(value, key) {
+  const seen = new Set()
+  const normalized = []
+  for (const item of normalizeHermesMultilineList(value)) {
+    const provider = String(item ?? '').trim().toLowerCase()
+    if (!/^[a-zA-Z0-9_.-]+$/.test(provider)) {
+      throw new Error(`${key} 只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (!seen.has(provider)) {
+      seen.add(provider)
+      normalized.push(provider)
+    }
+  }
+  return normalized
+}
+
+function normalizeHermesEnvNameList(value, key) {
+  const seen = new Set()
+  const normalized = []
+  for (const item of normalizeHermesMultilineList(value)) {
+    const name = String(item ?? '').trim()
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+      throw new Error(`${key} 只能填写环境变量名，每行一个，例如 GITHUB_TOKEN`)
+    }
+    if (!seen.has(name)) {
+      seen.add(name)
+      normalized.push(name)
+    }
+  }
+  return normalized
+}
+
+function normalizeHermesShellInitFileList(value, key) {
+  const seen = new Set()
+  const normalized = []
+  for (const item of normalizeHermesMultilineList(value)) {
+    const path = String(item ?? '').trim()
+    if (!path || /[\u0000-\u001f\u007f]/.test(path) || /\s/.test(path)) {
+      throw new Error(`${key} 每行只能填写一个 shell 初始化文件路径，路径不能包含空白字符`)
+    }
+    if (!/^[~$%{}A-Za-z0-9_./:\\-]+$/.test(path)) {
+      throw new Error(`${key} 只能包含路径字符、~、环境变量占位、点、斜杠、冒号和短横线`)
+    }
+    if (!seen.has(path)) {
+      seen.add(path)
+      normalized.push(path)
+    }
+  }
+  return normalized
+}
+
+function normalizeHermesDockerEnvJson(value, key) {
+  let object = value
+  if (typeof value === 'string') {
+    const text = value.trim()
+    object = text ? JSON.parse(text) : {}
+  }
+  if (!object || typeof object !== 'object' || Array.isArray(object)) {
+    throw new Error(`${key} 必须是 JSON object，例如 {"PLAYWRIGHT_BROWSERS_PATH":"/ms-playwright"}`)
+  }
+  const normalized = {}
+  for (const [name, rawValue] of Object.entries(object)) {
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+      throw new Error(`${key} 只能使用合法环境变量名作为 key`)
+    }
+    if (rawValue === null || (typeof rawValue === 'object' && !Array.isArray(rawValue))) {
+      throw new Error(`${key}.${name} 只能是字符串、数字或布尔值`)
+    }
+    if (Array.isArray(rawValue)) {
+      throw new Error(`${key}.${name} 不能是数组`)
+    }
+    normalized[name] = String(rawValue)
+  }
+  return normalized
+}
+
+function normalizeHermesDockerVolumeList(value, key) {
+  const seen = new Set()
+  const normalized = []
+  for (const item of normalizeHermesMultilineList(value)) {
+    const volume = String(item ?? '').trim()
+    if (!volume.includes(':') || /[\u0000-\u001f\u007f\s]/.test(volume)) {
+      throw new Error(`${key} 每行一个 Docker volume 映射，例如 /host/path:/container/path`)
+    }
+    if (!seen.has(volume)) {
+      seen.add(volume)
+      normalized.push(volume)
+    }
+  }
+  return normalized
+}
+
+function normalizeHermesDockerExtraArgsList(value, key) {
+  const seen = new Set()
+  const normalized = []
+  for (const item of normalizeHermesMultilineList(value)) {
+    const arg = String(item ?? '').trim()
+    if (!arg.startsWith('-') || /[\u0000-\u001f\u007f\s]/.test(arg)) {
+      throw new Error(`${key} 每行一个 Docker 参数，必须以 - 开头，例如 --network=host`)
+    }
+    if (!seen.has(arg)) {
+      seen.add(arg)
+      normalized.push(arg)
+    }
+  }
+  return normalized
+}
+
+function normalizeHermesAuxiliaryProvider(value, key, strict = false) {
+  const provider = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_AUXILIARY_PROVIDERS.has(provider)) return provider
+  if (strict) throw new Error(`${key} 必须是 auto、openrouter、nous、gemini、ollama-cloud、codex 或 main`)
+  return 'auto'
+}
+
+function normalizeHermesAuxiliaryModel(value, key, strict = false) {
+  const model = String(value ?? '').trim()
+  if (!model) return ''
+  if (/^[a-zA-Z0-9_./:@+-]+$/.test(model) && !model.split('/').includes('..')) return model
+  if (strict) throw new Error(`${key} 只能包含字母、数字、下划线、点、斜杠、冒号、@、加号和短横线`)
+  return ''
+}
+
+function normalizeHermesDisplayToolProgress(value, strict = false, key = 'display.tool_progress') {
+  const progress = String(value ?? '').trim().toLowerCase() || 'all'
+  if (HERMES_DISPLAY_TOOL_PROGRESS_VALUES.has(progress)) return progress
+  if (strict) throw new Error(`${key} 必须是 off、new、all 或 verbose`)
+  return 'all'
+}
+
+function normalizeHermesDisplayToolPrefix(value, strict = false) {
+  const prefix = String(value ?? '').trim() || '┊'
+  if (prefix.length <= 8 && !/[\r\n\t]/.test(prefix)) return prefix
+  if (strict) throw new Error('display.tool_prefix 必须是 1 到 8 个字符，且不能包含换行或制表符')
+  return '┊'
+}
+
+function normalizeHermesDisplayStreaming(value, strict = false, key = 'display.streaming') {
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  const streaming = String(value ?? '').trim().toLowerCase() || 'inherit'
+  if (HERMES_DISPLAY_STREAMING_VALUES.has(streaming)) return streaming
+  if (strict) throw new Error(`${key} 必须是 inherit、true 或 false`)
+  return 'inherit'
+}
+
+function normalizeHermesDisplayResume(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'full'
+  if (HERMES_DISPLAY_RESUME_VALUES.has(mode)) return mode
+  if (strict) throw new Error('display.resume_display 必须是 full 或 minimal')
+  return 'full'
+}
+
+function normalizeHermesDisplayBusyInputMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'interrupt'
+  if (HERMES_DISPLAY_BUSY_INPUT_MODES.has(mode)) return mode
+  if (strict) throw new Error('display.busy_input_mode 必须是 interrupt、queue 或 steer')
+  return 'interrupt'
+}
+
+function normalizeHermesDisplayBackgroundProcessNotifications(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'all'
+  if (HERMES_DISPLAY_BACKGROUND_PROCESS_NOTIFICATIONS.has(mode)) return mode
+  if (strict) throw new Error('display.background_process_notifications 必须是 off、result、error 或 all')
+  return 'all'
+}
+
+function normalizeHermesDisplayFinalResponseMarkdown(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'strip'
+  if (HERMES_DISPLAY_FINAL_RESPONSE_MARKDOWN_VALUES.has(mode)) return mode
+  if (strict) throw new Error('display.final_response_markdown 必须是 render、strip 或 raw')
+  return 'strip'
+}
+
+function normalizeHermesTuiStatusIndicator(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'kaomoji'
+  if (HERMES_TUI_STATUS_INDICATORS.has(mode)) return mode
+  if (strict) throw new Error('display.tui_status_indicator 必须是 kaomoji、emoji、unicode 或 ascii')
+  return 'kaomoji'
+}
+
+function normalizeHermesCopyShortcut(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'auto'
+  if (HERMES_COPY_SHORTCUTS.has(mode)) return mode
+  if (strict) throw new Error('display.copy_shortcut 必须是 auto、ctrl_c、ctrl_shift_c 或 disabled')
+  return 'auto'
+}
+
+function normalizeHermesDisplayLanguage(value, strict = false) {
+  const language = String(value ?? '').trim().toLowerCase() || 'en'
+  if (HERMES_DISPLAY_LANGUAGE_VALUES.has(language)) return language
+  if (strict) throw new Error('display.language 不在支持列表中')
+  return 'en'
+}
+
+function normalizeHermesDisplaySkin(value, strict = false) {
+  const skin = String(value ?? '').trim().toLowerCase() || 'default'
+  if (HERMES_DISPLAY_SKINS.has(skin)) return skin
+  if (strict) throw new Error('display.skin 必须是内置皮肤 default、ares、mono、slate、daylight、warm-lightmode、poseidon、sisyphus 或 charizard')
+  return 'default'
+}
+
+function normalizeHermesRuntimeFooterFields(value, strict = false) {
+  const items = Array.isArray(value)
+    ? value
+    : String(value ?? '').split(/\r?\n|,/)
+  const normalized = [...new Set(items.map(item => String(item ?? '').trim()).filter(Boolean))]
+  if (!normalized.length) return ['model', 'context_pct', 'cwd']
+  const invalid = normalized.find(item => !HERMES_RUNTIME_FOOTER_FIELDS.has(item))
+  if (invalid) {
+    if (strict) throw new Error(`display.runtime_footer.fields 包含不支持的字段: ${invalid}`)
+    return ['model', 'context_pct', 'cwd']
+  }
+  return normalized
+}
+
+function hermesDisplayConfigParts(config = {}, platform = '') {
+  const display = config?.display && typeof config.display === 'object' && !Array.isArray(config.display)
+    ? config.display
+    : {}
+  const platforms = display.platforms && typeof display.platforms === 'object' && !Array.isArray(display.platforms)
+    ? display.platforms
+    : {}
+  const platformDisplay = platforms[platform] && typeof platforms[platform] === 'object' && !Array.isArray(platforms[platform])
+    ? platforms[platform]
+    : {}
+  return { display, platformDisplay }
+}
+
+export function buildHermesDisplayConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const display = root.display && typeof root.display === 'object' && !Array.isArray(root.display)
+    ? root.display
+    : {}
+  const dashboard = root.dashboard && typeof root.dashboard === 'object' && !Array.isArray(root.dashboard)
+    ? root.dashboard
+    : {}
+  const runtimeFooter = display.runtime_footer && typeof display.runtime_footer === 'object' && !Array.isArray(display.runtime_footer)
+    ? display.runtime_footer
+    : {}
+  const userMessagePreview = display.user_message_preview && typeof display.user_message_preview === 'object' && !Array.isArray(display.user_message_preview)
+    ? display.user_message_preview
+    : {}
+  return {
+    displayCompact: readHermesBool(display.compact, false),
+    displaySkin: normalizeHermesDisplaySkin(display.skin, false),
+    displayToolPrefix: normalizeHermesDisplayToolPrefix(display.tool_prefix, false),
+    displayToolProgress: normalizeHermesDisplayToolProgress(display.tool_progress, false),
+    displayShowReasoning: readHermesBool(display.show_reasoning, false),
+    displayToolPreviewLength: parseHermesInteger(display.tool_preview_length, 'display.tool_preview_length', 0, 0, 200000, false),
+    displayCleanupProgress: readHermesBool(display.cleanup_progress, false),
+    displayToolProgressCommand: readHermesBool(display.tool_progress_command, false),
+    displayInterimAssistantMessages: readHermesBool(display.interim_assistant_messages, true),
+    displayRuntimeFooterEnabled: readHermesBool(runtimeFooter.enabled, false),
+    displayRuntimeFooterFields: normalizeHermesRuntimeFooterFields(runtimeFooter.fields, false).join('\n'),
+    displayFileMutationVerifier: readHermesBool(display.file_mutation_verifier, true),
+    displayShowCost: readHermesBool(display.show_cost, false),
+    dashboardShowTokenAnalytics: readHermesBool(dashboard.show_token_analytics, false),
+    displayLanguage: normalizeHermesDisplayLanguage(display.language, false),
+    displayResumeDisplay: normalizeHermesDisplayResume(display.resume_display, false),
+    displayBusyInputMode: normalizeHermesDisplayBusyInputMode(display.busy_input_mode, false),
+    displayBackgroundProcessNotifications: normalizeHermesDisplayBackgroundProcessNotifications(display.background_process_notifications, false),
+    displayFinalResponseMarkdown: normalizeHermesDisplayFinalResponseMarkdown(display.final_response_markdown, false),
+    displayTimestamps: readHermesBool(display.timestamps, false),
+    displayBellOnComplete: readHermesBool(display.bell_on_complete, false),
+    displayPersistentOutput: readHermesBool(display.persistent_output, true),
+    displayPersistentOutputMaxLines: parseHermesInteger(display.persistent_output_max_lines, 'display.persistent_output_max_lines', 200, 0, 100000, false),
+    displayInlineDiffs: readHermesBool(display.inline_diffs, true),
+    displayTuiAutoResumeRecent: readHermesBool(display.tui_auto_resume_recent, false),
+    displayTuiStatusIndicator: normalizeHermesTuiStatusIndicator(display.tui_status_indicator, false),
+    displayUserMessagePreviewFirstLines: parseHermesInteger(userMessagePreview.first_lines, 'display.user_message_preview.first_lines', 2, 1, 100, false),
+    displayUserMessagePreviewLastLines: parseHermesInteger(userMessagePreview.last_lines, 'display.user_message_preview.last_lines', 2, 0, 100, false),
+    displayEphemeralSystemTtl: parseHermesInteger(display.ephemeral_system_ttl, 'display.ephemeral_system_ttl', 0, 0, 86400, false),
+    displayCopyShortcut: normalizeHermesCopyShortcut(display.copy_shortcut, false),
+  }
+}
+
+export function mergeHermesDisplayConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesDisplayConfigValues(next)
+  const display = next.display && typeof next.display === 'object' && !Array.isArray(next.display)
+    ? mergeConfigsPreservingFields(next.display, {})
+    : {}
+  const runtimeFooter = display.runtime_footer && typeof display.runtime_footer === 'object' && !Array.isArray(display.runtime_footer)
+    ? mergeConfigsPreservingFields(display.runtime_footer, {})
+    : {}
+  const userMessagePreview = display.user_message_preview && typeof display.user_message_preview === 'object' && !Array.isArray(display.user_message_preview)
+    ? mergeConfigsPreservingFields(display.user_message_preview, {})
+    : {}
+
+  display.compact = formHermesBool(form, 'displayCompact', currentValues.displayCompact)
+  display.skin = normalizeHermesDisplaySkin(Object.hasOwn(form, 'displaySkin') ? form.displaySkin : currentValues.displaySkin, true)
+  display.tool_prefix = normalizeHermesDisplayToolPrefix(Object.hasOwn(form, 'displayToolPrefix') ? form.displayToolPrefix : currentValues.displayToolPrefix, true)
+  display.tool_progress = normalizeHermesDisplayToolProgress(Object.hasOwn(form, 'displayToolProgress') ? form.displayToolProgress : currentValues.displayToolProgress, true, 'display.tool_progress')
+  display.show_reasoning = formHermesBool(form, 'displayShowReasoning', currentValues.displayShowReasoning)
+  display.tool_preview_length = parseHermesInteger(Object.hasOwn(form, 'displayToolPreviewLength') ? form.displayToolPreviewLength : currentValues.displayToolPreviewLength, 'display.tool_preview_length', 0, 0, 200000, true)
+  display.cleanup_progress = formHermesBool(form, 'displayCleanupProgress', currentValues.displayCleanupProgress)
+  display.tool_progress_command = formHermesBool(form, 'displayToolProgressCommand', currentValues.displayToolProgressCommand)
+  display.interim_assistant_messages = formHermesBool(form, 'displayInterimAssistantMessages', currentValues.displayInterimAssistantMessages)
+  runtimeFooter.enabled = formHermesBool(form, 'displayRuntimeFooterEnabled', currentValues.displayRuntimeFooterEnabled)
+  runtimeFooter.fields = normalizeHermesRuntimeFooterFields(Object.hasOwn(form, 'displayRuntimeFooterFields') ? form.displayRuntimeFooterFields : currentValues.displayRuntimeFooterFields, true)
+  display.runtime_footer = runtimeFooter
+  display.file_mutation_verifier = formHermesBool(form, 'displayFileMutationVerifier', currentValues.displayFileMutationVerifier)
+  display.show_cost = formHermesBool(form, 'displayShowCost', currentValues.displayShowCost)
+  display.language = normalizeHermesDisplayLanguage(Object.hasOwn(form, 'displayLanguage') ? form.displayLanguage : currentValues.displayLanguage, true)
+  display.resume_display = normalizeHermesDisplayResume(Object.hasOwn(form, 'displayResumeDisplay') ? form.displayResumeDisplay : currentValues.displayResumeDisplay, true)
+  display.busy_input_mode = normalizeHermesDisplayBusyInputMode(Object.hasOwn(form, 'displayBusyInputMode') ? form.displayBusyInputMode : currentValues.displayBusyInputMode, true)
+  display.background_process_notifications = normalizeHermesDisplayBackgroundProcessNotifications(Object.hasOwn(form, 'displayBackgroundProcessNotifications') ? form.displayBackgroundProcessNotifications : currentValues.displayBackgroundProcessNotifications, true)
+  display.final_response_markdown = normalizeHermesDisplayFinalResponseMarkdown(Object.hasOwn(form, 'displayFinalResponseMarkdown') ? form.displayFinalResponseMarkdown : currentValues.displayFinalResponseMarkdown, true)
+  display.timestamps = formHermesBool(form, 'displayTimestamps', currentValues.displayTimestamps)
+  display.bell_on_complete = formHermesBool(form, 'displayBellOnComplete', currentValues.displayBellOnComplete)
+  display.persistent_output = formHermesBool(form, 'displayPersistentOutput', currentValues.displayPersistentOutput)
+  display.persistent_output_max_lines = parseHermesInteger(Object.hasOwn(form, 'displayPersistentOutputMaxLines') ? form.displayPersistentOutputMaxLines : currentValues.displayPersistentOutputMaxLines, 'display.persistent_output_max_lines', 200, 0, 100000, true)
+  display.inline_diffs = formHermesBool(form, 'displayInlineDiffs', currentValues.displayInlineDiffs)
+  display.tui_auto_resume_recent = formHermesBool(form, 'displayTuiAutoResumeRecent', currentValues.displayTuiAutoResumeRecent)
+  display.tui_status_indicator = normalizeHermesTuiStatusIndicator(Object.hasOwn(form, 'displayTuiStatusIndicator') ? form.displayTuiStatusIndicator : currentValues.displayTuiStatusIndicator, true)
+  userMessagePreview.first_lines = parseHermesInteger(Object.hasOwn(form, 'displayUserMessagePreviewFirstLines') ? form.displayUserMessagePreviewFirstLines : currentValues.displayUserMessagePreviewFirstLines, 'display.user_message_preview.first_lines', 2, 1, 100, true)
+  userMessagePreview.last_lines = parseHermesInteger(Object.hasOwn(form, 'displayUserMessagePreviewLastLines') ? form.displayUserMessagePreviewLastLines : currentValues.displayUserMessagePreviewLastLines, 'display.user_message_preview.last_lines', 2, 0, 100, true)
+  display.user_message_preview = userMessagePreview
+  display.ephemeral_system_ttl = parseHermesInteger(Object.hasOwn(form, 'displayEphemeralSystemTtl') ? form.displayEphemeralSystemTtl : currentValues.displayEphemeralSystemTtl, 'display.ephemeral_system_ttl', 0, 0, 86400, true)
+  display.copy_shortcut = normalizeHermesCopyShortcut(Object.hasOwn(form, 'displayCopyShortcut') ? form.displayCopyShortcut : currentValues.displayCopyShortcut, true)
+  next.display = display
+  const dashboard = next.dashboard && typeof next.dashboard === 'object' && !Array.isArray(next.dashboard)
+    ? mergeConfigsPreservingFields(next.dashboard, {})
+    : {}
+  dashboard.show_token_analytics = formHermesBool(form, 'dashboardShowTokenAnalytics', currentValues.dashboardShowTokenAnalytics)
+  next.dashboard = dashboard
+  return next
+}
+
+export function buildHermesKanbanConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const kanban = root.kanban && typeof root.kanban === 'object' && !Array.isArray(root.kanban)
+    ? root.kanban
+    : {}
+  return {
+    dispatchInGateway: readHermesBool(kanban.dispatch_in_gateway, true),
+    dispatchIntervalSeconds: parseHermesInteger(
+      kanban.dispatch_interval_seconds,
+      'kanban.dispatch_interval_seconds',
+      60,
+      1,
+      86400,
+      false,
+    ),
+    maxSpawn: parseHermesInteger(
+      kanban.max_spawn,
+      'kanban.max_spawn',
+      0,
+      0,
+      1000,
+      false,
+    ),
+    maxInProgress: parseHermesInteger(
+      kanban.max_in_progress,
+      'kanban.max_in_progress',
+      0,
+      0,
+      1000,
+      false,
+    ),
+    failureLimit: parseHermesInteger(
+      kanban.failure_limit,
+      'kanban.failure_limit',
+      2,
+      1,
+      100,
+      false,
+    ),
+    autoDecompose: readHermesBool(kanban.auto_decompose, true),
+    autoDecomposePerTick: parseHermesInteger(
+      kanban.auto_decompose_per_tick,
+      'kanban.auto_decompose_per_tick',
+      3,
+      1,
+      1000,
+      false,
+    ),
+    workerLogRotateBytes: parseHermesInteger(
+      kanban.worker_log_rotate_bytes,
+      'kanban.worker_log_rotate_bytes',
+      2097152,
+      1,
+      1073741824,
+      false,
+    ),
+    workerLogBackupCount: parseHermesInteger(
+      kanban.worker_log_backup_count,
+      'kanban.worker_log_backup_count',
+      1,
+      0,
+      100,
+      false,
+    ),
+    orchestratorProfile: normalizeHermesKanbanOptionalString(
+      kanban.orchestrator_profile,
+      'kanban.orchestrator_profile',
+      false,
+    ),
+    defaultAssignee: normalizeHermesKanbanOptionalString(
+      kanban.default_assignee,
+      'kanban.default_assignee',
+      false,
+    ),
+    dispatchStaleTimeoutSeconds: parseHermesInteger(
+      kanban.dispatch_stale_timeout_seconds,
+      'kanban.dispatch_stale_timeout_seconds',
+      14400,
+      0,
+      604800,
+      false,
+    ),
+  }
+}
+
+export function mergeHermesKanbanConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesKanbanConfigValues(next)
+  const kanban = next.kanban && typeof next.kanban === 'object' && !Array.isArray(next.kanban)
+    ? mergeConfigsPreservingFields(next.kanban, {})
+    : {}
+
+  kanban.dispatch_in_gateway = formHermesBool(form, 'dispatchInGateway', currentValues.dispatchInGateway)
+  kanban.dispatch_interval_seconds = parseHermesInteger(
+    Object.hasOwn(form, 'dispatchIntervalSeconds') ? form.dispatchIntervalSeconds : currentValues.dispatchIntervalSeconds,
+    'kanban.dispatch_interval_seconds',
+    60,
+    1,
+    86400,
+    true,
+  )
+  const maxSpawn = parseHermesInteger(
+    Object.hasOwn(form, 'maxSpawn') ? form.maxSpawn : currentValues.maxSpawn,
+    'kanban.max_spawn',
+    0,
+    0,
+    1000,
+    true,
+  )
+  if (maxSpawn > 0) kanban.max_spawn = maxSpawn
+  else delete kanban.max_spawn
+  const maxInProgress = parseHermesInteger(
+    Object.hasOwn(form, 'maxInProgress') ? form.maxInProgress : currentValues.maxInProgress,
+    'kanban.max_in_progress',
+    0,
+    0,
+    1000,
+    true,
+  )
+  if (maxInProgress > 0) kanban.max_in_progress = maxInProgress
+  else delete kanban.max_in_progress
+  kanban.failure_limit = parseHermesInteger(
+    Object.hasOwn(form, 'failureLimit') ? form.failureLimit : currentValues.failureLimit,
+    'kanban.failure_limit',
+    2,
+    1,
+    100,
+    true,
+  )
+  kanban.auto_decompose = formHermesBool(form, 'autoDecompose', currentValues.autoDecompose)
+  kanban.auto_decompose_per_tick = parseHermesInteger(
+    Object.hasOwn(form, 'autoDecomposePerTick') ? form.autoDecomposePerTick : currentValues.autoDecomposePerTick,
+    'kanban.auto_decompose_per_tick',
+    3,
+    1,
+    1000,
+    true,
+  )
+  kanban.worker_log_rotate_bytes = parseHermesInteger(
+    Object.hasOwn(form, 'workerLogRotateBytes') ? form.workerLogRotateBytes : currentValues.workerLogRotateBytes,
+    'kanban.worker_log_rotate_bytes',
+    2097152,
+    1,
+    1073741824,
+    true,
+  )
+  kanban.worker_log_backup_count = parseHermesInteger(
+    Object.hasOwn(form, 'workerLogBackupCount') ? form.workerLogBackupCount : currentValues.workerLogBackupCount,
+    'kanban.worker_log_backup_count',
+    1,
+    0,
+    100,
+    true,
+  )
+  const orchestratorProfile = normalizeHermesKanbanOptionalString(
+    Object.hasOwn(form, 'orchestratorProfile') ? form.orchestratorProfile : currentValues.orchestratorProfile,
+    'kanban.orchestrator_profile',
+    true,
+  )
+  if (orchestratorProfile) kanban.orchestrator_profile = orchestratorProfile
+  else delete kanban.orchestrator_profile
+  const defaultAssignee = normalizeHermesKanbanOptionalString(
+    Object.hasOwn(form, 'defaultAssignee') ? form.defaultAssignee : currentValues.defaultAssignee,
+    'kanban.default_assignee',
+    true,
+  )
+  if (defaultAssignee) kanban.default_assignee = defaultAssignee
+  else delete kanban.default_assignee
+  kanban.dispatch_stale_timeout_seconds = parseHermesInteger(
+    Object.hasOwn(form, 'dispatchStaleTimeoutSeconds') ? form.dispatchStaleTimeoutSeconds : currentValues.dispatchStaleTimeoutSeconds,
+    'kanban.dispatch_stale_timeout_seconds',
+    14400,
+    0,
+    604800,
+    true,
+  )
+  next.kanban = kanban
+  return next
+}
+
+function putHermesChannelDisplayFields(form, config, platform) {
+  const { display, platformDisplay } = hermesDisplayConfigParts(config, platform)
+  const legacyToolProgress = display.tool_progress_overrides && typeof display.tool_progress_overrides === 'object' && !Array.isArray(display.tool_progress_overrides)
+    ? display.tool_progress_overrides[platform]
+    : undefined
+  form.displayToolProgress = normalizeHermesDisplayToolProgress(
+    platformDisplay.tool_progress ?? legacyToolProgress ?? display.tool_progress ?? 'all',
+    false,
+  )
+  form.displayShowReasoning = readHermesBool(platformDisplay.show_reasoning ?? display.show_reasoning, false)
+  form.displayToolPreviewLength = parseHermesInteger(
+    platformDisplay.tool_preview_length ?? display.tool_preview_length,
+    `display.platforms.${platform}.tool_preview_length`,
+    0,
+    0,
+    200000,
+    false,
+  )
+  form.displayStreaming = Object.hasOwn(platformDisplay, 'streaming')
+    ? normalizeHermesDisplayStreaming(platformDisplay.streaming, false)
+    : 'inherit'
+  form.displayCleanupProgress = readHermesBool(platformDisplay.cleanup_progress ?? display.cleanup_progress, false)
+}
+
+function hermesStreamingConfigSource(root) {
+  if (root.streaming && typeof root.streaming === 'object' && !Array.isArray(root.streaming)) {
+    return root.streaming
+  }
+  const gateway = root.gateway && typeof root.gateway === 'object' && !Array.isArray(root.gateway)
+    ? root.gateway
+    : {}
+  return gateway.streaming && typeof gateway.streaming === 'object' && !Array.isArray(gateway.streaming)
+    ? gateway.streaming
+    : {}
+}
+
+export function buildHermesCompressionConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const compression = root.compression && typeof root.compression === 'object' && !Array.isArray(root.compression)
+    ? root.compression
+    : {}
+  return {
+    enabled: readHermesBool(compression.enabled, true),
+    threshold: parseHermesFloat(compression.threshold, 'compression.threshold', 0.5, 0.1, 0.95, false),
+    targetRatio: parseHermesFloat(compression.target_ratio, 'compression.target_ratio', 0.2, 0.1, 0.8, false),
+    protectLastN: parseHermesInteger(compression.protect_last_n, 'compression.protect_last_n', 20, 1, 500, false),
+    protectFirstN: parseHermesInteger(compression.protect_first_n, 'compression.protect_first_n', 3, 0, 100, false),
+    abortOnSummaryFailure: readHermesBool(compression.abort_on_summary_failure, false),
+  }
+}
+
+export function mergeHermesCompressionConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesCompressionConfigValues(next)
+  const compression = next.compression && typeof next.compression === 'object' && !Array.isArray(next.compression)
+    ? mergeConfigsPreservingFields(next.compression, {})
+    : {}
+  compression.enabled = formHermesBool(form, 'enabled', currentValues.enabled)
+  compression.threshold = parseHermesFloat(Object.hasOwn(form, 'threshold') ? form.threshold : currentValues.threshold, 'compression.threshold', 0.5, 0.1, 0.95, true)
+  compression.target_ratio = parseHermesFloat(Object.hasOwn(form, 'targetRatio') ? form.targetRatio : currentValues.targetRatio, 'compression.target_ratio', 0.2, 0.1, 0.8, true)
+  compression.protect_last_n = parseHermesInteger(Object.hasOwn(form, 'protectLastN') ? form.protectLastN : currentValues.protectLastN, 'compression.protect_last_n', 20, 1, 500, true)
+  compression.protect_first_n = parseHermesInteger(Object.hasOwn(form, 'protectFirstN') ? form.protectFirstN : currentValues.protectFirstN, 'compression.protect_first_n', 3, 0, 100, true)
+  compression.abort_on_summary_failure = formHermesBool(form, 'abortOnSummaryFailure', currentValues.abortOnSummaryFailure)
+  next.compression = compression
+  return next
+}
+
+export function buildHermesPromptCachingConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const promptCaching = root.prompt_caching && typeof root.prompt_caching === 'object' && !Array.isArray(root.prompt_caching)
+    ? root.prompt_caching
+    : {}
+  return {
+    promptCacheTtl: normalizeHermesPromptCacheTtl(promptCaching.cache_ttl, false),
+  }
+}
+
+export function mergeHermesPromptCachingConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesPromptCachingConfigValues(next)
+  const promptCaching = next.prompt_caching && typeof next.prompt_caching === 'object' && !Array.isArray(next.prompt_caching)
+    ? mergeConfigsPreservingFields(next.prompt_caching, {})
+    : {}
+  promptCaching.cache_ttl = normalizeHermesPromptCacheTtl(Object.hasOwn(form, 'promptCacheTtl') ? form.promptCacheTtl : currentValues.promptCacheTtl, true)
+  next.prompt_caching = promptCaching
+  return next
+}
+
+export function buildHermesOpenrouterCacheConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const openrouter = root.openrouter && typeof root.openrouter === 'object' && !Array.isArray(root.openrouter)
+    ? root.openrouter
+    : {}
+  return {
+    openrouterResponseCache: readHermesBool(openrouter.response_cache, true),
+    openrouterResponseCacheTtl: parseHermesInteger(openrouter.response_cache_ttl, 'openrouter.response_cache_ttl', 300, 1, 86400, false),
+  }
+}
+
+export function mergeHermesOpenrouterCacheConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesOpenrouterCacheConfigValues(next)
+  const openrouter = next.openrouter && typeof next.openrouter === 'object' && !Array.isArray(next.openrouter)
+    ? mergeConfigsPreservingFields(next.openrouter, {})
+    : {}
+  openrouter.response_cache = formHermesBool(form, 'openrouterResponseCache', currentValues.openrouterResponseCache)
+  openrouter.response_cache_ttl = parseHermesInteger(Object.hasOwn(form, 'openrouterResponseCacheTtl') ? form.openrouterResponseCacheTtl : currentValues.openrouterResponseCacheTtl, 'openrouter.response_cache_ttl', 300, 1, 86400, true)
+  next.openrouter = openrouter
+  return next
+}
+
+export function buildHermesProviderRoutingConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const providerRouting = root.provider_routing && typeof root.provider_routing === 'object' && !Array.isArray(root.provider_routing)
+    ? root.provider_routing
+    : {}
+  return {
+    providerRoutingSort: normalizeHermesProviderRoutingSort(providerRouting.sort, false),
+    providerRoutingOnly: normalizeHermesProviderRoutingList(providerRouting.only || [], 'provider_routing.only').join('\n'),
+    providerRoutingIgnore: normalizeHermesProviderRoutingList(providerRouting.ignore || [], 'provider_routing.ignore').join('\n'),
+    providerRoutingOrder: normalizeHermesProviderRoutingList(providerRouting.order || [], 'provider_routing.order').join('\n'),
+    providerRoutingRequireParameters: readHermesBool(providerRouting.require_parameters, false),
+    providerRoutingDataCollection: normalizeHermesProviderRoutingDataCollection(providerRouting.data_collection, false),
+  }
+}
+
+export function mergeHermesProviderRoutingConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesProviderRoutingConfigValues(next)
+  const providerRouting = next.provider_routing && typeof next.provider_routing === 'object' && !Array.isArray(next.provider_routing)
+    ? mergeConfigsPreservingFields(next.provider_routing, {})
+    : {}
+  providerRouting.sort = normalizeHermesProviderRoutingSort(Object.hasOwn(form, 'providerRoutingSort') ? form.providerRoutingSort : currentValues.providerRoutingSort, true)
+  providerRouting.require_parameters = formHermesBool(form, 'providerRoutingRequireParameters', currentValues.providerRoutingRequireParameters)
+  providerRouting.data_collection = normalizeHermesProviderRoutingDataCollection(Object.hasOwn(form, 'providerRoutingDataCollection') ? form.providerRoutingDataCollection : currentValues.providerRoutingDataCollection, true)
+
+  for (const [field, formKey] of [
+    ['only', 'providerRoutingOnly'],
+    ['ignore', 'providerRoutingIgnore'],
+    ['order', 'providerRoutingOrder'],
+  ]) {
+    const values = normalizeHermesProviderRoutingList(Object.hasOwn(form, formKey) ? form[formKey] : currentValues[formKey], `provider_routing.${field}`)
+    if (values.length) providerRouting[field] = values
+    else delete providerRouting[field]
+  }
+
+  next.provider_routing = providerRouting
+  return next
+}
+
+function hermesAuxiliaryTask(root, key) {
+  const auxiliary = root.auxiliary && typeof root.auxiliary === 'object' && !Array.isArray(root.auxiliary)
+    ? root.auxiliary
+    : {}
+  return auxiliary[key] && typeof auxiliary[key] === 'object' && !Array.isArray(auxiliary[key])
+    ? auxiliary[key]
+    : {}
+}
+
+export function buildHermesAuxiliaryConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const vision = hermesAuxiliaryTask(root, 'vision')
+  const webExtract = hermesAuxiliaryTask(root, 'web_extract')
+  const sessionSearch = hermesAuxiliaryTask(root, 'session_search')
+  return {
+    auxiliaryVisionProvider: normalizeHermesAuxiliaryProvider(vision.provider, 'auxiliary.vision.provider', false),
+    auxiliaryVisionModel: normalizeHermesAuxiliaryModel(vision.model, 'auxiliary.vision.model', false),
+    auxiliaryVisionTimeout: parseHermesInteger(vision.timeout, 'auxiliary.vision.timeout', 30, 1, 3600, false),
+    auxiliaryVisionDownloadTimeout: parseHermesInteger(vision.download_timeout, 'auxiliary.vision.download_timeout', 30, 1, 3600, false),
+    auxiliaryWebExtractProvider: normalizeHermesAuxiliaryProvider(webExtract.provider, 'auxiliary.web_extract.provider', false),
+    auxiliaryWebExtractModel: normalizeHermesAuxiliaryModel(webExtract.model, 'auxiliary.web_extract.model', false),
+    auxiliarySessionSearchProvider: normalizeHermesAuxiliaryProvider(sessionSearch.provider, 'auxiliary.session_search.provider', false),
+    auxiliarySessionSearchModel: normalizeHermesAuxiliaryModel(sessionSearch.model, 'auxiliary.session_search.model', false),
+    auxiliarySessionSearchTimeout: parseHermesInteger(sessionSearch.timeout, 'auxiliary.session_search.timeout', 30, 1, 3600, false),
+    auxiliarySessionSearchMaxConcurrency: parseHermesInteger(sessionSearch.max_concurrency, 'auxiliary.session_search.max_concurrency', 3, 1, 100, false),
+  }
+}
+
+export function mergeHermesAuxiliaryConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesAuxiliaryConfigValues(next)
+  const auxiliary = next.auxiliary && typeof next.auxiliary === 'object' && !Array.isArray(next.auxiliary)
+    ? mergeConfigsPreservingFields(next.auxiliary, {})
+    : {}
+  const vision = auxiliary.vision && typeof auxiliary.vision === 'object' && !Array.isArray(auxiliary.vision)
+    ? mergeConfigsPreservingFields(auxiliary.vision, {})
+    : {}
+  const webExtract = auxiliary.web_extract && typeof auxiliary.web_extract === 'object' && !Array.isArray(auxiliary.web_extract)
+    ? mergeConfigsPreservingFields(auxiliary.web_extract, {})
+    : {}
+  const sessionSearch = auxiliary.session_search && typeof auxiliary.session_search === 'object' && !Array.isArray(auxiliary.session_search)
+    ? mergeConfigsPreservingFields(auxiliary.session_search, {})
+    : {}
+
+  vision.provider = normalizeHermesAuxiliaryProvider(Object.hasOwn(form, 'auxiliaryVisionProvider') ? form.auxiliaryVisionProvider : currentValues.auxiliaryVisionProvider, 'auxiliary.vision.provider', true)
+  vision.model = normalizeHermesAuxiliaryModel(Object.hasOwn(form, 'auxiliaryVisionModel') ? form.auxiliaryVisionModel : currentValues.auxiliaryVisionModel, 'auxiliary.vision.model', true)
+  vision.timeout = parseHermesInteger(Object.hasOwn(form, 'auxiliaryVisionTimeout') ? form.auxiliaryVisionTimeout : currentValues.auxiliaryVisionTimeout, 'auxiliary.vision.timeout', 30, 1, 3600, true)
+  vision.download_timeout = parseHermesInteger(Object.hasOwn(form, 'auxiliaryVisionDownloadTimeout') ? form.auxiliaryVisionDownloadTimeout : currentValues.auxiliaryVisionDownloadTimeout, 'auxiliary.vision.download_timeout', 30, 1, 3600, true)
+  webExtract.provider = normalizeHermesAuxiliaryProvider(Object.hasOwn(form, 'auxiliaryWebExtractProvider') ? form.auxiliaryWebExtractProvider : currentValues.auxiliaryWebExtractProvider, 'auxiliary.web_extract.provider', true)
+  webExtract.model = normalizeHermesAuxiliaryModel(Object.hasOwn(form, 'auxiliaryWebExtractModel') ? form.auxiliaryWebExtractModel : currentValues.auxiliaryWebExtractModel, 'auxiliary.web_extract.model', true)
+  sessionSearch.provider = normalizeHermesAuxiliaryProvider(Object.hasOwn(form, 'auxiliarySessionSearchProvider') ? form.auxiliarySessionSearchProvider : currentValues.auxiliarySessionSearchProvider, 'auxiliary.session_search.provider', true)
+  sessionSearch.model = normalizeHermesAuxiliaryModel(Object.hasOwn(form, 'auxiliarySessionSearchModel') ? form.auxiliarySessionSearchModel : currentValues.auxiliarySessionSearchModel, 'auxiliary.session_search.model', true)
+  sessionSearch.timeout = parseHermesInteger(Object.hasOwn(form, 'auxiliarySessionSearchTimeout') ? form.auxiliarySessionSearchTimeout : currentValues.auxiliarySessionSearchTimeout, 'auxiliary.session_search.timeout', 30, 1, 3600, true)
+  sessionSearch.max_concurrency = parseHermesInteger(Object.hasOwn(form, 'auxiliarySessionSearchMaxConcurrency') ? form.auxiliarySessionSearchMaxConcurrency : currentValues.auxiliarySessionSearchMaxConcurrency, 'auxiliary.session_search.max_concurrency', 3, 1, 100, true)
+
+  auxiliary.vision = vision
+  auxiliary.web_extract = webExtract
+  auxiliary.session_search = sessionSearch
+  next.auxiliary = auxiliary
+  return next
+}
+
+export function buildHermesToolLoopGuardrailsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const guardrails = root.tool_loop_guardrails && typeof root.tool_loop_guardrails === 'object' && !Array.isArray(root.tool_loop_guardrails)
+    ? root.tool_loop_guardrails
+    : {}
+  const warnAfter = guardrails.warn_after && typeof guardrails.warn_after === 'object' && !Array.isArray(guardrails.warn_after)
+    ? guardrails.warn_after
+    : {}
+  const hardStopAfter = guardrails.hard_stop_after && typeof guardrails.hard_stop_after === 'object' && !Array.isArray(guardrails.hard_stop_after)
+    ? guardrails.hard_stop_after
+    : {}
+  return {
+    warningsEnabled: readHermesBool(guardrails.warnings_enabled, true),
+    hardStopEnabled: readHermesBool(guardrails.hard_stop_enabled, false),
+    warnExactFailure: parseHermesInteger(warnAfter.exact_failure ?? guardrails.exact_failure_warn_after, 'tool_loop_guardrails.warn_after.exact_failure', 2, 1, 100, false),
+    warnSameToolFailure: parseHermesInteger(warnAfter.same_tool_failure ?? guardrails.same_tool_failure_warn_after, 'tool_loop_guardrails.warn_after.same_tool_failure', 3, 1, 100, false),
+    warnNoProgress: parseHermesInteger(warnAfter.idempotent_no_progress ?? guardrails.no_progress_warn_after, 'tool_loop_guardrails.warn_after.idempotent_no_progress', 2, 1, 100, false),
+    hardStopExactFailure: parseHermesInteger(hardStopAfter.exact_failure ?? guardrails.exact_failure_block_after, 'tool_loop_guardrails.hard_stop_after.exact_failure', 5, 1, 100, false),
+    hardStopSameToolFailure: parseHermesInteger(hardStopAfter.same_tool_failure ?? guardrails.same_tool_failure_halt_after, 'tool_loop_guardrails.hard_stop_after.same_tool_failure', 8, 1, 100, false),
+    hardStopNoProgress: parseHermesInteger(hardStopAfter.idempotent_no_progress ?? guardrails.no_progress_block_after, 'tool_loop_guardrails.hard_stop_after.idempotent_no_progress', 5, 1, 100, false),
+  }
+}
+
+export function mergeHermesToolLoopGuardrailsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesToolLoopGuardrailsConfigValues(next)
+  const guardrails = next.tool_loop_guardrails && typeof next.tool_loop_guardrails === 'object' && !Array.isArray(next.tool_loop_guardrails)
+    ? mergeConfigsPreservingFields(next.tool_loop_guardrails, {})
+    : {}
+  const warnAfter = guardrails.warn_after && typeof guardrails.warn_after === 'object' && !Array.isArray(guardrails.warn_after)
+    ? mergeConfigsPreservingFields(guardrails.warn_after, {})
+    : {}
+  const hardStopAfter = guardrails.hard_stop_after && typeof guardrails.hard_stop_after === 'object' && !Array.isArray(guardrails.hard_stop_after)
+    ? mergeConfigsPreservingFields(guardrails.hard_stop_after, {})
+    : {}
+
+  guardrails.warnings_enabled = formHermesBool(form, 'warningsEnabled', currentValues.warningsEnabled)
+  guardrails.hard_stop_enabled = formHermesBool(form, 'hardStopEnabled', currentValues.hardStopEnabled)
+  warnAfter.exact_failure = parseHermesInteger(Object.hasOwn(form, 'warnExactFailure') ? form.warnExactFailure : currentValues.warnExactFailure, 'tool_loop_guardrails.warn_after.exact_failure', 2, 1, 100, true)
+  warnAfter.same_tool_failure = parseHermesInteger(Object.hasOwn(form, 'warnSameToolFailure') ? form.warnSameToolFailure : currentValues.warnSameToolFailure, 'tool_loop_guardrails.warn_after.same_tool_failure', 3, 1, 100, true)
+  warnAfter.idempotent_no_progress = parseHermesInteger(Object.hasOwn(form, 'warnNoProgress') ? form.warnNoProgress : currentValues.warnNoProgress, 'tool_loop_guardrails.warn_after.idempotent_no_progress', 2, 1, 100, true)
+  hardStopAfter.exact_failure = parseHermesInteger(Object.hasOwn(form, 'hardStopExactFailure') ? form.hardStopExactFailure : currentValues.hardStopExactFailure, 'tool_loop_guardrails.hard_stop_after.exact_failure', 5, 1, 100, true)
+  hardStopAfter.same_tool_failure = parseHermesInteger(Object.hasOwn(form, 'hardStopSameToolFailure') ? form.hardStopSameToolFailure : currentValues.hardStopSameToolFailure, 'tool_loop_guardrails.hard_stop_after.same_tool_failure', 8, 1, 100, true)
+  hardStopAfter.idempotent_no_progress = parseHermesInteger(Object.hasOwn(form, 'hardStopNoProgress') ? form.hardStopNoProgress : currentValues.hardStopNoProgress, 'tool_loop_guardrails.hard_stop_after.idempotent_no_progress', 5, 1, 100, true)
+  guardrails.warn_after = warnAfter
+  guardrails.hard_stop_after = hardStopAfter
+  next.tool_loop_guardrails = guardrails
+  return next
+}
+
+export function buildHermesMemoryConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const memory = root.memory && typeof root.memory === 'object' && !Array.isArray(root.memory)
+    ? root.memory
+    : {}
+  return {
+    memoryEnabled: readHermesBool(memory.memory_enabled, true),
+    userProfileEnabled: readHermesBool(memory.user_profile_enabled, true),
+    memoryCharLimit: parseHermesInteger(memory.memory_char_limit, 'memory.memory_char_limit', 2200, 100, 200000, false),
+    userCharLimit: parseHermesInteger(memory.user_char_limit, 'memory.user_char_limit', 1375, 100, 200000, false),
+    nudgeInterval: parseHermesInteger(memory.nudge_interval, 'memory.nudge_interval', 10, 0, 1000, false),
+    flushMinTurns: parseHermesInteger(memory.flush_min_turns, 'memory.flush_min_turns', 6, 0, 1000, false),
+  }
+}
+
+export function mergeHermesMemoryConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesMemoryConfigValues(next)
+  const memory = next.memory && typeof next.memory === 'object' && !Array.isArray(next.memory)
+    ? mergeConfigsPreservingFields(next.memory, {})
+    : {}
+  memory.memory_enabled = formHermesBool(form, 'memoryEnabled', currentValues.memoryEnabled)
+  memory.user_profile_enabled = formHermesBool(form, 'userProfileEnabled', currentValues.userProfileEnabled)
+  memory.memory_char_limit = parseHermesInteger(Object.hasOwn(form, 'memoryCharLimit') ? form.memoryCharLimit : currentValues.memoryCharLimit, 'memory.memory_char_limit', 2200, 100, 200000, true)
+  memory.user_char_limit = parseHermesInteger(Object.hasOwn(form, 'userCharLimit') ? form.userCharLimit : currentValues.userCharLimit, 'memory.user_char_limit', 1375, 100, 200000, true)
+  memory.nudge_interval = parseHermesInteger(Object.hasOwn(form, 'nudgeInterval') ? form.nudgeInterval : currentValues.nudgeInterval, 'memory.nudge_interval', 10, 0, 1000, true)
+  memory.flush_min_turns = parseHermesInteger(Object.hasOwn(form, 'flushMinTurns') ? form.flushMinTurns : currentValues.flushMinTurns, 'memory.flush_min_turns', 6, 0, 1000, true)
+  next.memory = memory
+  return next
+}
+
+function normalizeHermesMultilineList(value) {
+  if (Array.isArray(value)) {
+    return value.map(item => String(item ?? '').trim()).filter(Boolean)
+  }
+  return String(value ?? '')
+    .split(/\r?\n/)
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
+function normalizeHermesToolsetList(value, fieldName = 'agent.disabled_toolsets') {
+  const seen = new Set()
+  const normalized = []
+  for (const item of normalizeHermesMultilineList(value)) {
+    if (!/^[a-zA-Z0-9_.-]+$/.test(item)) {
+      throw new Error(`${fieldName} 只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (!seen.has(item)) {
+      seen.add(item)
+      normalized.push(item)
+    }
+  }
+  return normalized
+}
+
+function validateHermesPersonalities(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('agent.personalities 必须是 JSON 对象')
+  }
+  const normalized = {}
+  for (const [rawName, rawPrompt] of Object.entries(value)) {
+    const name = String(rawName || '').trim()
+    if (!name) throw new Error('agent.personalities 名称不能为空')
+    if (!/^[A-Za-z0-9_.-]+$/.test(name)) {
+      throw new Error(`agent.personalities.${name} 名称只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (typeof rawPrompt !== 'string') {
+      throw new Error(`agent.personalities.${name} 必须是字符串`)
+    }
+    const prompt = rawPrompt.trim()
+    if (!prompt) throw new Error(`agent.personalities.${name} 不能为空`)
+    normalized[name] = prompt
+  }
+  return normalized
+}
+
+function parseHermesPersonalitiesJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`agent.personalities JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesPersonalities(value)
+}
+
+function validateHermesPlatformToolsets(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('platform_toolsets 必须是 JSON 对象')
+  }
+  const normalized = {}
+  for (const [rawPlatform, rawToolsets] of Object.entries(value)) {
+    const platform = String(rawPlatform || '').trim()
+    if (!platform || !/^[a-zA-Z0-9_.-]+$/.test(platform)) {
+      throw new Error(`platform_toolsets.${platform || '<empty>'} 平台名只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (!Array.isArray(rawToolsets)) {
+      throw new Error(`platform_toolsets.${platform} 必须是工具集数组`)
+    }
+    const toolsets = normalizeHermesToolsetList(rawToolsets, `platform_toolsets.${platform}`)
+    if (!toolsets.length) {
+      throw new Error(`platform_toolsets.${platform} 至少需要一个工具集`)
+    }
+    normalized[platform] = toolsets
+  }
+  return normalized
+}
+
+function parseHermesPlatformToolsetsJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`platform_toolsets JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesPlatformToolsets(value)
+}
+
+export function buildHermesSkillsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const skills = root.skills && typeof root.skills === 'object' && !Array.isArray(root.skills)
+    ? root.skills
+    : {}
+  const externalDirs = Array.isArray(skills.external_dirs)
+    ? skills.external_dirs.map(item => String(item ?? '').trim()).filter(Boolean).join('\n')
+    : ''
+  return {
+    creationNudgeInterval: parseHermesInteger(skills.creation_nudge_interval, 'skills.creation_nudge_interval', 15, 0, 10000, false),
+    externalDirs,
+    templateVars: readHermesBool(skills.template_vars, true),
+    inlineShell: readHermesBool(skills.inline_shell, false),
+    inlineShellTimeout: parseHermesInteger(skills.inline_shell_timeout, 'skills.inline_shell_timeout', 10, 1, 86400, false),
+    guardAgentCreated: readHermesBool(skills.guard_agent_created, false),
+  }
+}
+
+export function mergeHermesSkillsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesSkillsConfigValues(next)
+  const skills = next.skills && typeof next.skills === 'object' && !Array.isArray(next.skills)
+    ? mergeConfigsPreservingFields(next.skills, {})
+    : {}
+  skills.creation_nudge_interval = parseHermesInteger(Object.hasOwn(form, 'creationNudgeInterval') ? form.creationNudgeInterval : currentValues.creationNudgeInterval, 'skills.creation_nudge_interval', 15, 0, 10000, true)
+  skills.template_vars = formHermesBool(form, 'templateVars', currentValues.templateVars)
+  skills.inline_shell = formHermesBool(form, 'inlineShell', currentValues.inlineShell)
+  skills.inline_shell_timeout = parseHermesInteger(Object.hasOwn(form, 'inlineShellTimeout') ? form.inlineShellTimeout : currentValues.inlineShellTimeout, 'skills.inline_shell_timeout', 10, 1, 86400, true)
+  skills.guard_agent_created = formHermesBool(form, 'guardAgentCreated', currentValues.guardAgentCreated)
+  const externalDirs = normalizeHermesMultilineList(Object.hasOwn(form, 'externalDirs') ? form.externalDirs : currentValues.externalDirs)
+  if (externalDirs.length) skills.external_dirs = externalDirs
+  else delete skills.external_dirs
+  next.skills = skills
+  return next
+}
+
+export function buildHermesCuratorConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const curator = root.curator && typeof root.curator === 'object' && !Array.isArray(root.curator)
+    ? root.curator
+    : {}
+  const backup = curator.backup && typeof curator.backup === 'object' && !Array.isArray(curator.backup)
+    ? curator.backup
+    : {}
+  return {
+    curatorEnabled: readHermesBool(curator.enabled, true),
+    curatorIntervalHours: parseHermesInteger(curator.interval_hours, 'curator.interval_hours', 168, 1, 87600, false),
+    curatorMinIdleHours: parseHermesInteger(curator.min_idle_hours, 'curator.min_idle_hours', 2, 0, 87600, false),
+    curatorStaleAfterDays: parseHermesInteger(curator.stale_after_days, 'curator.stale_after_days', 30, 1, 36500, false),
+    curatorArchiveAfterDays: parseHermesInteger(curator.archive_after_days, 'curator.archive_after_days', 90, 1, 36500, false),
+    curatorBackupEnabled: readHermesBool(backup.enabled, true),
+    curatorBackupKeep: parseHermesInteger(backup.keep, 'curator.backup.keep', 5, 0, 1000, false),
+  }
+}
+
+export function mergeHermesCuratorConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesCuratorConfigValues(next)
+  const curator = next.curator && typeof next.curator === 'object' && !Array.isArray(next.curator)
+    ? mergeConfigsPreservingFields(next.curator, {})
+    : {}
+  const backup = curator.backup && typeof curator.backup === 'object' && !Array.isArray(curator.backup)
+    ? mergeConfigsPreservingFields(curator.backup, {})
+    : {}
+
+  curator.enabled = formHermesBool(form, 'curatorEnabled', currentValues.curatorEnabled)
+  curator.interval_hours = parseHermesInteger(Object.hasOwn(form, 'curatorIntervalHours') ? form.curatorIntervalHours : currentValues.curatorIntervalHours, 'curator.interval_hours', 168, 1, 87600, true)
+  curator.min_idle_hours = parseHermesInteger(Object.hasOwn(form, 'curatorMinIdleHours') ? form.curatorMinIdleHours : currentValues.curatorMinIdleHours, 'curator.min_idle_hours', 2, 0, 87600, true)
+  curator.stale_after_days = parseHermesInteger(Object.hasOwn(form, 'curatorStaleAfterDays') ? form.curatorStaleAfterDays : currentValues.curatorStaleAfterDays, 'curator.stale_after_days', 30, 1, 36500, true)
+  curator.archive_after_days = parseHermesInteger(Object.hasOwn(form, 'curatorArchiveAfterDays') ? form.curatorArchiveAfterDays : currentValues.curatorArchiveAfterDays, 'curator.archive_after_days', 90, 1, 36500, true)
+  if (curator.archive_after_days < curator.stale_after_days) {
+    throw new Error('curator.archive_after_days 必须大于或等于 curator.stale_after_days')
+  }
+  backup.enabled = formHermesBool(form, 'curatorBackupEnabled', currentValues.curatorBackupEnabled)
+  backup.keep = parseHermesInteger(Object.hasOwn(form, 'curatorBackupKeep') ? form.curatorBackupKeep : currentValues.curatorBackupKeep, 'curator.backup.keep', 5, 0, 1000, true)
+  curator.backup = backup
+  next.curator = curator
+  return next
+}
+
+export function buildHermesAgentToolsetsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const agent = root.agent && typeof root.agent === 'object' && !Array.isArray(root.agent)
+    ? root.agent
+    : {}
+  const disabledToolsets = Array.isArray(agent.disabled_toolsets)
+    ? normalizeHermesMultilineList(agent.disabled_toolsets).join('\n')
+    : ''
+  return {
+    disabledToolsets,
+  }
+}
+
+export function mergeHermesAgentToolsetsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesAgentToolsetsConfigValues(next)
+  const agent = next.agent && typeof next.agent === 'object' && !Array.isArray(next.agent)
+    ? mergeConfigsPreservingFields(next.agent, {})
+    : {}
+  agent.disabled_toolsets = normalizeHermesToolsetList(Object.hasOwn(form, 'disabledToolsets') ? form.disabledToolsets : currentValues.disabledToolsets)
+  next.agent = agent
+  return next
+}
+
+export function buildHermesPlatformToolsetsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const platformToolsets = root.platform_toolsets && typeof root.platform_toolsets === 'object' && !Array.isArray(root.platform_toolsets)
+    ? validateHermesPlatformToolsets(root.platform_toolsets)
+    : HERMES_DEFAULT_PLATFORM_TOOLSETS
+  return {
+    platformToolsetsJson: JSON.stringify(platformToolsets, null, 2),
+  }
+}
+
+export function mergeHermesPlatformToolsetsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesPlatformToolsetsConfigValues(next)
+  const platformToolsets = parseHermesPlatformToolsetsJson(Object.hasOwn(form, 'platformToolsetsJson') ? form.platformToolsetsJson : currentValues.platformToolsetsJson)
+  next.platform_toolsets = platformToolsets
+  return next
+}
+
+export function buildHermesAgentRuntimeConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const agent = root.agent && typeof root.agent === 'object' && !Array.isArray(root.agent)
+    ? root.agent
+    : {}
+  const personalities = agent.personalities && typeof agent.personalities === 'object' && !Array.isArray(agent.personalities)
+    ? validateHermesPersonalities(agent.personalities)
+    : {}
+  return {
+    agentMaxTurns: parseHermesInteger(agent.max_turns, 'agent.max_turns', 90, 1, 10000, false),
+    gatewayTimeout: parseHermesInteger(agent.gateway_timeout, 'agent.gateway_timeout', 1800, 0, 604800, false),
+    restartDrainTimeout: parseHermesInteger(agent.restart_drain_timeout, 'agent.restart_drain_timeout', 180, 0, 86400, false),
+    apiMaxRetries: parseHermesInteger(agent.api_max_retries, 'agent.api_max_retries', 3, 1, 20, false),
+    gatewayTimeoutWarning: parseHermesInteger(agent.gateway_timeout_warning, 'agent.gateway_timeout_warning', 900, 0, 604800, false),
+    clarifyTimeout: parseHermesInteger(agent.clarify_timeout, 'agent.clarify_timeout', 600, 0, 86400, false),
+    gatewayNotifyInterval: parseHermesInteger(agent.gateway_notify_interval, 'agent.gateway_notify_interval', 180, 0, 86400, false),
+    gatewayAutoContinueFreshness: parseHermesInteger(agent.gateway_auto_continue_freshness, 'agent.gateway_auto_continue_freshness', 3600, 0, 604800, false),
+    imageInputMode: normalizeHermesImageInputMode(agent.image_input_mode, false),
+    agentVerbose: readHermesBool(agent.verbose, false),
+    reasoningEffort: normalizeHermesReasoningEffort(agent.reasoning_effort, false),
+    personalitiesJson: JSON.stringify(personalities, null, 2),
+  }
+}
+
+export function mergeHermesAgentRuntimeConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesAgentRuntimeConfigValues(next)
+  const agent = next.agent && typeof next.agent === 'object' && !Array.isArray(next.agent)
+    ? mergeConfigsPreservingFields(next.agent, {})
+    : {}
+  agent.max_turns = parseHermesInteger(Object.hasOwn(form, 'agentMaxTurns') ? form.agentMaxTurns : currentValues.agentMaxTurns, 'agent.max_turns', 90, 1, 10000, true)
+  agent.gateway_timeout = parseHermesInteger(Object.hasOwn(form, 'gatewayTimeout') ? form.gatewayTimeout : currentValues.gatewayTimeout, 'agent.gateway_timeout', 1800, 0, 604800, true)
+  agent.restart_drain_timeout = parseHermesInteger(Object.hasOwn(form, 'restartDrainTimeout') ? form.restartDrainTimeout : currentValues.restartDrainTimeout, 'agent.restart_drain_timeout', 180, 0, 86400, true)
+  agent.api_max_retries = parseHermesInteger(Object.hasOwn(form, 'apiMaxRetries') ? form.apiMaxRetries : currentValues.apiMaxRetries, 'agent.api_max_retries', 3, 1, 20, true)
+  agent.gateway_timeout_warning = parseHermesInteger(Object.hasOwn(form, 'gatewayTimeoutWarning') ? form.gatewayTimeoutWarning : currentValues.gatewayTimeoutWarning, 'agent.gateway_timeout_warning', 900, 0, 604800, true)
+  agent.clarify_timeout = parseHermesInteger(Object.hasOwn(form, 'clarifyTimeout') ? form.clarifyTimeout : currentValues.clarifyTimeout, 'agent.clarify_timeout', 600, 0, 86400, true)
+  agent.gateway_notify_interval = parseHermesInteger(Object.hasOwn(form, 'gatewayNotifyInterval') ? form.gatewayNotifyInterval : currentValues.gatewayNotifyInterval, 'agent.gateway_notify_interval', 180, 0, 86400, true)
+  agent.gateway_auto_continue_freshness = parseHermesInteger(Object.hasOwn(form, 'gatewayAutoContinueFreshness') ? form.gatewayAutoContinueFreshness : currentValues.gatewayAutoContinueFreshness, 'agent.gateway_auto_continue_freshness', 3600, 0, 604800, true)
+  agent.image_input_mode = normalizeHermesImageInputMode(Object.hasOwn(form, 'imageInputMode') ? form.imageInputMode : currentValues.imageInputMode, true)
+  agent.verbose = formHermesBool(form, 'agentVerbose', currentValues.agentVerbose)
+  agent.reasoning_effort = normalizeHermesReasoningEffort(Object.hasOwn(form, 'reasoningEffort') ? form.reasoningEffort : currentValues.reasoningEffort, true)
+  const personalities = parseHermesPersonalitiesJson(Object.hasOwn(form, 'personalitiesJson') ? form.personalitiesJson : currentValues.personalitiesJson)
+  if (Object.keys(personalities).length) agent.personalities = personalities
+  else delete agent.personalities
+  next.agent = agent
+  return next
+}
+
+function validateHermesQuickCommands(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('quick_commands 必须是 JSON 对象')
+  }
+  const normalized = {}
+  for (const [rawName, rawCommand] of Object.entries(value)) {
+    const name = String(rawName || '').trim().replace(/^\/+/, '')
+    if (!name) throw new Error('quick_commands 命令名不能为空')
+    if (!rawCommand || typeof rawCommand !== 'object' || Array.isArray(rawCommand)) {
+      throw new Error(`quick_commands.${name} 必须是对象`)
+    }
+    const command = mergeConfigsPreservingFields(rawCommand, {})
+    const type = String(command.type || '').trim().toLowerCase()
+    if (!['exec', 'alias'].includes(type)) {
+      throw new Error(`quick_commands.${name}.type 必须是 exec 或 alias`)
+    }
+    command.type = type
+    if (type === 'exec') {
+      const shellCommand = String(command.command || '').trim()
+      if (!shellCommand) throw new Error(`quick_commands.${name}.command 不能为空`)
+      command.command = shellCommand
+    }
+    if (type === 'alias') {
+      const target = String(command.target || '').trim()
+      if (!target.startsWith('/')) throw new Error(`quick_commands.${name}.target 必须以 / 开头`)
+      command.target = target
+    }
+    normalized[name] = command
+  }
+  return normalized
+}
+
+function parseHermesQuickCommandsJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`quick_commands JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesQuickCommands(value)
+}
+
+export function buildHermesQuickCommandsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const quickCommands = root.quick_commands && typeof root.quick_commands === 'object' && !Array.isArray(root.quick_commands)
+    ? validateHermesQuickCommands(root.quick_commands)
+    : {}
+  return {
+    quickCommandsJson: JSON.stringify(quickCommands, null, 2),
+  }
+}
+
+export function mergeHermesQuickCommandsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesQuickCommandsConfigValues(next)
+  const quickCommands = parseHermesQuickCommandsJson(Object.hasOwn(form, 'quickCommandsJson') ? form.quickCommandsJson : currentValues.quickCommandsJson)
+  if (Object.keys(quickCommands).length) next.quick_commands = quickCommands
+  else delete next.quick_commands
+  return next
+}
+
+function normalizeHermesModelConfigString(value, key, required = false) {
+  if (value == null || value === '') {
+    if (required) throw new Error(`${key} 不能为空`)
+    return ''
+  }
+  if (typeof value !== 'string') throw new Error(`${key} 必须是字符串`)
+  const text = value.trim()
+  if (!text && required) throw new Error(`${key} 不能为空`)
+  return text
+}
+
+function normalizeHermesXSearchModel(value, strict = false) {
+  const text = String(value ?? '').trim()
+  if (!text) {
+    if (strict) throw new Error('x_search.model 不能为空')
+    return 'grok-4.20-reasoning'
+  }
+  if (/^[a-zA-Z0-9_.:/-]+$/.test(text)) return text
+  if (strict) throw new Error('x_search.model 只能包含字母、数字、下划线、点、斜杠、冒号和短横线')
+  return 'grok-4.20-reasoning'
+}
+
+function normalizeHermesOptionalModelInteger(value, key) {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+  return parseHermesInteger(raw, key, 0, 1, 10000000, true)
+}
+
+function normalizeHermesOptionalString(value, key) {
+  if (value == null || value === '') return ''
+  if (typeof value !== 'string') throw new Error(`${key} 必须是字符串`)
+  return value.trim()
+}
+
+function normalizeHermesCamofoxIdentity(value, key) {
+  if (value == null || value === '') return ''
+  if (typeof value !== 'string') throw new Error(`${key} 必须是字符串`)
+  const text = value.trim()
+  if (!text) return ''
+  if (!/^[A-Za-z0-9_.:@+-]+$/.test(text)) {
+    throw new Error(`${key} 只能包含字母、数字、下划线、点、冒号、@、加号和短横线`)
+  }
+  return text
+}
+
+export function buildHermesModelConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const model = root.model && typeof root.model === 'object' && !Array.isArray(root.model) ? root.model : {}
+  const defaultModel = typeof model.default === 'string' ? model.default : model.model
+  return {
+    modelDefault: typeof defaultModel === 'string' ? defaultModel.trim() : '',
+    modelProvider: typeof model.provider === 'string' && model.provider.trim() ? model.provider.trim() : 'auto',
+    modelBaseUrl: typeof model.base_url === 'string' ? model.base_url.trim() : '',
+    modelContextLength: Number.isInteger(model.context_length) && model.context_length > 0 ? String(model.context_length) : '',
+    modelMaxTokens: Number.isInteger(model.max_tokens) && model.max_tokens > 0 ? String(model.max_tokens) : '',
+  }
+}
+
+export function mergeHermesModelConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesModelConfigValues(next)
+  const model = next.model && typeof next.model === 'object' && !Array.isArray(next.model)
+    ? mergeConfigsPreservingFields(next.model, {})
+    : {}
+  model.default = normalizeHermesModelConfigString(Object.hasOwn(form, 'modelDefault') ? form.modelDefault : currentValues.modelDefault, 'model.default', true)
+  model.provider = normalizeHermesModelConfigString(Object.hasOwn(form, 'modelProvider') ? form.modelProvider : currentValues.modelProvider, 'model.provider', true) || 'auto'
+  const baseUrl = normalizeHermesModelConfigString(Object.hasOwn(form, 'modelBaseUrl') ? form.modelBaseUrl : currentValues.modelBaseUrl, 'model.base_url')
+  if (baseUrl) model.base_url = baseUrl
+  else delete model.base_url
+  const contextLength = normalizeHermesOptionalModelInteger(Object.hasOwn(form, 'modelContextLength') ? form.modelContextLength : currentValues.modelContextLength, 'model.context_length')
+  if (contextLength) model.context_length = contextLength
+  else delete model.context_length
+  const maxTokens = normalizeHermesOptionalModelInteger(Object.hasOwn(form, 'modelMaxTokens') ? form.modelMaxTokens : currentValues.modelMaxTokens, 'model.max_tokens')
+  if (maxTokens) model.max_tokens = maxTokens
+  else delete model.max_tokens
+  delete model.model
+  next.model = model
+  return next
+}
+
+export function buildHermesXSearchConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const xSearch = root.x_search && typeof root.x_search === 'object' && !Array.isArray(root.x_search)
+    ? root.x_search
+    : {}
+  return {
+    xSearchModel: normalizeHermesXSearchModel(xSearch.model, false),
+    xSearchTimeoutSeconds: parseHermesInteger(xSearch.timeout_seconds, 'x_search.timeout_seconds', 180, 30, 3600, false),
+    xSearchRetries: parseHermesInteger(xSearch.retries, 'x_search.retries', 2, 0, 20, false),
+  }
+}
+
+export function mergeHermesXSearchConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesXSearchConfigValues(next)
+  const xSearch = next.x_search && typeof next.x_search === 'object' && !Array.isArray(next.x_search)
+    ? mergeConfigsPreservingFields(next.x_search, {})
+    : {}
+  xSearch.model = normalizeHermesXSearchModel(Object.hasOwn(form, 'xSearchModel') ? form.xSearchModel : currentValues.xSearchModel, true)
+  xSearch.timeout_seconds = parseHermesInteger(Object.hasOwn(form, 'xSearchTimeoutSeconds') ? form.xSearchTimeoutSeconds : currentValues.xSearchTimeoutSeconds, 'x_search.timeout_seconds', 180, 30, 3600, true)
+  xSearch.retries = parseHermesInteger(Object.hasOwn(form, 'xSearchRetries') ? form.xSearchRetries : currentValues.xSearchRetries, 'x_search.retries', 2, 0, 20, true)
+  next.x_search = xSearch
+  return next
+}
+
+function normalizeHermesContextEngine(value, strict = false) {
+  const text = String(value ?? '').trim()
+  if (!text) {
+    if (strict) throw new Error('context.engine 不能为空')
+    return 'compressor'
+  }
+  if (/^[a-zA-Z0-9_.-]+$/.test(text)) return text
+  if (strict) throw new Error('context.engine 只能包含字母、数字、下划线、点和短横线')
+  return 'compressor'
+}
+
+export function buildHermesContextConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const context = root.context && typeof root.context === 'object' && !Array.isArray(root.context)
+    ? root.context
+    : {}
+  return {
+    contextEngine: normalizeHermesContextEngine(context.engine, false),
+  }
+}
+
+export function mergeHermesContextConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesContextConfigValues(next)
+  const context = next.context && typeof next.context === 'object' && !Array.isArray(next.context)
+    ? mergeConfigsPreservingFields(next.context, {})
+    : {}
+  context.engine = normalizeHermesContextEngine(Object.hasOwn(form, 'contextEngine') ? form.contextEngine : currentValues.contextEngine, true)
+  next.context = context
+  return next
+}
+
+function isHermesModelAliasName(value) {
+  return /^[a-zA-Z0-9_.-]+$/.test(String(value || '').trim())
+}
+
+function normalizeHermesModelAliasString(entry, field, key, required = false) {
+  if (!Object.hasOwn(entry, field) || entry[field] == null || entry[field] === '') {
+    if (required) throw new Error(`${key}.${field} 不能为空`)
+    delete entry[field]
+    return
+  }
+  if (typeof entry[field] !== 'string') throw new Error(`${key}.${field} 必须是字符串`)
+  const value = entry[field].trim()
+  if (!value && required) throw new Error(`${key}.${field} 不能为空`)
+  if (value) entry[field] = value
+  else delete entry[field]
+}
+
+function validateHermesModelAliases(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('model_aliases 必须是 JSON 对象')
+  }
+  const normalized = {}
+  for (const [rawAlias, rawConfig] of Object.entries(value)) {
+    const alias = String(rawAlias || '').trim()
+    if (!alias || !isHermesModelAliasName(alias)) {
+      throw new Error(`model_aliases.${rawAlias || '<empty>'} 别名只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (!rawConfig || typeof rawConfig !== 'object' || Array.isArray(rawConfig)) {
+      throw new Error(`model_aliases.${alias} 必须是 JSON 对象`)
+    }
+    const entry = mergeConfigsPreservingFields(rawConfig, {})
+    normalizeHermesModelAliasString(entry, 'model', `model_aliases.${alias}`, true)
+    normalizeHermesModelAliasString(entry, 'provider', `model_aliases.${alias}`)
+    normalizeHermesModelAliasString(entry, 'base_url', `model_aliases.${alias}`)
+    normalized[alias] = entry
+  }
+  return normalized
+}
+
+function parseHermesModelAliasesJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`model_aliases JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesModelAliases(value)
+}
+
+export function buildHermesModelAliasesConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const modelAliases = root.model_aliases && typeof root.model_aliases === 'object' && !Array.isArray(root.model_aliases)
+    ? validateHermesModelAliases(root.model_aliases)
+    : {}
+  return {
+    modelAliasesJson: JSON.stringify(modelAliases, null, 2),
+  }
+}
+
+export function mergeHermesModelAliasesConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesModelAliasesConfigValues(next)
+  const modelAliases = parseHermesModelAliasesJson(Object.hasOwn(form, 'modelAliasesJson') ? form.modelAliasesJson : currentValues.modelAliasesJson)
+  if (Object.keys(modelAliases).length) next.model_aliases = modelAliases
+  else delete next.model_aliases
+  return next
+}
+
+function normalizeHermesHookTimeout(entry, key) {
+  if (!Object.hasOwn(entry, 'timeout') || entry.timeout == null || entry.timeout === '') {
+    delete entry.timeout
+    return
+  }
+  entry.timeout = parseHermesInteger(entry.timeout, `${key}.timeout`, 30, 1, 86400, true)
+}
+
+function validateHermesHooks(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('hooks 必须是 JSON 对象')
+  }
+  const normalized = {}
+  for (const [rawEvent, rawEntries] of Object.entries(value)) {
+    const event = String(rawEvent || '').trim()
+    if (!HERMES_HOOK_EVENTS.has(event)) {
+      throw new Error(`hooks.${event || '<empty>'} 事件名不受支持`)
+    }
+    if (!Array.isArray(rawEntries)) {
+      throw new Error(`hooks.${event} 必须是数组`)
+    }
+    const entries = rawEntries.map((rawEntry, index) => {
+      const key = `hooks.${event}.${index}`
+      if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+        throw new Error(`${key} 必须是 JSON 对象`)
+      }
+      const entry = mergeConfigsPreservingFields(rawEntry, {})
+      const command = typeof entry.command === 'string' ? entry.command.trim() : ''
+      if (!command) throw new Error(`${key}.command 不能为空`)
+      entry.command = command
+      if (Object.hasOwn(entry, 'matcher') && entry.matcher != null) {
+        if (typeof entry.matcher !== 'string') throw new Error(`${key}.matcher 必须是字符串`)
+        entry.matcher = entry.matcher.trim()
+      }
+      normalizeHermesHookTimeout(entry, key)
+      return entry
+    })
+    if (entries.length) normalized[event] = entries
+  }
+  return normalized
+}
+
+function parseHermesHooksJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`hooks JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesHooks(value)
+}
+
+export function buildHermesHooksConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const hooks = root.hooks && typeof root.hooks === 'object' && !Array.isArray(root.hooks)
+    ? validateHermesHooks(root.hooks)
+    : {}
+  return {
+    hooksAutoAccept: readHermesBool(root.hooks_auto_accept, false),
+    hooksJson: JSON.stringify(hooks, null, 2),
+  }
+}
+
+export function mergeHermesHooksConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesHooksConfigValues(next)
+  const hooks = parseHermesHooksJson(Object.hasOwn(form, 'hooksJson') ? form.hooksJson : currentValues.hooksJson)
+  next.hooks_auto_accept = formHermesBool(form, 'hooksAutoAccept', currentValues.hooksAutoAccept)
+  if (Object.keys(hooks).length) next.hooks = hooks
+  else delete next.hooks
+  return next
+}
+
+function normalizeHermesMcpServerName(value) {
+  const name = String(value ?? '').trim()
+  if (!name || !/^[a-zA-Z0-9_.-]+$/.test(name)) {
+    throw new Error(`mcp_servers.${name || '<empty>'} 服务名只能包含字母、数字、下划线、点和短横线`)
+  }
+  return name
+}
+
+function normalizeHermesStringArray(value, key) {
+  if (value == null) return undefined
+  if (!Array.isArray(value)) throw new Error(`${key} 必须是字符串数组`)
+  return value.map((item, index) => {
+    if (typeof item !== 'string') throw new Error(`${key}.${index} 必须是字符串`)
+    return item
+  })
+}
+
+function normalizeHermesStringMap(value, key) {
+  if (value == null) return undefined
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${key} 必须是 JSON 对象`)
+  const normalized = {}
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    const itemKey = String(rawKey || '').trim()
+    if (!itemKey) throw new Error(`${key} 键名不能为空`)
+    if (typeof rawValue !== 'string') throw new Error(`${key}.${itemKey} 必须是字符串`)
+    normalized[itemKey] = rawValue
+  }
+  return normalized
+}
+
+function normalizeHermesMcpTimeout(entry, field, key) {
+  if (!Object.hasOwn(entry, field) || entry[field] == null || entry[field] === '') {
+    delete entry[field]
+    return
+  }
+  entry[field] = parseHermesInteger(entry[field], key, 120, 1, 86400, true)
+}
+
+function normalizeHermesMcpSampling(value, key) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${key} 必须是 JSON 对象`)
+  }
+  const sampling = mergeConfigsPreservingFields(value, {})
+  if (Object.hasOwn(sampling, 'enabled')) {
+    if (typeof sampling.enabled !== 'boolean') throw new Error(`${key}.enabled 必须是布尔值`)
+  }
+  if (Object.hasOwn(sampling, 'model')) {
+    if (sampling.model == null || sampling.model === '') {
+      delete sampling.model
+    } else if (typeof sampling.model !== 'string') {
+      throw new Error(`${key}.model 必须是字符串`)
+    } else {
+      const model = sampling.model.trim()
+      if (model) sampling.model = model
+      else delete sampling.model
+    }
+  }
+  if (Object.hasOwn(sampling, 'max_tokens_cap')) {
+    sampling.max_tokens_cap = parseHermesInteger(sampling.max_tokens_cap, `${key}.max_tokens_cap`, 4096, 1, 1000000, true)
+  }
+  if (Object.hasOwn(sampling, 'timeout')) {
+    sampling.timeout = parseHermesInteger(sampling.timeout, `${key}.timeout`, 30, 1, 86400, true)
+  }
+  if (Object.hasOwn(sampling, 'max_rpm')) {
+    sampling.max_rpm = parseHermesInteger(sampling.max_rpm, `${key}.max_rpm`, 10, 1, 100000, true)
+  }
+  if (Object.hasOwn(sampling, 'allowed_models')) {
+    sampling.allowed_models = normalizeHermesStringArray(sampling.allowed_models, `${key}.allowed_models`)
+  }
+  if (Object.hasOwn(sampling, 'max_tool_rounds')) {
+    sampling.max_tool_rounds = parseHermesInteger(sampling.max_tool_rounds, `${key}.max_tool_rounds`, 5, 0, 1000, true)
+  }
+  if (Object.hasOwn(sampling, 'log_level')) {
+    if (sampling.log_level == null || sampling.log_level === '') {
+      delete sampling.log_level
+    } else if (typeof sampling.log_level !== 'string') {
+      throw new Error(`${key}.log_level 必须是字符串`)
+    } else {
+      const level = sampling.log_level.trim().toLowerCase()
+      if (!['debug', 'info', 'warning', 'error'].includes(level)) {
+        throw new Error(`${key}.log_level 必须是 debug、info、warning 或 error`)
+      }
+      sampling.log_level = level
+    }
+  }
+  return sampling
+}
+
+function validateHermesMcpServers(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('mcp_servers 必须是 JSON 对象')
+  }
+  const normalized = {}
+  for (const [rawName, rawConfig] of Object.entries(value)) {
+    const name = normalizeHermesMcpServerName(rawName)
+    if (!rawConfig || typeof rawConfig !== 'object' || Array.isArray(rawConfig)) {
+      throw new Error(`mcp_servers.${name} 必须是 JSON 对象`)
+    }
+    const entry = mergeConfigsPreservingFields(rawConfig, {})
+    const command = typeof entry.command === 'string' ? entry.command.trim() : ''
+    const url = typeof entry.url === 'string' ? entry.url.trim() : ''
+    if (Object.hasOwn(entry, 'command')) {
+      if (!command) throw new Error(`mcp_servers.${name}.command 不能为空`)
+      entry.command = command
+    }
+    if (Object.hasOwn(entry, 'url')) {
+      if (!/^https?:\/\//i.test(url)) throw new Error(`mcp_servers.${name}.url 必须以 http:// 或 https:// 开头`)
+      entry.url = url
+    }
+    if (!command && !url) throw new Error(`mcp_servers.${name} 需要 command 或 url`)
+    if (Object.hasOwn(entry, 'args')) entry.args = normalizeHermesStringArray(entry.args, `mcp_servers.${name}.args`)
+    if (Object.hasOwn(entry, 'env')) entry.env = normalizeHermesStringMap(entry.env, `mcp_servers.${name}.env`)
+    if (Object.hasOwn(entry, 'headers')) entry.headers = normalizeHermesStringMap(entry.headers, `mcp_servers.${name}.headers`)
+    normalizeHermesMcpTimeout(entry, 'timeout', `mcp_servers.${name}.timeout`)
+    normalizeHermesMcpTimeout(entry, 'connect_timeout', `mcp_servers.${name}.connect_timeout`)
+    if (Object.hasOwn(entry, 'sampling')) entry.sampling = normalizeHermesMcpSampling(entry.sampling, `mcp_servers.${name}.sampling`)
+    normalized[name] = entry
+  }
+  return normalized
+}
+
+function parseHermesMcpServersJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`mcp_servers JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesMcpServers(value)
+}
+
+export function buildHermesMcpServersConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const mcpServers = root.mcp_servers && typeof root.mcp_servers === 'object' && !Array.isArray(root.mcp_servers)
+    ? validateHermesMcpServers(root.mcp_servers)
+    : {}
+  return {
+    mcpServersJson: JSON.stringify(mcpServers, null, 2),
+  }
+}
+
+export function mergeHermesMcpServersConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesMcpServersConfigValues(next)
+  const mcpServers = parseHermesMcpServersJson(Object.hasOwn(form, 'mcpServersJson') ? form.mcpServersJson : currentValues.mcpServersJson)
+  if (Object.keys(mcpServers).length) next.mcp_servers = mcpServers
+  else delete next.mcp_servers
+  return next
+}
+
+function isHermesProviderOverrideName(value) {
+  return /^[a-zA-Z0-9_.-]+$/.test(String(value || '').trim())
+}
+
+function isHermesProviderModelName(value) {
+  const text = String(value || '').trim()
+  return !!text && !text.split('/').includes('..') && /^[a-zA-Z0-9_.:/@+-]+$/.test(text)
+}
+
+function normalizeHermesProviderTimeout(value, key) {
+  if (value === undefined || value === null || value === '') return undefined
+  return parseHermesInteger(value, key, 0, 1, 86400, true)
+}
+
+function normalizeHermesProviderModelOverrides(value, key) {
+  if (value === undefined) return undefined
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${key} 必须是 JSON 对象`)
+  }
+  const normalized = {}
+  for (const [rawModel, rawConfig] of Object.entries(value)) {
+    const model = String(rawModel || '').trim()
+    if (!isHermesProviderModelName(model)) {
+      throw new Error(`${key}.${model || '<empty>'} 模型名只能包含字母、数字、下划线、点、斜杠、冒号、@、加号和短横线`)
+    }
+    if (!rawConfig || typeof rawConfig !== 'object' || Array.isArray(rawConfig)) {
+      throw new Error(`${key}.${model} 必须是 JSON 对象`)
+    }
+    const entry = mergeConfigsPreservingFields(rawConfig, {})
+    for (const field of ['timeout_seconds', 'stale_timeout_seconds']) {
+      const parsed = normalizeHermesProviderTimeout(entry[field], `${key}.${model}.${field}`)
+      if (parsed === undefined) delete entry[field]
+      else entry[field] = parsed
+    }
+    normalized[model] = entry
+  }
+  return normalized
+}
+
+function validateHermesProviderOverrides(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('providers 必须是 JSON 对象')
+  }
+  const normalized = {}
+  for (const [rawProvider, rawConfig] of Object.entries(value)) {
+    const provider = String(rawProvider || '').trim().toLowerCase()
+    if (!provider || !isHermesProviderOverrideName(provider)) {
+      throw new Error(`providers.${rawProvider || '<empty>'} provider 名只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (!rawConfig || typeof rawConfig !== 'object' || Array.isArray(rawConfig)) {
+      throw new Error(`providers.${provider} 必须是 JSON 对象`)
+    }
+    const entry = mergeConfigsPreservingFields(rawConfig, {})
+    for (const field of ['request_timeout_seconds', 'stale_timeout_seconds']) {
+      const parsed = normalizeHermesProviderTimeout(entry[field], `providers.${provider}.${field}`)
+      if (parsed === undefined) delete entry[field]
+      else entry[field] = parsed
+    }
+    if (Object.hasOwn(entry, 'models')) {
+      entry.models = normalizeHermesProviderModelOverrides(entry.models, `providers.${provider}.models`)
+    }
+    normalized[provider] = entry
+  }
+  return normalized
+}
+
+function parseHermesProviderOverridesJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`providers JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesProviderOverrides(value)
+}
+
+export function buildHermesProviderOverridesConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const providers = root.providers && typeof root.providers === 'object' && !Array.isArray(root.providers)
+    ? validateHermesProviderOverrides(root.providers)
+    : {}
+  return {
+    providerOverridesJson: JSON.stringify(providers, null, 2),
+  }
+}
+
+export function mergeHermesProviderOverridesConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesProviderOverridesConfigValues(next)
+  const providers = parseHermesProviderOverridesJson(Object.hasOwn(form, 'providerOverridesJson') ? form.providerOverridesJson : currentValues.providerOverridesJson)
+  if (Object.keys(providers).length) next.providers = providers
+  else delete next.providers
+  return next
+}
+
+function normalizeHermesUnauthorizedDmBehavior(value, strict = false) {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (['pair', 'ignore'].includes(normalized)) return normalized
+  if (strict) throw new Error('unauthorized_dm_behavior 必须是 pair 或 ignore')
+  return 'pair'
+}
+
+export function buildHermesUnauthorizedDmConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  return {
+    unauthorizedDmBehavior: normalizeHermesUnauthorizedDmBehavior(root.unauthorized_dm_behavior, false),
+  }
+}
+
+export function mergeHermesUnauthorizedDmConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesUnauthorizedDmConfigValues(next)
+  next.unauthorized_dm_behavior = normalizeHermesUnauthorizedDmBehavior(
+    Object.hasOwn(form, 'unauthorizedDmBehavior') ? form.unauthorizedDmBehavior : currentValues.unauthorizedDmBehavior,
+    true,
+  )
+  return next
+}
+
+export function buildHermesSecurityConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const security = root.security && typeof root.security === 'object' && !Array.isArray(root.security)
+    ? root.security
+    : {}
+  const tirithPath = typeof security.tirith_path === 'string' && security.tirith_path.trim()
+    ? security.tirith_path.trim()
+    : 'tirith'
+  return {
+    tirithEnabled: readHermesBool(security.tirith_enabled, true),
+    tirithPath,
+    tirithTimeout: parseHermesInteger(security.tirith_timeout, 'security.tirith_timeout', 5, 1, 300, false),
+    tirithFailOpen: readHermesBool(security.tirith_fail_open, true),
+  }
+}
+
+export function mergeHermesSecurityConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesSecurityConfigValues(next)
+  const security = next.security && typeof next.security === 'object' && !Array.isArray(next.security)
+    ? mergeConfigsPreservingFields(next.security, {})
+    : {}
+  const tirithPath = String(Object.hasOwn(form, 'tirithPath') ? form.tirithPath : currentValues.tirithPath).trim()
+  if (!tirithPath) throw new Error('security.tirith_path 不能为空')
+  security.tirith_enabled = formHermesBool(form, 'tirithEnabled', currentValues.tirithEnabled)
+  security.tirith_path = tirithPath
+  security.tirith_timeout = parseHermesInteger(Object.hasOwn(form, 'tirithTimeout') ? form.tirithTimeout : currentValues.tirithTimeout, 'security.tirith_timeout', 5, 1, 300, true)
+  security.tirith_fail_open = formHermesBool(form, 'tirithFailOpen', currentValues.tirithFailOpen)
+  next.security = security
+  return next
+}
+
+function normalizeHermesHumanDelayMode(value, strict = false) {
+  const mode = String(value ?? '').trim().toLowerCase() || 'off'
+  if (['off', 'natural', 'custom'].includes(mode)) return mode
+  if (strict) throw new Error('human_delay.mode 必须是 off、natural 或 custom')
+  return 'off'
+}
+
+export function buildHermesHumanDelayConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const humanDelay = root.human_delay && typeof root.human_delay === 'object' && !Array.isArray(root.human_delay)
+    ? root.human_delay
+    : {}
+  const minMs = parseHermesInteger(humanDelay.min_ms, 'human_delay.min_ms', 800, 0, 60000, false)
+  const maxMs = parseHermesInteger(humanDelay.max_ms, 'human_delay.max_ms', 2500, 0, 60000, false)
+  return {
+    humanDelayMode: normalizeHermesHumanDelayMode(humanDelay.mode, false),
+    humanDelayMinMs: minMs,
+    humanDelayMaxMs: Math.max(maxMs, minMs),
+  }
+}
+
+export function mergeHermesHumanDelayConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesHumanDelayConfigValues(next)
+  const humanDelay = next.human_delay && typeof next.human_delay === 'object' && !Array.isArray(next.human_delay)
+    ? mergeConfigsPreservingFields(next.human_delay, {})
+    : {}
+  const mode = normalizeHermesHumanDelayMode(Object.hasOwn(form, 'humanDelayMode') ? form.humanDelayMode : currentValues.humanDelayMode, true)
+  const minMs = parseHermesInteger(Object.hasOwn(form, 'humanDelayMinMs') ? form.humanDelayMinMs : currentValues.humanDelayMinMs, 'human_delay.min_ms', 800, 0, 60000, true)
+  const maxMs = parseHermesInteger(Object.hasOwn(form, 'humanDelayMaxMs') ? form.humanDelayMaxMs : currentValues.humanDelayMaxMs, 'human_delay.max_ms', 2500, 0, 60000, true)
+  if (maxMs < minMs) throw new Error('human_delay.max_ms 不能小于 min_ms')
+  humanDelay.mode = mode
+  humanDelay.min_ms = minMs
+  humanDelay.max_ms = maxMs
+  next.human_delay = humanDelay
+  return next
+}
+
+export function buildHermesStreamingConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const streaming = hermesStreamingConfigSource(root)
+  return {
+    enabled: readHermesBool(streaming.enabled, false),
+    transport: normalizeHermesStreamingTransport(streaming.transport, false),
+    editInterval: parseHermesFloat(streaming.edit_interval, 'streaming.edit_interval', 0.8, 0.05, 60, false),
+    bufferThreshold: parseHermesInteger(streaming.buffer_threshold, 'streaming.buffer_threshold', 24, 1, 5000, false),
+    cursor: typeof streaming.cursor === 'string' ? streaming.cursor : ' ▉',
+    freshFinalAfterSeconds: parseHermesFloat(streaming.fresh_final_after_seconds, 'streaming.fresh_final_after_seconds', 60, 0, 86400, false),
+  }
+}
+
+export function mergeHermesStreamingConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesStreamingConfigValues(next)
+  const streaming = next.streaming && typeof next.streaming === 'object' && !Array.isArray(next.streaming)
+    ? mergeConfigsPreservingFields(next.streaming, {})
+    : {}
+  streaming.enabled = formHermesBool(form, 'enabled', currentValues.enabled)
+  streaming.transport = normalizeHermesStreamingTransport(Object.hasOwn(form, 'transport') ? form.transport : currentValues.transport, true)
+  streaming.edit_interval = parseHermesFloat(Object.hasOwn(form, 'editInterval') ? form.editInterval : currentValues.editInterval, 'streaming.edit_interval', 0.8, 0.05, 60, true)
+  streaming.buffer_threshold = parseHermesInteger(Object.hasOwn(form, 'bufferThreshold') ? form.bufferThreshold : currentValues.bufferThreshold, 'streaming.buffer_threshold', 24, 1, 5000, true)
+  streaming.cursor = Object.hasOwn(form, 'cursor') ? String(form.cursor ?? '') : currentValues.cursor
+  streaming.fresh_final_after_seconds = parseHermesFloat(Object.hasOwn(form, 'freshFinalAfterSeconds') ? form.freshFinalAfterSeconds : currentValues.freshFinalAfterSeconds, 'streaming.fresh_final_after_seconds', 60, 0, 86400, true)
+  next.streaming = streaming
+  return next
+}
+
+export function buildHermesExecutionLimitsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const codeExecution = root.code_execution && typeof root.code_execution === 'object' && !Array.isArray(root.code_execution)
+    ? root.code_execution
+    : {}
+  const delegation = root.delegation && typeof root.delegation === 'object' && !Array.isArray(root.delegation)
+    ? root.delegation
+    : {}
+  return {
+    codeExecutionMode: normalizeHermesCodeExecutionMode(codeExecution.mode, false),
+    codeExecutionTimeout: parseHermesInteger(codeExecution.timeout, 'code_execution.timeout', 300, 1, 86400, false),
+    codeExecutionMaxToolCalls: parseHermesInteger(codeExecution.max_tool_calls, 'code_execution.max_tool_calls', 50, 1, 10000, false),
+    delegationMaxIterations: parseHermesInteger(delegation.max_iterations, 'delegation.max_iterations', 50, 1, 1000, false),
+    delegationChildTimeoutSeconds: parseHermesInteger(delegation.child_timeout_seconds, 'delegation.child_timeout_seconds', 600, 30, 86400, false),
+    delegationMaxConcurrentChildren: parseHermesInteger(delegation.max_concurrent_children, 'delegation.max_concurrent_children', 3, 1, 100, false),
+    delegationMaxSpawnDepth: parseHermesInteger(delegation.max_spawn_depth, 'delegation.max_spawn_depth', 1, 1, 3, false),
+    delegationOrchestratorEnabled: readHermesBool(delegation.orchestrator_enabled, true),
+    delegationSubagentAutoApprove: readHermesBool(delegation.subagent_auto_approve, false),
+    delegationInheritMcpToolsets: readHermesBool(delegation.inherit_mcp_toolsets, true),
+    delegationModel: typeof delegation.model === 'string' ? delegation.model.trim() : '',
+    delegationProvider: typeof delegation.provider === 'string' ? delegation.provider.trim() : '',
+  }
+}
+
+export function buildHermesIoSafetyConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const toolOutput = root.tool_output && typeof root.tool_output === 'object' && !Array.isArray(root.tool_output)
+    ? root.tool_output
+    : {}
+  return {
+    fileReadMaxChars: parseHermesInteger(root.file_read_max_chars, 'file_read_max_chars', 100000, 1000, 1000000, false),
+    toolOutputMaxBytes: parseHermesInteger(toolOutput.max_bytes, 'tool_output.max_bytes', 50000, 1000, 1000000, false),
+    toolOutputMaxLines: parseHermesInteger(toolOutput.max_lines, 'tool_output.max_lines', 2000, 1, 100000, false),
+    toolOutputMaxLineLength: parseHermesInteger(toolOutput.max_line_length, 'tool_output.max_line_length', 2000, 1, 100000, false),
+  }
+}
+
+export function mergeHermesIoSafetyConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesIoSafetyConfigValues(next)
+  const toolOutput = next.tool_output && typeof next.tool_output === 'object' && !Array.isArray(next.tool_output)
+    ? mergeConfigsPreservingFields(next.tool_output, {})
+    : {}
+
+  next.file_read_max_chars = parseHermesInteger(Object.hasOwn(form, 'fileReadMaxChars') ? form.fileReadMaxChars : currentValues.fileReadMaxChars, 'file_read_max_chars', 100000, 1000, 1000000, true)
+  toolOutput.max_bytes = parseHermesInteger(Object.hasOwn(form, 'toolOutputMaxBytes') ? form.toolOutputMaxBytes : currentValues.toolOutputMaxBytes, 'tool_output.max_bytes', 50000, 1000, 1000000, true)
+  toolOutput.max_lines = parseHermesInteger(Object.hasOwn(form, 'toolOutputMaxLines') ? form.toolOutputMaxLines : currentValues.toolOutputMaxLines, 'tool_output.max_lines', 2000, 1, 100000, true)
+  toolOutput.max_line_length = parseHermesInteger(Object.hasOwn(form, 'toolOutputMaxLineLength') ? form.toolOutputMaxLineLength : currentValues.toolOutputMaxLineLength, 'tool_output.max_line_length', 2000, 1, 100000, true)
+  next.tool_output = toolOutput
+  return next
+}
+
+export function buildHermesCheckpointsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const checkpoints = root.checkpoints && typeof root.checkpoints === 'object' && !Array.isArray(root.checkpoints)
+    ? root.checkpoints
+    : {}
+  return {
+    checkpointsEnabled: readHermesBool(checkpoints.enabled, false),
+    checkpointMaxSnapshots: parseHermesInteger(checkpoints.max_snapshots, 'checkpoints.max_snapshots', 20, 1, 10000, false),
+    checkpointMaxTotalSizeMb: parseHermesInteger(checkpoints.max_total_size_mb, 'checkpoints.max_total_size_mb', 500, 0, 10485760, false),
+    checkpointMaxFileSizeMb: parseHermesInteger(checkpoints.max_file_size_mb, 'checkpoints.max_file_size_mb', 10, 0, 1048576, false),
+    checkpointAutoPrune: readHermesBool(checkpoints.auto_prune, true),
+    checkpointRetentionDays: parseHermesInteger(checkpoints.retention_days, 'checkpoints.retention_days', 7, 1, 3650, false),
+    checkpointDeleteOrphans: readHermesBool(checkpoints.delete_orphans, true),
+    checkpointMinIntervalHours: parseHermesInteger(checkpoints.min_interval_hours, 'checkpoints.min_interval_hours', 24, 0, 8760, false),
+  }
+}
+
+export function mergeHermesCheckpointsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesCheckpointsConfigValues(next)
+  const checkpoints = next.checkpoints && typeof next.checkpoints === 'object' && !Array.isArray(next.checkpoints)
+    ? mergeConfigsPreservingFields(next.checkpoints, {})
+    : {}
+
+  checkpoints.enabled = formHermesBool(form, 'checkpointsEnabled', currentValues.checkpointsEnabled)
+  checkpoints.max_snapshots = parseHermesInteger(Object.hasOwn(form, 'checkpointMaxSnapshots') ? form.checkpointMaxSnapshots : currentValues.checkpointMaxSnapshots, 'checkpoints.max_snapshots', 20, 1, 10000, true)
+  checkpoints.max_total_size_mb = parseHermesInteger(Object.hasOwn(form, 'checkpointMaxTotalSizeMb') ? form.checkpointMaxTotalSizeMb : currentValues.checkpointMaxTotalSizeMb, 'checkpoints.max_total_size_mb', 500, 0, 10485760, true)
+  checkpoints.max_file_size_mb = parseHermesInteger(Object.hasOwn(form, 'checkpointMaxFileSizeMb') ? form.checkpointMaxFileSizeMb : currentValues.checkpointMaxFileSizeMb, 'checkpoints.max_file_size_mb', 10, 0, 1048576, true)
+  checkpoints.auto_prune = formHermesBool(form, 'checkpointAutoPrune', currentValues.checkpointAutoPrune)
+  checkpoints.retention_days = parseHermesInteger(Object.hasOwn(form, 'checkpointRetentionDays') ? form.checkpointRetentionDays : currentValues.checkpointRetentionDays, 'checkpoints.retention_days', 7, 1, 3650, true)
+  checkpoints.delete_orphans = formHermesBool(form, 'checkpointDeleteOrphans', currentValues.checkpointDeleteOrphans)
+  checkpoints.min_interval_hours = parseHermesInteger(Object.hasOwn(form, 'checkpointMinIntervalHours') ? form.checkpointMinIntervalHours : currentValues.checkpointMinIntervalHours, 'checkpoints.min_interval_hours', 24, 0, 8760, true)
+  next.checkpoints = checkpoints
+  return next
+}
+
+export function buildHermesCronConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const cron = root.cron && typeof root.cron === 'object' && !Array.isArray(root.cron)
+    ? root.cron
+    : {}
+  return {
+    cronWrapResponse: readHermesBool(cron.wrap_response, true),
+    cronMaxParallelJobs: parseHermesInteger(cron.max_parallel_jobs, 'cron.max_parallel_jobs', 0, 0, 10000, false),
+  }
+}
+
+export function mergeHermesCronConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesCronConfigValues(next)
+  const cron = next.cron && typeof next.cron === 'object' && !Array.isArray(next.cron)
+    ? mergeConfigsPreservingFields(next.cron, {})
+    : {}
+
+  cron.wrap_response = formHermesBool(form, 'cronWrapResponse', currentValues.cronWrapResponse)
+  const maxParallelJobs = parseHermesInteger(Object.hasOwn(form, 'cronMaxParallelJobs') ? form.cronMaxParallelJobs : currentValues.cronMaxParallelJobs, 'cron.max_parallel_jobs', 0, 0, 10000, true)
+  cron.max_parallel_jobs = maxParallelJobs === 0 ? null : maxParallelJobs
+  next.cron = cron
+  return next
+}
+
+export function buildHermesSessionsMaintenanceConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const sessions = root.sessions && typeof root.sessions === 'object' && !Array.isArray(root.sessions)
+    ? root.sessions
+    : {}
+  return {
+    sessionsAutoPrune: readHermesBool(sessions.auto_prune, false),
+    sessionsRetentionDays: parseHermesInteger(sessions.retention_days, 'sessions.retention_days', 90, 1, 36500, false),
+    sessionsVacuumAfterPrune: readHermesBool(sessions.vacuum_after_prune, true),
+    sessionsMinIntervalHours: parseHermesInteger(sessions.min_interval_hours, 'sessions.min_interval_hours', 24, 0, 87600, false),
+    sessionsWriteJsonSnapshots: readHermesBool(sessions.write_json_snapshots, false),
+  }
+}
+
+export function mergeHermesSessionsMaintenanceConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesSessionsMaintenanceConfigValues(next)
+  const sessions = next.sessions && typeof next.sessions === 'object' && !Array.isArray(next.sessions)
+    ? mergeConfigsPreservingFields(next.sessions, {})
+    : {}
+
+  sessions.auto_prune = formHermesBool(form, 'sessionsAutoPrune', currentValues.sessionsAutoPrune)
+  sessions.retention_days = parseHermesInteger(Object.hasOwn(form, 'sessionsRetentionDays') ? form.sessionsRetentionDays : currentValues.sessionsRetentionDays, 'sessions.retention_days', 90, 1, 36500, true)
+  sessions.vacuum_after_prune = formHermesBool(form, 'sessionsVacuumAfterPrune', currentValues.sessionsVacuumAfterPrune)
+  sessions.min_interval_hours = parseHermesInteger(Object.hasOwn(form, 'sessionsMinIntervalHours') ? form.sessionsMinIntervalHours : currentValues.sessionsMinIntervalHours, 'sessions.min_interval_hours', 24, 0, 87600, true)
+  sessions.write_json_snapshots = formHermesBool(form, 'sessionsWriteJsonSnapshots', currentValues.sessionsWriteJsonSnapshots)
+  next.sessions = sessions
+  return next
+}
+
+export function buildHermesUpdatesConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const updates = root.updates && typeof root.updates === 'object' && !Array.isArray(root.updates)
+    ? root.updates
+    : {}
+  return {
+    updatesPreUpdateBackup: readHermesBool(updates.pre_update_backup, false),
+    updatesBackupKeep: parseHermesInteger(updates.backup_keep, 'updates.backup_keep', 5, 1, 1000, false),
+  }
+}
+
+export function mergeHermesUpdatesConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesUpdatesConfigValues(next)
+  const updates = next.updates && typeof next.updates === 'object' && !Array.isArray(next.updates)
+    ? mergeConfigsPreservingFields(next.updates, {})
+    : {}
+
+  updates.pre_update_backup = formHermesBool(form, 'updatesPreUpdateBackup', currentValues.updatesPreUpdateBackup)
+  updates.backup_keep = parseHermesInteger(Object.hasOwn(form, 'updatesBackupKeep') ? form.updatesBackupKeep : currentValues.updatesBackupKeep, 'updates.backup_keep', 5, 1, 1000, true)
+  next.updates = updates
+  return next
+}
+
+export function buildHermesLoggingConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const logging = root.logging && typeof root.logging === 'object' && !Array.isArray(root.logging)
+    ? root.logging
+    : {}
+  const memoryMonitor = logging.memory_monitor && typeof logging.memory_monitor === 'object' && !Array.isArray(logging.memory_monitor)
+    ? logging.memory_monitor
+    : {}
+  return {
+    loggingLevel: normalizeHermesLoggingLevel(logging.level, false),
+    loggingMaxSizeMb: parseHermesInteger(logging.max_size_mb, 'logging.max_size_mb', 5, 1, 102400, false),
+    loggingBackupCount: parseHermesInteger(logging.backup_count, 'logging.backup_count', 3, 0, 1000, false),
+    loggingMemoryMonitorEnabled: readHermesBool(memoryMonitor.enabled, true),
+    loggingMemoryMonitorIntervalSeconds: parseHermesInteger(memoryMonitor.interval_seconds, 'logging.memory_monitor.interval_seconds', 300, 1, 86400, false),
+  }
+}
+
+export function mergeHermesLoggingConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesLoggingConfigValues(next)
+  const logging = next.logging && typeof next.logging === 'object' && !Array.isArray(next.logging)
+    ? mergeConfigsPreservingFields(next.logging, {})
+    : {}
+  const memoryMonitor = logging.memory_monitor && typeof logging.memory_monitor === 'object' && !Array.isArray(logging.memory_monitor)
+    ? mergeConfigsPreservingFields(logging.memory_monitor, {})
+    : {}
+
+  logging.level = normalizeHermesLoggingLevel(Object.hasOwn(form, 'loggingLevel') ? form.loggingLevel : currentValues.loggingLevel, true)
+  logging.max_size_mb = parseHermesInteger(Object.hasOwn(form, 'loggingMaxSizeMb') ? form.loggingMaxSizeMb : currentValues.loggingMaxSizeMb, 'logging.max_size_mb', 5, 1, 102400, true)
+  logging.backup_count = parseHermesInteger(Object.hasOwn(form, 'loggingBackupCount') ? form.loggingBackupCount : currentValues.loggingBackupCount, 'logging.backup_count', 3, 0, 1000, true)
+  memoryMonitor.enabled = formHermesBool(form, 'loggingMemoryMonitorEnabled', currentValues.loggingMemoryMonitorEnabled)
+  memoryMonitor.interval_seconds = parseHermesInteger(Object.hasOwn(form, 'loggingMemoryMonitorIntervalSeconds') ? form.loggingMemoryMonitorIntervalSeconds : currentValues.loggingMemoryMonitorIntervalSeconds, 'logging.memory_monitor.interval_seconds', 300, 1, 86400, true)
+  logging.memory_monitor = memoryMonitor
+  next.logging = logging
+  return next
+}
+
+export function buildHermesApprovalsConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const approvals = root.approvals && typeof root.approvals === 'object' && !Array.isArray(root.approvals)
+    ? root.approvals
+    : {}
+  return {
+    approvalMode: normalizeHermesApprovalMode(approvals.mode, false),
+    approvalTimeout: parseHermesInteger(approvals.timeout, 'approvals.timeout', 60, 1, 86400, false),
+    approvalCronMode: normalizeHermesApprovalCronMode(approvals.cron_mode, false),
+    approvalMcpReloadConfirm: readHermesBool(approvals.mcp_reload_confirm, true),
+    approvalDestructiveSlashConfirm: readHermesBool(approvals.destructive_slash_confirm, true),
+  }
+}
+
+export function mergeHermesApprovalsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesApprovalsConfigValues(next)
+  const approvals = next.approvals && typeof next.approvals === 'object' && !Array.isArray(next.approvals)
+    ? mergeConfigsPreservingFields(next.approvals, {})
+    : {}
+
+  approvals.mode = normalizeHermesApprovalMode(Object.hasOwn(form, 'approvalMode') ? form.approvalMode : currentValues.approvalMode, true)
+  approvals.timeout = parseHermesInteger(Object.hasOwn(form, 'approvalTimeout') ? form.approvalTimeout : currentValues.approvalTimeout, 'approvals.timeout', 60, 1, 86400, true)
+  approvals.cron_mode = normalizeHermesApprovalCronMode(Object.hasOwn(form, 'approvalCronMode') ? form.approvalCronMode : currentValues.approvalCronMode, true)
+  approvals.mcp_reload_confirm = formHermesBool(form, 'approvalMcpReloadConfirm', currentValues.approvalMcpReloadConfirm)
+  approvals.destructive_slash_confirm = formHermesBool(form, 'approvalDestructiveSlashConfirm', currentValues.approvalDestructiveSlashConfirm)
+  next.approvals = approvals
+  return next
+}
+
+export function buildHermesPrivacyConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const privacy = root.privacy && typeof root.privacy === 'object' && !Array.isArray(root.privacy)
+    ? root.privacy
+    : {}
+  return {
+    redactPii: readHermesBool(privacy.redact_pii, false),
+  }
+}
+
+export function mergeHermesPrivacyConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesPrivacyConfigValues(next)
+  const privacy = next.privacy && typeof next.privacy === 'object' && !Array.isArray(next.privacy)
+    ? mergeConfigsPreservingFields(next.privacy, {})
+    : {}
+  privacy.redact_pii = formHermesBool(form, 'redactPii', currentValues.redactPii)
+  next.privacy = privacy
+  return next
+}
+
+export function buildHermesBrowserConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const browser = root.browser && typeof root.browser === 'object' && !Array.isArray(root.browser)
+    ? root.browser
+    : {}
+  const camofox = browser.camofox && typeof browser.camofox === 'object' && !Array.isArray(browser.camofox)
+    ? browser.camofox
+    : {}
+  return {
+    browserInactivityTimeout: parseHermesInteger(browser.inactivity_timeout, 'browser.inactivity_timeout', 120, 1, 86400, false),
+    browserCommandTimeout: parseHermesInteger(browser.command_timeout, 'browser.command_timeout', 30, 5, 3600, false),
+    browserRecordSessions: readHermesBool(browser.record_sessions, false),
+    browserEngine: normalizeHermesBrowserEngine(browser.engine, false),
+    browserAllowPrivateUrls: readHermesBool(browser.allow_private_urls, false),
+    browserAutoLocalForPrivateUrls: readHermesBool(browser.auto_local_for_private_urls, true),
+    browserCdpUrl: normalizeHermesOptionalString(browser.cdp_url, 'browser.cdp_url'),
+    browserCamofoxManagedPersistence: readHermesBool(camofox.managed_persistence, false),
+    browserCamofoxUserId: normalizeHermesCamofoxIdentity(camofox.user_id, 'browser.camofox.user_id'),
+    browserCamofoxSessionKey: normalizeHermesCamofoxIdentity(camofox.session_key, 'browser.camofox.session_key'),
+    browserCamofoxAdoptExistingTab: readHermesBool(camofox.adopt_existing_tab, false),
+    browserDialogPolicy: normalizeHermesBrowserDialogPolicy(browser.dialog_policy, false),
+    browserDialogTimeout: parseHermesInteger(browser.dialog_timeout_s, 'browser.dialog_timeout_s', 300, 1, 86400, false),
+  }
+}
+
+export function mergeHermesBrowserConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesBrowserConfigValues(next)
+  const browser = next.browser && typeof next.browser === 'object' && !Array.isArray(next.browser)
+    ? mergeConfigsPreservingFields(next.browser, {})
+    : {}
+  browser.inactivity_timeout = parseHermesInteger(Object.hasOwn(form, 'browserInactivityTimeout') ? form.browserInactivityTimeout : currentValues.browserInactivityTimeout, 'browser.inactivity_timeout', 120, 1, 86400, true)
+  browser.command_timeout = parseHermesInteger(Object.hasOwn(form, 'browserCommandTimeout') ? form.browserCommandTimeout : currentValues.browserCommandTimeout, 'browser.command_timeout', 30, 5, 3600, true)
+  browser.record_sessions = formHermesBool(form, 'browserRecordSessions', currentValues.browserRecordSessions)
+  browser.engine = normalizeHermesBrowserEngine(Object.hasOwn(form, 'browserEngine') ? form.browserEngine : currentValues.browserEngine, true)
+  browser.allow_private_urls = formHermesBool(form, 'browserAllowPrivateUrls', currentValues.browserAllowPrivateUrls)
+  browser.auto_local_for_private_urls = formHermesBool(form, 'browserAutoLocalForPrivateUrls', currentValues.browserAutoLocalForPrivateUrls)
+  const cdpUrl = normalizeHermesOptionalString(Object.hasOwn(form, 'browserCdpUrl') ? form.browserCdpUrl : currentValues.browserCdpUrl, 'browser.cdp_url')
+  if (cdpUrl) browser.cdp_url = cdpUrl
+  else delete browser.cdp_url
+  const camofox = browser.camofox && typeof browser.camofox === 'object' && !Array.isArray(browser.camofox)
+    ? mergeConfigsPreservingFields(browser.camofox, {})
+    : {}
+  camofox.managed_persistence = formHermesBool(form, 'browserCamofoxManagedPersistence', currentValues.browserCamofoxManagedPersistence)
+  const camofoxUserId = normalizeHermesCamofoxIdentity(Object.hasOwn(form, 'browserCamofoxUserId') ? form.browserCamofoxUserId : currentValues.browserCamofoxUserId, 'browser.camofox.user_id')
+  if (camofoxUserId) camofox.user_id = camofoxUserId
+  else delete camofox.user_id
+  const camofoxSessionKey = normalizeHermesCamofoxIdentity(Object.hasOwn(form, 'browserCamofoxSessionKey') ? form.browserCamofoxSessionKey : currentValues.browserCamofoxSessionKey, 'browser.camofox.session_key')
+  if (camofoxSessionKey) camofox.session_key = camofoxSessionKey
+  else delete camofox.session_key
+  camofox.adopt_existing_tab = formHermesBool(form, 'browserCamofoxAdoptExistingTab', currentValues.browserCamofoxAdoptExistingTab)
+  browser.camofox = camofox
+  browser.dialog_policy = normalizeHermesBrowserDialogPolicy(Object.hasOwn(form, 'browserDialogPolicy') ? form.browserDialogPolicy : currentValues.browserDialogPolicy, true)
+  browser.dialog_timeout_s = parseHermesInteger(Object.hasOwn(form, 'browserDialogTimeout') ? form.browserDialogTimeout : currentValues.browserDialogTimeout, 'browser.dialog_timeout_s', 300, 1, 86400, true)
+  next.browser = browser
+  return next
+}
+
+export function buildHermesWebConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const web = root.web && typeof root.web === 'object' && !Array.isArray(root.web)
+    ? root.web
+    : {}
+  return {
+    webBackend: normalizeHermesWebBackend(web.backend, 'web.backend', false),
+    webSearchBackend: normalizeHermesWebBackend(web.search_backend, 'web.search_backend', false),
+    webExtractBackend: normalizeHermesWebBackend(web.extract_backend, 'web.extract_backend', false),
+  }
+}
+
+export function mergeHermesWebConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesWebConfigValues(next)
+  const web = next.web && typeof next.web === 'object' && !Array.isArray(next.web)
+    ? mergeConfigsPreservingFields(next.web, {})
+    : {}
+  const backend = normalizeHermesWebBackend(Object.hasOwn(form, 'webBackend') ? form.webBackend : currentValues.webBackend, 'web.backend', true)
+  const searchBackend = normalizeHermesWebBackend(Object.hasOwn(form, 'webSearchBackend') ? form.webSearchBackend : currentValues.webSearchBackend, 'web.search_backend', true)
+  const extractBackend = normalizeHermesWebBackend(Object.hasOwn(form, 'webExtractBackend') ? form.webExtractBackend : currentValues.webExtractBackend, 'web.extract_backend', true)
+  if (backend) web.backend = backend
+  else delete web.backend
+  if (searchBackend) web.search_backend = searchBackend
+  else delete web.search_backend
+  if (extractBackend) web.extract_backend = extractBackend
+  else delete web.extract_backend
+  next.web = web
+  return next
+}
+
+function validateHermesModelCatalogProviders(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('model_catalog.providers 必须是 JSON object')
+  }
+  const normalized = {}
+  for (const [provider, rawEntry] of Object.entries(value)) {
+    const name = String(provider || '').trim()
+    if (!/^[a-zA-Z0-9_.-]+$/.test(name)) {
+      throw new Error(`model_catalog.providers.${provider} 名称只能包含字母、数字、下划线、点和短横线`)
+    }
+    if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+      throw new Error(`model_catalog.providers.${name} 必须是 object`)
+    }
+    const entry = mergeConfigsPreservingFields({}, rawEntry)
+    if (Object.hasOwn(entry, 'url')) {
+      const url = normalizeHermesHttpUrl(entry.url, `model_catalog.providers.${name}.url`, '', true)
+      if (url) entry.url = url
+      else delete entry.url
+    }
+    normalized[name] = entry
+  }
+  return normalized
+}
+
+function parseHermesModelCatalogProvidersJson(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return {}
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`model_catalog.providers JSON 格式错误: ${err.message}`)
+  }
+  return validateHermesModelCatalogProviders(value)
+}
+
+export function buildHermesModelCatalogConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const modelCatalog = root.model_catalog && typeof root.model_catalog === 'object' && !Array.isArray(root.model_catalog)
+    ? root.model_catalog
+    : {}
+  const providers = modelCatalog.providers && typeof modelCatalog.providers === 'object' && !Array.isArray(modelCatalog.providers)
+    ? validateHermesModelCatalogProviders(modelCatalog.providers)
+    : {}
+  return {
+    modelCatalogEnabled: readHermesBool(modelCatalog.enabled, true),
+    modelCatalogUrl: normalizeHermesHttpUrl(modelCatalog.url, 'model_catalog.url', HERMES_MODEL_CATALOG_DEFAULT_URL, false),
+    modelCatalogTtlHours: parseHermesInteger(modelCatalog.ttl_hours, 'model_catalog.ttl_hours', 24, 1, 8760, false),
+    modelCatalogProvidersJson: JSON.stringify(providers, null, 2),
+  }
+}
+
+export function mergeHermesModelCatalogConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesModelCatalogConfigValues(next)
+  const modelCatalog = next.model_catalog && typeof next.model_catalog === 'object' && !Array.isArray(next.model_catalog)
+    ? mergeConfigsPreservingFields(next.model_catalog, {})
+    : {}
+  modelCatalog.enabled = formHermesBool(form, 'modelCatalogEnabled', currentValues.modelCatalogEnabled)
+  modelCatalog.url = normalizeHermesHttpUrl(Object.hasOwn(form, 'modelCatalogUrl') ? form.modelCatalogUrl : currentValues.modelCatalogUrl, 'model_catalog.url', HERMES_MODEL_CATALOG_DEFAULT_URL, true)
+  modelCatalog.ttl_hours = parseHermesInteger(Object.hasOwn(form, 'modelCatalogTtlHours') ? form.modelCatalogTtlHours : currentValues.modelCatalogTtlHours, 'model_catalog.ttl_hours', 24, 1, 8760, true)
+  const providers = parseHermesModelCatalogProvidersJson(Object.hasOwn(form, 'modelCatalogProvidersJson') ? form.modelCatalogProvidersJson : currentValues.modelCatalogProvidersJson)
+  if (Object.keys(providers).length) modelCatalog.providers = providers
+  else delete modelCatalog.providers
+  next.model_catalog = modelCatalog
+  return next
+}
+
+export function buildHermesLspConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const lsp = root.lsp && typeof root.lsp === 'object' && !Array.isArray(root.lsp)
+    ? root.lsp
+    : {}
+  return {
+    lspEnabled: readHermesBool(lsp.enabled, true),
+    lspWaitMode: normalizeHermesLspWaitMode(lsp.wait_mode, false),
+    lspWaitTimeout: parseHermesFloat(lsp.wait_timeout, 'lsp.wait_timeout', 5, 0.1, 120, false),
+    lspInstallStrategy: normalizeHermesLspInstallStrategy(lsp.install_strategy, false),
+  }
+}
+
+export function mergeHermesLspConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesLspConfigValues(next)
+  const lsp = next.lsp && typeof next.lsp === 'object' && !Array.isArray(next.lsp)
+    ? mergeConfigsPreservingFields(next.lsp, {})
+    : {}
+  lsp.enabled = formHermesBool(form, 'lspEnabled', currentValues.lspEnabled)
+  lsp.wait_mode = normalizeHermesLspWaitMode(Object.hasOwn(form, 'lspWaitMode') ? form.lspWaitMode : currentValues.lspWaitMode, true)
+  lsp.wait_timeout = parseHermesFloat(Object.hasOwn(form, 'lspWaitTimeout') ? form.lspWaitTimeout : currentValues.lspWaitTimeout, 'lsp.wait_timeout', 5, 0.1, 120, true)
+  lsp.install_strategy = normalizeHermesLspInstallStrategy(Object.hasOwn(form, 'lspInstallStrategy') ? form.lspInstallStrategy : currentValues.lspInstallStrategy, true)
+  next.lsp = lsp
+  return next
+}
+
+export function buildHermesSttConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const stt = root.stt && typeof root.stt === 'object' && !Array.isArray(root.stt)
+    ? root.stt
+    : {}
+  const local = stt.local && typeof stt.local === 'object' && !Array.isArray(stt.local)
+    ? stt.local
+    : {}
+  const openai = stt.openai && typeof stt.openai === 'object' && !Array.isArray(stt.openai)
+    ? stt.openai
+    : {}
+  const mistral = stt.mistral && typeof stt.mistral === 'object' && !Array.isArray(stt.mistral)
+    ? stt.mistral
+    : {}
+  return {
+    sttEnabled: readHermesBool(stt.enabled, true),
+    sttProvider: normalizeHermesSttProvider(stt.provider, false),
+    sttLocalModel: normalizeHermesSttLocalModel(local.model, false),
+    sttLocalLanguage: normalizeHermesSttLanguage(local.language, false),
+    sttOpenaiModel: normalizeHermesSttOpenaiModel(openai.model, false),
+    sttMistralModel: normalizeHermesSttMistralModel(mistral.model, false),
+  }
+}
+
+export function buildHermesTtsVoiceConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const tts = root.tts && typeof root.tts === 'object' && !Array.isArray(root.tts) ? root.tts : {}
+  const edge = tts.edge && typeof tts.edge === 'object' && !Array.isArray(tts.edge) ? tts.edge : {}
+  const openai = tts.openai && typeof tts.openai === 'object' && !Array.isArray(tts.openai) ? tts.openai : {}
+  const elevenlabs = tts.elevenlabs && typeof tts.elevenlabs === 'object' && !Array.isArray(tts.elevenlabs) ? tts.elevenlabs : {}
+  const xai = tts.xai && typeof tts.xai === 'object' && !Array.isArray(tts.xai) ? tts.xai : {}
+  const mistral = tts.mistral && typeof tts.mistral === 'object' && !Array.isArray(tts.mistral) ? tts.mistral : {}
+  const piper = tts.piper && typeof tts.piper === 'object' && !Array.isArray(tts.piper) ? tts.piper : {}
+  const voice = root.voice && typeof root.voice === 'object' && !Array.isArray(root.voice) ? root.voice : {}
+  return {
+    ttsProvider: normalizeHermesTtsProvider(tts.provider, false),
+    ttsEdgeVoice: typeof edge.voice === 'string' ? edge.voice.trim() : 'en-US-AriaNeural',
+    ttsOpenaiModel: typeof openai.model === 'string' && openai.model.trim() ? openai.model.trim() : 'gpt-4o-mini-tts',
+    ttsOpenaiVoice: normalizeHermesTtsOpenaiVoice(openai.voice, false),
+    ttsElevenlabsVoiceId: typeof elevenlabs.voice_id === 'string' ? elevenlabs.voice_id.trim() : 'pNInz6obpgDQGcFmaJgB',
+    ttsElevenlabsModelId: typeof elevenlabs.model_id === 'string' ? elevenlabs.model_id.trim() : 'eleven_multilingual_v2',
+    ttsXaiVoiceId: typeof xai.voice_id === 'string' && xai.voice_id.trim() ? xai.voice_id.trim() : 'eve',
+    ttsXaiLanguage: normalizeHermesVoiceLanguage(xai.language, false, 'tts.xai.language'),
+    ttsXaiSampleRate: parseHermesInteger(xai.sample_rate, 'tts.xai.sample_rate', 24000, 8000, 192000, false),
+    ttsXaiBitRate: parseHermesInteger(xai.bit_rate, 'tts.xai.bit_rate', 128000, 16000, 512000, false),
+    ttsMistralModel: typeof mistral.model === 'string' && mistral.model.trim() ? mistral.model.trim() : 'voxtral-mini-tts-2603',
+    ttsMistralVoiceId: typeof mistral.voice_id === 'string' ? mistral.voice_id.trim() : 'c69964a6-ab8b-4f8a-9465-ec0925096ec8',
+    ttsPiperVoice: typeof piper.voice === 'string' ? piper.voice.trim() : 'en_US-lessac-medium',
+    voiceRecordKey: typeof voice.record_key === 'string' ? voice.record_key.trim() : 'ctrl+b',
+    voiceMaxRecordingSeconds: parseHermesInteger(voice.max_recording_seconds, 'voice.max_recording_seconds', 120, 1, 3600, false),
+    voiceAutoTts: readHermesBool(voice.auto_tts, false),
+    voiceBeepEnabled: readHermesBool(voice.beep_enabled, true),
+    voiceSilenceThreshold: parseHermesInteger(voice.silence_threshold, 'voice.silence_threshold', 200, 0, 32767, false),
+    voiceSilenceDuration: parseHermesFloat(voice.silence_duration, 'voice.silence_duration', 3, 0.1, 60, false),
+  }
+}
+
+export function mergeHermesTtsVoiceConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesTtsVoiceConfigValues(next)
+  const tts = next.tts && typeof next.tts === 'object' && !Array.isArray(next.tts) ? mergeConfigsPreservingFields(next.tts, {}) : {}
+  const edge = tts.edge && typeof tts.edge === 'object' && !Array.isArray(tts.edge) ? mergeConfigsPreservingFields(tts.edge, {}) : {}
+  const openai = tts.openai && typeof tts.openai === 'object' && !Array.isArray(tts.openai) ? mergeConfigsPreservingFields(tts.openai, {}) : {}
+  const elevenlabs = tts.elevenlabs && typeof tts.elevenlabs === 'object' && !Array.isArray(tts.elevenlabs) ? mergeConfigsPreservingFields(tts.elevenlabs, {}) : {}
+  const xai = tts.xai && typeof tts.xai === 'object' && !Array.isArray(tts.xai) ? mergeConfigsPreservingFields(tts.xai, {}) : {}
+  const mistral = tts.mistral && typeof tts.mistral === 'object' && !Array.isArray(tts.mistral) ? mergeConfigsPreservingFields(tts.mistral, {}) : {}
+  const piper = tts.piper && typeof tts.piper === 'object' && !Array.isArray(tts.piper) ? mergeConfigsPreservingFields(tts.piper, {}) : {}
+  const voice = next.voice && typeof next.voice === 'object' && !Array.isArray(next.voice) ? mergeConfigsPreservingFields(next.voice, {}) : {}
+  tts.provider = normalizeHermesTtsProvider(Object.hasOwn(form, 'ttsProvider') ? form.ttsProvider : currentValues.ttsProvider, true)
+  const edgeVoice = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsEdgeVoice') ? form.ttsEdgeVoice : currentValues.ttsEdgeVoice, 'tts.edge.voice')
+  if (edgeVoice) edge.voice = edgeVoice
+  else delete edge.voice
+  openai.model = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsOpenaiModel') ? form.ttsOpenaiModel : currentValues.ttsOpenaiModel, 'tts.openai.model') || 'gpt-4o-mini-tts'
+  openai.voice = normalizeHermesTtsOpenaiVoice(Object.hasOwn(form, 'ttsOpenaiVoice') ? form.ttsOpenaiVoice : currentValues.ttsOpenaiVoice, true)
+  const elevenlabsVoiceId = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsElevenlabsVoiceId') ? form.ttsElevenlabsVoiceId : currentValues.ttsElevenlabsVoiceId, 'tts.elevenlabs.voice_id')
+  if (elevenlabsVoiceId) elevenlabs.voice_id = elevenlabsVoiceId
+  else delete elevenlabs.voice_id
+  const elevenlabsModelId = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsElevenlabsModelId') ? form.ttsElevenlabsModelId : currentValues.ttsElevenlabsModelId, 'tts.elevenlabs.model_id')
+  if (elevenlabsModelId) elevenlabs.model_id = elevenlabsModelId
+  else delete elevenlabs.model_id
+  xai.voice_id = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsXaiVoiceId') ? form.ttsXaiVoiceId : currentValues.ttsXaiVoiceId, 'tts.xai.voice_id') || 'eve'
+  xai.language = normalizeHermesVoiceLanguage(Object.hasOwn(form, 'ttsXaiLanguage') ? form.ttsXaiLanguage : currentValues.ttsXaiLanguage, true, 'tts.xai.language')
+  xai.sample_rate = parseHermesInteger(Object.hasOwn(form, 'ttsXaiSampleRate') ? form.ttsXaiSampleRate : currentValues.ttsXaiSampleRate, 'tts.xai.sample_rate', 24000, 8000, 192000, true)
+  xai.bit_rate = parseHermesInteger(Object.hasOwn(form, 'ttsXaiBitRate') ? form.ttsXaiBitRate : currentValues.ttsXaiBitRate, 'tts.xai.bit_rate', 128000, 16000, 512000, true)
+  mistral.model = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsMistralModel') ? form.ttsMistralModel : currentValues.ttsMistralModel, 'tts.mistral.model') || 'voxtral-mini-tts-2603'
+  const mistralVoiceId = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsMistralVoiceId') ? form.ttsMistralVoiceId : currentValues.ttsMistralVoiceId, 'tts.mistral.voice_id')
+  if (mistralVoiceId) mistral.voice_id = mistralVoiceId
+  else delete mistral.voice_id
+  const piperVoice = normalizeHermesOptionalString(Object.hasOwn(form, 'ttsPiperVoice') ? form.ttsPiperVoice : currentValues.ttsPiperVoice, 'tts.piper.voice')
+  if (piperVoice) piper.voice = piperVoice
+  else delete piper.voice
+  const recordKey = normalizeHermesOptionalString(Object.hasOwn(form, 'voiceRecordKey') ? form.voiceRecordKey : currentValues.voiceRecordKey, 'voice.record_key')
+  if (recordKey) voice.record_key = recordKey
+  else delete voice.record_key
+  voice.max_recording_seconds = parseHermesInteger(Object.hasOwn(form, 'voiceMaxRecordingSeconds') ? form.voiceMaxRecordingSeconds : currentValues.voiceMaxRecordingSeconds, 'voice.max_recording_seconds', 120, 1, 3600, true)
+  voice.auto_tts = formHermesBool(form, 'voiceAutoTts', currentValues.voiceAutoTts)
+  voice.beep_enabled = formHermesBool(form, 'voiceBeepEnabled', currentValues.voiceBeepEnabled)
+  voice.silence_threshold = parseHermesInteger(Object.hasOwn(form, 'voiceSilenceThreshold') ? form.voiceSilenceThreshold : currentValues.voiceSilenceThreshold, 'voice.silence_threshold', 200, 0, 32767, true)
+  voice.silence_duration = parseHermesFloat(Object.hasOwn(form, 'voiceSilenceDuration') ? form.voiceSilenceDuration : currentValues.voiceSilenceDuration, 'voice.silence_duration', 3, 0.1, 60, true)
+  tts.edge = edge
+  tts.openai = openai
+  tts.elevenlabs = elevenlabs
+  tts.xai = xai
+  tts.mistral = mistral
+  tts.piper = piper
+  next.tts = tts
+  next.voice = voice
+  return next
+}
+
+export function mergeHermesSttConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesSttConfigValues(next)
+  const stt = next.stt && typeof next.stt === 'object' && !Array.isArray(next.stt)
+    ? mergeConfigsPreservingFields(next.stt, {})
+    : {}
+  const local = stt.local && typeof stt.local === 'object' && !Array.isArray(stt.local)
+    ? mergeConfigsPreservingFields(stt.local, {})
+    : {}
+  const openai = stt.openai && typeof stt.openai === 'object' && !Array.isArray(stt.openai)
+    ? mergeConfigsPreservingFields(stt.openai, {})
+    : {}
+  const mistral = stt.mistral && typeof stt.mistral === 'object' && !Array.isArray(stt.mistral)
+    ? mergeConfigsPreservingFields(stt.mistral, {})
+    : {}
+  stt.enabled = formHermesBool(form, 'sttEnabled', currentValues.sttEnabled)
+  stt.provider = normalizeHermesSttProvider(Object.hasOwn(form, 'sttProvider') ? form.sttProvider : currentValues.sttProvider, true)
+  local.model = normalizeHermesSttLocalModel(Object.hasOwn(form, 'sttLocalModel') ? form.sttLocalModel : currentValues.sttLocalModel, true)
+  local.language = normalizeHermesSttLanguage(Object.hasOwn(form, 'sttLocalLanguage') ? form.sttLocalLanguage : currentValues.sttLocalLanguage, true)
+  openai.model = normalizeHermesSttOpenaiModel(Object.hasOwn(form, 'sttOpenaiModel') ? form.sttOpenaiModel : currentValues.sttOpenaiModel, true)
+  mistral.model = normalizeHermesSttMistralModel(Object.hasOwn(form, 'sttMistralModel') ? form.sttMistralModel : currentValues.sttMistralModel, true)
+  stt.local = local
+  stt.openai = openai
+  stt.mistral = mistral
+  next.stt = stt
+  return next
+}
+
+export function buildHermesTerminalConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const terminal = root.terminal && typeof root.terminal === 'object' && !Array.isArray(root.terminal)
+    ? root.terminal
+    : {}
+  return {
+    terminalBackend: normalizeHermesTerminalBackend(terminal.backend, false),
+    terminalCwd: typeof terminal.cwd === 'string' && terminal.cwd.trim() ? terminal.cwd : '.',
+    terminalTimeout: parseHermesInteger(terminal.timeout, 'terminal.timeout', 180, 1, 86400, false),
+    terminalLifetimeSeconds: parseHermesInteger(terminal.lifetime_seconds, 'terminal.lifetime_seconds', 300, 0, 86400, false),
+    terminalShellInitFiles: normalizeHermesShellInitFileList(terminal.shell_init_files || [], 'terminal.shell_init_files').join('\n'),
+    terminalAutoSourceBashrc: readHermesBool(terminal.auto_source_bashrc, true),
+    terminalPersistentShell: readHermesBool(terminal.persistent_shell, true),
+    terminalEnvPassthrough: normalizeHermesEnvNameList(terminal.env_passthrough || [], 'terminal.env_passthrough').join('\n'),
+    terminalDockerMountCwdToWorkspace: readHermesBool(terminal.docker_mount_cwd_to_workspace, false),
+    terminalDockerRunAsHostUser: readHermesBool(terminal.docker_run_as_host_user, false),
+    terminalDockerImage: typeof terminal.docker_image === 'string' ? terminal.docker_image.trim() : '',
+    terminalDockerEnvJson: JSON.stringify(normalizeHermesDockerEnvJson(terminal.docker_env || {}, 'terminal.docker_env'), null, 2),
+    terminalDockerVolumes: normalizeHermesDockerVolumeList(terminal.docker_volumes || [], 'terminal.docker_volumes').join('\n'),
+    terminalDockerExtraArgs: normalizeHermesDockerExtraArgsList(terminal.docker_extra_args || [], 'terminal.docker_extra_args').join('\n'),
+    terminalSingularityImage: typeof terminal.singularity_image === 'string' ? terminal.singularity_image.trim() : '',
+    terminalModalImage: typeof terminal.modal_image === 'string' ? terminal.modal_image.trim() : '',
+    terminalModalMode: normalizeHermesTerminalModalMode(terminal.modal_mode, false),
+    terminalVercelRuntime: normalizeHermesTerminalVercelRuntime(terminal.vercel_runtime, false),
+    terminalDaytonaImage: typeof terminal.daytona_image === 'string' ? terminal.daytona_image.trim() : '',
+    terminalDockerForwardEnv: normalizeHermesEnvNameList(terminal.docker_forward_env || [], 'terminal.docker_forward_env').join('\n'),
+    terminalSshHost: typeof terminal.ssh_host === 'string' ? terminal.ssh_host.trim() : '',
+    terminalSshUser: typeof terminal.ssh_user === 'string' ? terminal.ssh_user.trim() : '',
+    terminalSshPort: parseHermesInteger(terminal.ssh_port, 'terminal.ssh_port', 22, 1, 65535, false),
+    terminalSshKey: typeof terminal.ssh_key === 'string' ? terminal.ssh_key.trim() : '',
+    terminalContainerCpu: parseHermesInteger(terminal.container_cpu, 'terminal.container_cpu', 1, 1, 64, false),
+    terminalContainerMemory: parseHermesInteger(terminal.container_memory, 'terminal.container_memory', 5120, 128, 1048576, false),
+    terminalContainerDisk: parseHermesInteger(terminal.container_disk, 'terminal.container_disk', 51200, 1024, 10485760, false),
+    terminalContainerPersistent: readHermesBool(terminal.container_persistent, true),
+  }
+}
+
+export function mergeHermesTerminalConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesTerminalConfigValues(next)
+  const terminal = next.terminal && typeof next.terminal === 'object' && !Array.isArray(next.terminal)
+    ? mergeConfigsPreservingFields(next.terminal, {})
+    : {}
+  terminal.backend = normalizeHermesTerminalBackend(Object.hasOwn(form, 'terminalBackend') ? form.terminalBackend : currentValues.terminalBackend, true)
+  terminal.cwd = String(Object.hasOwn(form, 'terminalCwd') ? form.terminalCwd : currentValues.terminalCwd).trim() || '.'
+  terminal.timeout = parseHermesInteger(Object.hasOwn(form, 'terminalTimeout') ? form.terminalTimeout : currentValues.terminalTimeout, 'terminal.timeout', 180, 1, 86400, true)
+  terminal.lifetime_seconds = parseHermesInteger(Object.hasOwn(form, 'terminalLifetimeSeconds') ? form.terminalLifetimeSeconds : currentValues.terminalLifetimeSeconds, 'terminal.lifetime_seconds', 300, 0, 86400, true)
+  const shellInitFiles = normalizeHermesShellInitFileList(Object.hasOwn(form, 'terminalShellInitFiles') ? form.terminalShellInitFiles : currentValues.terminalShellInitFiles, 'terminal.shell_init_files')
+  if (shellInitFiles.length) terminal.shell_init_files = shellInitFiles
+  else delete terminal.shell_init_files
+  terminal.auto_source_bashrc = formHermesBool(form, 'terminalAutoSourceBashrc', currentValues.terminalAutoSourceBashrc)
+  terminal.persistent_shell = formHermesBool(form, 'terminalPersistentShell', currentValues.terminalPersistentShell)
+  const envPassthrough = normalizeHermesEnvNameList(Object.hasOwn(form, 'terminalEnvPassthrough') ? form.terminalEnvPassthrough : currentValues.terminalEnvPassthrough, 'terminal.env_passthrough')
+  if (envPassthrough.length) terminal.env_passthrough = envPassthrough
+  else delete terminal.env_passthrough
+  terminal.docker_mount_cwd_to_workspace = formHermesBool(form, 'terminalDockerMountCwdToWorkspace', currentValues.terminalDockerMountCwdToWorkspace)
+  terminal.docker_run_as_host_user = formHermesBool(form, 'terminalDockerRunAsHostUser', currentValues.terminalDockerRunAsHostUser)
+  terminal.modal_mode = normalizeHermesTerminalModalMode(Object.hasOwn(form, 'terminalModalMode') ? form.terminalModalMode : currentValues.terminalModalMode, true)
+  terminal.vercel_runtime = normalizeHermesTerminalVercelRuntime(Object.hasOwn(form, 'terminalVercelRuntime') ? form.terminalVercelRuntime : currentValues.terminalVercelRuntime, true)
+  for (const [formKey, yamlKey] of [
+    ['terminalDockerImage', 'docker_image'],
+    ['terminalSingularityImage', 'singularity_image'],
+    ['terminalModalImage', 'modal_image'],
+    ['terminalDaytonaImage', 'daytona_image'],
+  ]) {
+    const image = normalizeHermesOptionalString(Object.hasOwn(form, formKey) ? form[formKey] : currentValues[formKey], `terminal.${yamlKey}`)
+    if (image) terminal[yamlKey] = image
+    else delete terminal[yamlKey]
+  }
+  const dockerForwardEnv = normalizeHermesEnvNameList(Object.hasOwn(form, 'terminalDockerForwardEnv') ? form.terminalDockerForwardEnv : currentValues.terminalDockerForwardEnv, 'terminal.docker_forward_env')
+  if (dockerForwardEnv.length) terminal.docker_forward_env = dockerForwardEnv
+  else delete terminal.docker_forward_env
+  const dockerEnv = normalizeHermesDockerEnvJson(Object.hasOwn(form, 'terminalDockerEnvJson') ? form.terminalDockerEnvJson : currentValues.terminalDockerEnvJson, 'terminal.docker_env')
+  if (Object.keys(dockerEnv).length) terminal.docker_env = dockerEnv
+  else delete terminal.docker_env
+  const dockerVolumes = normalizeHermesDockerVolumeList(Object.hasOwn(form, 'terminalDockerVolumes') ? form.terminalDockerVolumes : currentValues.terminalDockerVolumes, 'terminal.docker_volumes')
+  if (dockerVolumes.length) terminal.docker_volumes = dockerVolumes
+  else delete terminal.docker_volumes
+  const dockerExtraArgs = normalizeHermesDockerExtraArgsList(Object.hasOwn(form, 'terminalDockerExtraArgs') ? form.terminalDockerExtraArgs : currentValues.terminalDockerExtraArgs, 'terminal.docker_extra_args')
+  if (dockerExtraArgs.length) terminal.docker_extra_args = dockerExtraArgs
+  else delete terminal.docker_extra_args
+  for (const [formKey, yamlKey] of [
+    ['terminalSshHost', 'ssh_host'],
+    ['terminalSshUser', 'ssh_user'],
+    ['terminalSshKey', 'ssh_key'],
+  ]) {
+    const value = normalizeHermesOptionalString(Object.hasOwn(form, formKey) ? form[formKey] : currentValues[formKey], `terminal.${yamlKey}`)
+    if (value) terminal[yamlKey] = value
+    else delete terminal[yamlKey]
+  }
+  terminal.ssh_port = parseHermesInteger(Object.hasOwn(form, 'terminalSshPort') ? form.terminalSshPort : currentValues.terminalSshPort, 'terminal.ssh_port', 22, 1, 65535, true)
+  terminal.container_cpu = parseHermesInteger(Object.hasOwn(form, 'terminalContainerCpu') ? form.terminalContainerCpu : currentValues.terminalContainerCpu, 'terminal.container_cpu', 1, 1, 64, true)
+  terminal.container_memory = parseHermesInteger(Object.hasOwn(form, 'terminalContainerMemory') ? form.terminalContainerMemory : currentValues.terminalContainerMemory, 'terminal.container_memory', 5120, 128, 1048576, true)
+  terminal.container_disk = parseHermesInteger(Object.hasOwn(form, 'terminalContainerDisk') ? form.terminalContainerDisk : currentValues.terminalContainerDisk, 'terminal.container_disk', 51200, 1024, 10485760, true)
+  terminal.container_persistent = formHermesBool(form, 'terminalContainerPersistent', currentValues.terminalContainerPersistent)
+  next.terminal = terminal
+  return next
+}
+
+export function mergeHermesExecutionLimitsConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesExecutionLimitsConfigValues(next)
+  const codeExecution = next.code_execution && typeof next.code_execution === 'object' && !Array.isArray(next.code_execution)
+    ? mergeConfigsPreservingFields(next.code_execution, {})
+    : {}
+  const delegation = next.delegation && typeof next.delegation === 'object' && !Array.isArray(next.delegation)
+    ? mergeConfigsPreservingFields(next.delegation, {})
+    : {}
+
+  codeExecution.mode = normalizeHermesCodeExecutionMode(Object.hasOwn(form, 'codeExecutionMode') ? form.codeExecutionMode : currentValues.codeExecutionMode, true)
+  codeExecution.timeout = parseHermesInteger(Object.hasOwn(form, 'codeExecutionTimeout') ? form.codeExecutionTimeout : currentValues.codeExecutionTimeout, 'code_execution.timeout', 300, 1, 86400, true)
+  codeExecution.max_tool_calls = parseHermesInteger(Object.hasOwn(form, 'codeExecutionMaxToolCalls') ? form.codeExecutionMaxToolCalls : currentValues.codeExecutionMaxToolCalls, 'code_execution.max_tool_calls', 50, 1, 10000, true)
+  delegation.max_iterations = parseHermesInteger(Object.hasOwn(form, 'delegationMaxIterations') ? form.delegationMaxIterations : currentValues.delegationMaxIterations, 'delegation.max_iterations', 50, 1, 1000, true)
+  delegation.child_timeout_seconds = parseHermesInteger(Object.hasOwn(form, 'delegationChildTimeoutSeconds') ? form.delegationChildTimeoutSeconds : currentValues.delegationChildTimeoutSeconds, 'delegation.child_timeout_seconds', 600, 30, 86400, true)
+  delegation.max_concurrent_children = parseHermesInteger(Object.hasOwn(form, 'delegationMaxConcurrentChildren') ? form.delegationMaxConcurrentChildren : currentValues.delegationMaxConcurrentChildren, 'delegation.max_concurrent_children', 3, 1, 100, true)
+  delegation.max_spawn_depth = parseHermesInteger(Object.hasOwn(form, 'delegationMaxSpawnDepth') ? form.delegationMaxSpawnDepth : currentValues.delegationMaxSpawnDepth, 'delegation.max_spawn_depth', 1, 1, 3, true)
+  delegation.orchestrator_enabled = formHermesBool(form, 'delegationOrchestratorEnabled', currentValues.delegationOrchestratorEnabled)
+  delegation.subagent_auto_approve = formHermesBool(form, 'delegationSubagentAutoApprove', currentValues.delegationSubagentAutoApprove)
+  delegation.inherit_mcp_toolsets = formHermesBool(form, 'delegationInheritMcpToolsets', currentValues.delegationInheritMcpToolsets)
+  const delegationModel = normalizeHermesModelConfigString(Object.hasOwn(form, 'delegationModel') ? form.delegationModel : currentValues.delegationModel, 'delegation.model')
+  if (delegationModel) delegation.model = delegationModel
+  else delete delegation.model
+  const delegationProvider = normalizeHermesModelConfigString(Object.hasOwn(form, 'delegationProvider') ? form.delegationProvider : currentValues.delegationProvider, 'delegation.provider')
+  if (delegationProvider) delegation.provider = delegationProvider
+  else delete delegation.provider
+  next.code_execution = codeExecution
+  next.delegation = delegation
+  return next
+}
+
+export function buildHermesSessionRuntimeConfigValues(config = {}) {
+  const root = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const sessionReset = root.session_reset && typeof root.session_reset === 'object' && !Array.isArray(root.session_reset)
+    ? root.session_reset
+    : {}
+  const mode = HERMES_SESSION_RESET_MODES.has(String(sessionReset.mode || '').trim())
+    ? String(sessionReset.mode).trim()
+    : 'both'
+  return {
+    sessionResetMode: mode,
+    idleMinutes: parseHermesInteger(sessionReset.idle_minutes, 'idle_minutes', 1440, 1, 525600, false),
+    atHour: parseHermesInteger(sessionReset.at_hour, 'at_hour', 4, 0, 23, false),
+    groupSessionsPerUser: readHermesBool(root.group_sessions_per_user, true),
+    threadSessionsPerUser: readHermesBool(root.thread_sessions_per_user, false),
+    worktreeEnabled: readHermesBool(root.worktree, false),
+  }
+}
+
+export function mergeHermesSessionRuntimeConfig(config = {}, form = {}) {
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' && !Array.isArray(config) ? config : {})
+  const currentValues = buildHermesSessionRuntimeConfigValues(next)
+  const mode = String(Object.hasOwn(form, 'sessionResetMode') ? form.sessionResetMode : currentValues.sessionResetMode).trim()
+  if (!HERMES_SESSION_RESET_MODES.has(mode)) {
+    throw new Error('session_reset.mode 必须是 both、idle、daily 或 none')
+  }
+  const idleMinutes = parseHermesInteger(Object.hasOwn(form, 'idleMinutes') ? form.idleMinutes : currentValues.idleMinutes, 'idle_minutes', 1440, 1, 525600, true)
+  const atHour = parseHermesInteger(Object.hasOwn(form, 'atHour') ? form.atHour : currentValues.atHour, 'at_hour', 4, 0, 23, true)
+  const sessionReset = next.session_reset && typeof next.session_reset === 'object' && !Array.isArray(next.session_reset)
+    ? mergeConfigsPreservingFields(next.session_reset, {})
+    : {}
+  sessionReset.mode = mode
+  sessionReset.idle_minutes = idleMinutes
+  sessionReset.at_hour = atHour
+  next.session_reset = sessionReset
+  next.group_sessions_per_user = formHermesBool(form, 'groupSessionsPerUser', currentValues.groupSessionsPerUser)
+  next.thread_sessions_per_user = formHermesBool(form, 'threadSessionsPerUser', currentValues.threadSessionsPerUser)
+  next.worktree = formHermesBool(form, 'worktreeEnabled', currentValues.worktreeEnabled)
+  return next
+}
+
+function toCamelCaseKey(key) {
+  return String(key || '').replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase())
+}
+
+function putHermesString(form, source, key) {
+  const value = source?.[key]
+  if (typeof value === 'string') form[toCamelCaseKey(key)] = value
+}
+
+function putHermesScalarString(form, source, key) {
+  const value = source?.[key]
+  if (typeof value === 'string' || typeof value === 'number') form[toCamelCaseKey(key)] = String(value)
+}
+
+function putHermesBool(form, source, key) {
+  const value = source?.[key]
+  if (typeof value === 'boolean') form[toCamelCaseKey(key)] = value
+}
+
+function putHermesCsv(form, source, key) {
+  const value = csvForForm(source?.[key])
+  if (value) form[toCamelCaseKey(key)] = value
+}
+
+function hermesEnvValue(envValues, key) {
+  const value = envValues && Object.hasOwn(envValues, key) ? envValues[key] : undefined
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+}
+
+function hermesEnvBoolValue(envValues, key) {
+  const value = hermesEnvValue(envValues, key)
+  if (!value) return undefined
+  return ['true', '1', 'yes', 'on'].includes(value.toLowerCase())
+}
+
+function putHermesEnvString(form, envValues, envKey, formKey) {
+  const value = hermesEnvValue(envValues, envKey)
+  if (value) form[formKey] = value
+}
+
+function putHermesEnvBool(form, envValues, envKey, formKey) {
+  const value = hermesEnvBoolValue(envValues, envKey)
+  if (value !== undefined) form[formKey] = value
+}
+
+function putHermesHomeChannel(form, entry) {
+  const home = entry?.home_channel && typeof entry.home_channel === 'object' ? entry.home_channel : null
+  if (!home) return
+  if (typeof home.chat_id === 'string') form.homeChannel = home.chat_id
+  if (typeof home.name === 'string') form.homeChannelName = home.name
+}
+
+function readHermesEnvValues() {
+  const envPath = path.join(hermesHome(), '.env')
+  const values = {}
+  if (!fs.existsSync(envPath)) return values
+  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const parsed = parseDotenvLine(line)
+    if (parsed && values[parsed[0]] === undefined) values[parsed[0]] = parsed[1]
+  }
+  return values
+}
+
+function normalizeHermesDmPolicy(raw) {
+  const value = String(raw || '').trim().toLowerCase()
+  if (value === 'pairing') return 'pair'
+  if (value === 'allow') return 'open'
+  if (value === 'deny') return 'disabled'
+  if (['pair', 'open', 'allowlist', 'disabled'].includes(value)) return value
+  return 'pair'
+}
+
+function normalizeHermesGroupPolicy(raw) {
+  const value = String(raw || '').trim().toLowerCase()
+  if (value === 'all') return 'open'
+  if (value === 'mentioned') return 'open'
+  if (value === 'deny') return 'disabled'
+  if (['open', 'allowlist', 'disabled'].includes(value)) return value
+  return 'allowlist'
+}
+
+function normalizeHermesTelegramReplyToMode(raw, strict = false) {
+  const value = String(raw || '').trim().toLowerCase() || 'first'
+  if (HERMES_TELEGRAM_REPLY_TO_MODE_VALUES.has(value)) return value
+  if (strict) throw new Error('platforms.telegram.extra.reply_to_mode 必须是 off、first 或 all')
+  return 'first'
+}
+
+function readHermesPlatform(config, platform) {
+  const platforms = config?.platforms && typeof config.platforms === 'object' ? config.platforms : {}
+  const entry = platforms?.[platform] && typeof platforms[platform] === 'object' ? platforms[platform] : {}
+  const extra = entry?.extra && typeof entry.extra === 'object' ? entry.extra : {}
+  return { entry, extra }
+}
+
+export function buildHermesChannelConfigValues(config = {}, envValues = {}) {
+  const values = {}
+  for (const platform of HERMES_CHANNEL_PLATFORMS) {
+    const { entry, extra } = readHermesPlatform(config, platform)
+    const form = { enabled: entry.enabled === true }
+    if (platform === 'telegram') {
+      form.botToken = hermesEnvValue(envValues, 'TELEGRAM_BOT_TOKEN') || (typeof entry.token === 'string' ? entry.token : '')
+      putHermesString(form, extra, 'reply_to_mode')
+      putHermesBool(form, extra, 'guest_mode')
+      putHermesBool(form, extra, 'disable_link_previews')
+      form.replyToMode = normalizeHermesTelegramReplyToMode(hermesEnvValue(envValues, 'TELEGRAM_REPLY_TO_MODE') || form.replyToMode, false)
+      putHermesEnvBool(form, envValues, 'TELEGRAM_GUEST_MODE', 'guestMode')
+      putHermesEnvBool(form, envValues, 'TELEGRAM_DISABLE_LINK_PREVIEWS', 'disableLinkPreviews')
+    } else if (platform === 'discord') {
+      form.token = hermesEnvValue(envValues, 'DISCORD_BOT_TOKEN') || (typeof entry.token === 'string' ? entry.token : '')
+      for (const [yamlKey, formKey] of [
+        ['free_response_channels', 'freeResponseChannels'],
+        ['allowed_channels', 'allowedChannels'],
+        ['ignored_channels', 'ignoredChannels'],
+        ['no_thread_channels', 'noThreadChannels'],
+      ]) {
+        putHermesCsv(form, extra, yamlKey)
+        putHermesEnvString(form, envValues, `DISCORD_${yamlKey.toUpperCase()}`, formKey)
+      }
+      for (const [yamlKey, formKey] of [
+        ['auto_thread', 'autoThread'],
+        ['reactions', 'reactions'],
+        ['thread_require_mention', 'threadRequireMention'],
+        ['history_backfill', 'historyBackfill'],
+      ]) {
+        putHermesBool(form, extra, yamlKey)
+        putHermesEnvBool(form, envValues, `DISCORD_${yamlKey.toUpperCase()}`, formKey)
+      }
+      putHermesString(form, extra, 'history_backfill_limit')
+      putHermesEnvString(form, envValues, 'DISCORD_HISTORY_BACKFILL_LIMIT', 'historyBackfillLimit')
+      putHermesString(form, extra, 'reply_to_mode')
+      putHermesEnvString(form, envValues, 'DISCORD_REPLY_TO_MODE', 'replyToMode')
+      putHermesEnvString(form, envValues, 'DISCORD_HOME_CHANNEL', 'homeChannel')
+      putHermesEnvString(form, envValues, 'DISCORD_HOME_CHANNEL_NAME', 'homeChannelName')
+    } else if (platform === 'slack') {
+      form.botToken = hermesEnvValue(envValues, 'SLACK_BOT_TOKEN') || (typeof entry.token === 'string' ? entry.token : '')
+      putHermesString(form, extra, 'app_token')
+      form.appToken = hermesEnvValue(envValues, 'SLACK_APP_TOKEN') || form.appToken || ''
+      putHermesString(form, extra, 'signing_secret')
+      putHermesString(form, extra, 'webhook_path')
+    } else if (platform === 'feishu') {
+      for (const key of ['app_id', 'app_secret', 'domain', 'connection_mode', 'webhook_path', 'reaction_notifications']) {
+        putHermesString(form, extra, key)
+      }
+      form.appId = hermesEnvValue(envValues, 'FEISHU_APP_ID') || form.appId || ''
+      form.appSecret = hermesEnvValue(envValues, 'FEISHU_APP_SECRET') || form.appSecret || ''
+      form.domain = hermesEnvValue(envValues, 'FEISHU_DOMAIN') || form.domain || ''
+      form.connectionMode = hermesEnvValue(envValues, 'FEISHU_CONNECTION_MODE') || form.connectionMode || ''
+      form.webhookPath = hermesEnvValue(envValues, 'FEISHU_WEBHOOK_PATH') || form.webhookPath || ''
+      for (const key of ['typing_indicator', 'resolve_sender_names']) {
+        putHermesBool(form, extra, key)
+      }
+    } else if (platform === 'dingtalk') {
+      putHermesString(form, extra, 'client_id')
+      putHermesString(form, extra, 'client_secret')
+      form.clientId = hermesEnvValue(envValues, 'DINGTALK_CLIENT_ID') || form.clientId || ''
+      form.clientSecret = hermesEnvValue(envValues, 'DINGTALK_CLIENT_SECRET') || form.clientSecret || ''
+    } else if (platform === 'teams') {
+      for (const key of ['client_id', 'client_secret', 'tenant_id', 'service_url']) putHermesString(form, extra, key)
+      putHermesScalarString(form, extra, 'port')
+      putHermesHomeChannel(form, entry)
+      form.clientId = hermesEnvValue(envValues, 'TEAMS_CLIENT_ID') || form.clientId || ''
+      form.clientSecret = hermesEnvValue(envValues, 'TEAMS_CLIENT_SECRET') || form.clientSecret || ''
+      form.tenantId = hermesEnvValue(envValues, 'TEAMS_TENANT_ID') || form.tenantId || ''
+      form.port = hermesEnvValue(envValues, 'TEAMS_PORT') || form.port || ''
+      form.serviceUrl = hermesEnvValue(envValues, 'TEAMS_SERVICE_URL') || form.serviceUrl || ''
+      putHermesEnvString(form, envValues, 'TEAMS_ALLOWED_USERS', 'allowFrom')
+      putHermesEnvBool(form, envValues, 'TEAMS_ALLOW_ALL_USERS', 'allowAllUsers')
+      putHermesEnvString(form, envValues, 'TEAMS_HOME_CHANNEL', 'homeChannel')
+      putHermesEnvString(form, envValues, 'TEAMS_HOME_CHANNEL_NAME', 'homeChannelName')
+    } else if (platform === 'google_chat') {
+      for (const key of ['project_id', 'subscription_name', 'service_account_json']) putHermesString(form, extra, key)
+      putHermesHomeChannel(form, entry)
+      form.projectId = hermesEnvValue(envValues, 'GOOGLE_CHAT_PROJECT_ID') || hermesEnvValue(envValues, 'GOOGLE_CLOUD_PROJECT') || form.projectId || ''
+      form.subscriptionName = hermesEnvValue(envValues, 'GOOGLE_CHAT_SUBSCRIPTION_NAME') || hermesEnvValue(envValues, 'GOOGLE_CHAT_SUBSCRIPTION') || form.subscriptionName || ''
+      form.serviceAccountJson = hermesEnvValue(envValues, 'GOOGLE_CHAT_SERVICE_ACCOUNT_JSON') || hermesEnvValue(envValues, 'GOOGLE_APPLICATION_CREDENTIALS') || form.serviceAccountJson || ''
+      putHermesEnvString(form, envValues, 'GOOGLE_CHAT_ALLOWED_USERS', 'allowFrom')
+      putHermesEnvBool(form, envValues, 'GOOGLE_CHAT_ALLOW_ALL_USERS', 'allowAllUsers')
+      putHermesEnvString(form, envValues, 'GOOGLE_CHAT_HOME_CHANNEL', 'homeChannel')
+      putHermesEnvString(form, envValues, 'GOOGLE_CHAT_HOME_CHANNEL_NAME', 'homeChannelName')
+    } else if (platform === 'irc') {
+      for (const key of ['server', 'channel', 'nickname', 'server_password', 'nickserv_password']) putHermesString(form, extra, key)
+      putHermesScalarString(form, extra, 'port')
+      putHermesBool(form, extra, 'use_tls')
+      putHermesCsv(form, extra, 'allowed_users')
+      if (form.allowedUsers && !form.allowFrom) form.allowFrom = form.allowedUsers
+      delete form.allowedUsers
+      putHermesHomeChannel(form, entry)
+      form.server = hermesEnvValue(envValues, 'IRC_SERVER') || form.server || ''
+      form.channel = hermesEnvValue(envValues, 'IRC_CHANNEL') || form.channel || ''
+      form.nickname = hermesEnvValue(envValues, 'IRC_NICKNAME') || form.nickname || ''
+      form.port = hermesEnvValue(envValues, 'IRC_PORT') || form.port || ''
+      putHermesEnvBool(form, envValues, 'IRC_USE_TLS', 'useTls')
+      form.serverPassword = hermesEnvValue(envValues, 'IRC_SERVER_PASSWORD') || form.serverPassword || ''
+      form.nickservPassword = hermesEnvValue(envValues, 'IRC_NICKSERV_PASSWORD') || form.nickservPassword || ''
+      putHermesEnvString(form, envValues, 'IRC_ALLOWED_USERS', 'allowFrom')
+      putHermesEnvBool(form, envValues, 'IRC_ALLOW_ALL_USERS', 'allowAllUsers')
+      putHermesEnvString(form, envValues, 'IRC_HOME_CHANNEL', 'homeChannel')
+      putHermesEnvString(form, envValues, 'IRC_HOME_CHANNEL_NAME', 'homeChannelName')
+    } else if (platform === 'line') {
+      for (const key of ['channel_access_token', 'channel_secret', 'host', 'public_url', 'slow_response_threshold']) putHermesString(form, extra, key)
+      putHermesScalarString(form, extra, 'port')
+      putHermesCsv(form, extra, 'allowed_users')
+      if (form.allowedUsers && !form.allowFrom) form.allowFrom = form.allowedUsers
+      delete form.allowedUsers
+      putHermesCsv(form, extra, 'allowed_groups')
+      putHermesCsv(form, extra, 'allowed_rooms')
+      putHermesHomeChannel(form, entry)
+      form.channelAccessToken = hermesEnvValue(envValues, 'LINE_CHANNEL_ACCESS_TOKEN') || form.channelAccessToken || ''
+      form.channelSecret = hermesEnvValue(envValues, 'LINE_CHANNEL_SECRET') || form.channelSecret || ''
+      form.port = hermesEnvValue(envValues, 'LINE_PORT') || form.port || ''
+      form.host = hermesEnvValue(envValues, 'LINE_HOST') || form.host || ''
+      form.publicUrl = hermesEnvValue(envValues, 'LINE_PUBLIC_URL') || form.publicUrl || ''
+      putHermesEnvString(form, envValues, 'LINE_ALLOWED_USERS', 'allowFrom')
+      putHermesEnvString(form, envValues, 'LINE_ALLOWED_GROUPS', 'allowedGroups')
+      putHermesEnvString(form, envValues, 'LINE_ALLOWED_ROOMS', 'allowedRooms')
+      putHermesEnvBool(form, envValues, 'LINE_ALLOW_ALL_USERS', 'allowAllUsers')
+      putHermesEnvString(form, envValues, 'LINE_HOME_CHANNEL', 'homeChannel')
+      form.slowResponseThreshold = hermesEnvValue(envValues, 'LINE_SLOW_RESPONSE_THRESHOLD') || form.slowResponseThreshold || ''
+    } else if (platform === 'simplex') {
+      putHermesString(form, extra, 'ws_url')
+      putHermesCsv(form, extra, 'allowed_users')
+      if (form.allowedUsers && !form.allowFrom) form.allowFrom = form.allowedUsers
+      delete form.allowedUsers
+      putHermesHomeChannel(form, entry)
+      form.wsUrl = hermesEnvValue(envValues, 'SIMPLEX_WS_URL') || form.wsUrl || ''
+      putHermesEnvString(form, envValues, 'SIMPLEX_ALLOWED_USERS', 'allowFrom')
+      putHermesEnvBool(form, envValues, 'SIMPLEX_ALLOW_ALL_USERS', 'allowAllUsers')
+      putHermesEnvString(form, envValues, 'SIMPLEX_HOME_CHANNEL', 'homeChannel')
+      putHermesEnvString(form, envValues, 'SIMPLEX_HOME_CHANNEL_NAME', 'homeChannelName')
+    }
+    putHermesString(form, extra, 'dm_policy')
+    putHermesString(form, extra, 'group_policy')
+    putHermesBool(form, extra, 'require_mention')
+    if (platform === 'dingtalk') {
+      putHermesCsv(form, extra, 'allowed_users')
+      if (form.allowedUsers && !form.allowFrom) form.allowFrom = form.allowedUsers
+      delete form.allowedUsers
+      putHermesCsv(form, extra, 'allowed_chats')
+      if (form.allowedChats && !form.groupAllowFrom) form.groupAllowFrom = form.allowedChats
+      delete form.allowedChats
+    } else {
+      putHermesCsv(form, extra, 'allow_from')
+      putHermesCsv(form, extra, 'group_allow_from')
+    }
+    putHermesChannelDisplayFields(form, config, platform)
+    values[platform] = form
+  }
+  return values
+}
+
+function setHermesExtra(entry, key, value) {
+  if (!entry.extra || typeof entry.extra !== 'object' || Array.isArray(entry.extra)) entry.extra = {}
+  if (value === undefined || value === null || value === '') return
+  entry.extra[key] = value
+}
+
+function setHermesExtraInteger(entry, key, value) {
+  const raw = String(value ?? '').trim()
+  if (!raw) return
+  const parsed = Number.parseInt(raw, 10)
+  if (Number.isFinite(parsed)) setHermesExtra(entry, key, parsed)
+}
+
+function setHermesHomeChannel(entry, form = {}) {
+  if (!Object.hasOwn(form, 'homeChannel')) return
+  const chatId = String(form.homeChannel || '').trim()
+  if (!chatId) {
+    deleteHermesEntryKey(entry, 'home_channel')
+    return
+  }
+  entry.home_channel = {
+    chat_id: chatId,
+    name: String(form.homeChannelName || '').trim() || chatId,
+  }
+}
+
+function deleteHermesEntryKey(entry, key) {
+  if (entry && typeof entry === 'object') delete entry[key]
+}
+
+function deleteHermesExtraKey(entry, key) {
+  if (entry?.extra && typeof entry.extra === 'object' && !Array.isArray(entry.extra)) delete entry.extra[key]
+}
+
+function normalizeHermesChannelForm(platform, form = {}) {
+  const normalized = { ...(form || {}) }
+  normalized.enabled = normalized.enabled === true || normalized.enabled === 'true' || normalized.enabled === 'on'
+  if (Object.hasOwn(normalized, 'dmPolicy')) normalized.dmPolicy = normalizeHermesDmPolicy(normalized.dmPolicy)
+  if (Object.hasOwn(normalized, 'groupPolicy')) normalized.groupPolicy = normalizeHermesGroupPolicy(normalized.groupPolicy)
+  if (Object.hasOwn(normalized, 'allowFrom')) normalized.allowFrom = csvToStringArray(normalized.allowFrom)
+  if (Object.hasOwn(normalized, 'groupAllowFrom')) normalized.groupAllowFrom = csvToStringArray(normalized.groupAllowFrom)
+  if (Object.hasOwn(normalized, 'requireMention')) {
+    normalized.requireMention = normalized.requireMention === true || normalized.requireMention === 'true' || normalized.requireMention === 'on'
+  }
+  if (Object.hasOwn(normalized, 'allowAllUsers')) {
+    normalized.allowAllUsers = normalized.allowAllUsers === true || normalized.allowAllUsers === 'true' || normalized.allowAllUsers === 'on'
+  }
+  if (platform === 'feishu') {
+    normalized.domain = String(normalized.domain || '').trim() || 'feishu'
+    normalized.connectionMode = String(normalized.connectionMode || '').trim() || 'websocket'
+    normalized.webhookPath = String(normalized.webhookPath || '').trim() || '/feishu/webhook'
+    normalized.reactionNotifications = String(normalized.reactionNotifications || '').trim() || 'off'
+    if (!Object.hasOwn(normalized, 'typingIndicator')) normalized.typingIndicator = true
+    if (!Object.hasOwn(normalized, 'resolveSenderNames')) normalized.resolveSenderNames = true
+  }
+  if (platform === 'slack') {
+    normalized.webhookPath = String(normalized.webhookPath || '').trim() || '/slack/events'
+  }
+  if (platform === 'discord') {
+    for (const key of ['freeResponseChannels', 'allowedChannels', 'ignoredChannels', 'noThreadChannels']) {
+      if (Object.hasOwn(normalized, key)) normalized[key] = csvToStringArray(normalized[key])
+    }
+    for (const key of ['autoThread', 'reactions', 'threadRequireMention', 'historyBackfill']) {
+      if (Object.hasOwn(normalized, key)) normalized[key] = normalized[key] === true || normalized[key] === 'true' || normalized[key] === 'on'
+    }
+    normalized.historyBackfillLimit = String(normalized.historyBackfillLimit || '').trim()
+    normalized.replyToMode = String(normalized.replyToMode || '').trim()
+  }
+  if (platform === 'telegram') {
+    normalized.replyToMode = normalizeHermesTelegramReplyToMode(normalized.replyToMode, true)
+    if (Object.hasOwn(normalized, 'guestMode')) normalized.guestMode = normalized.guestMode === true || normalized.guestMode === 'true' || normalized.guestMode === 'on'
+    if (Object.hasOwn(normalized, 'disableLinkPreviews')) normalized.disableLinkPreviews = normalized.disableLinkPreviews === true || normalized.disableLinkPreviews === 'true' || normalized.disableLinkPreviews === 'on'
+  }
+  if (platform === 'irc') {
+    if (Object.hasOwn(normalized, 'useTls')) normalized.useTls = normalized.useTls === true || normalized.useTls === 'true' || normalized.useTls === 'on'
+  }
+  if (platform === 'line') {
+    for (const key of ['allowedGroups', 'allowedRooms']) {
+      if (Object.hasOwn(normalized, key)) normalized[key] = csvToStringArray(normalized[key])
+    }
+  }
+  if (Object.hasOwn(normalized, 'displayToolProgress')) {
+    normalized.displayToolProgress = normalizeHermesDisplayToolProgress(
+      normalized.displayToolProgress,
+      true,
+      `display.platforms.${platform}.tool_progress`,
+    )
+  }
+  if (Object.hasOwn(normalized, 'displayShowReasoning')) {
+    normalized.displayShowReasoning = normalized.displayShowReasoning === true || normalized.displayShowReasoning === 'true' || normalized.displayShowReasoning === 'on'
+  }
+  if (Object.hasOwn(normalized, 'displayToolPreviewLength')) {
+    normalized.displayToolPreviewLength = parseHermesInteger(
+      normalized.displayToolPreviewLength,
+      `display.platforms.${platform}.tool_preview_length`,
+      0,
+      0,
+      200000,
+      true,
+    )
+  }
+  if (Object.hasOwn(normalized, 'displayStreaming')) {
+    normalized.displayStreaming = normalizeHermesDisplayStreaming(
+      normalized.displayStreaming,
+      true,
+      `display.platforms.${platform}.streaming`,
+    )
+  }
+  if (Object.hasOwn(normalized, 'displayCleanupProgress')) {
+    normalized.displayCleanupProgress = normalized.displayCleanupProgress === true || normalized.displayCleanupProgress === 'true' || normalized.displayCleanupProgress === 'on'
+  }
+  return normalized
+}
+
+function mergeHermesChannelDisplayConfig(next, platform, normalized) {
+  const hasDisplayFields = [
+    'displayToolProgress',
+    'displayShowReasoning',
+    'displayToolPreviewLength',
+    'displayStreaming',
+    'displayCleanupProgress',
+  ].some(key => Object.hasOwn(normalized, key))
+  if (!hasDisplayFields) return
+  const display = next.display && typeof next.display === 'object' && !Array.isArray(next.display)
+    ? mergeConfigsPreservingFields(next.display, {})
+    : {}
+  const platforms = display.platforms && typeof display.platforms === 'object' && !Array.isArray(display.platforms)
+    ? mergeConfigsPreservingFields(display.platforms, {})
+    : {}
+  const current = platforms[platform] && typeof platforms[platform] === 'object' && !Array.isArray(platforms[platform])
+    ? platforms[platform]
+    : {}
+  const platformDisplay = mergeConfigsPreservingFields(current, {})
+  if (Object.hasOwn(normalized, 'displayToolProgress')) platformDisplay.tool_progress = normalized.displayToolProgress
+  if (Object.hasOwn(normalized, 'displayShowReasoning')) platformDisplay.show_reasoning = !!normalized.displayShowReasoning
+  if (Object.hasOwn(normalized, 'displayToolPreviewLength')) platformDisplay.tool_preview_length = normalized.displayToolPreviewLength
+  if (Object.hasOwn(normalized, 'displayStreaming')) {
+    if (normalized.displayStreaming === 'inherit') delete platformDisplay.streaming
+    else platformDisplay.streaming = normalized.displayStreaming === 'true'
+  }
+  if (Object.hasOwn(normalized, 'displayCleanupProgress')) platformDisplay.cleanup_progress = !!normalized.displayCleanupProgress
+  platforms[platform] = platformDisplay
+  display.platforms = platforms
+  next.display = display
+}
+
+export function mergeHermesChannelConfig(config = {}, platform, form = {}) {
+  const normalizedPlatform = normalizeHermesPlatform(platform)
+  if (!normalizedPlatform) throw new Error(`不支持的 Hermes 渠道: ${platform}`)
+  const next = mergeConfigsPreservingFields({}, config && typeof config === 'object' ? config : {})
+  if (!next.platforms || typeof next.platforms !== 'object' || Array.isArray(next.platforms)) next.platforms = {}
+  const current = next.platforms[normalizedPlatform] && typeof next.platforms[normalizedPlatform] === 'object'
+    ? next.platforms[normalizedPlatform]
+    : {}
+  const entry = mergeConfigsPreservingFields(current, {})
+  const normalized = normalizeHermesChannelForm(normalizedPlatform, form)
+  entry.enabled = normalized.enabled
+  if (normalizedPlatform === 'telegram') {
+    deleteHermesEntryKey(entry, 'token')
+    setHermesExtra(entry, 'reply_to_mode', normalized.replyToMode)
+    if (Object.hasOwn(normalized, 'guestMode')) setHermesExtra(entry, 'guest_mode', !!normalized.guestMode)
+    if (Object.hasOwn(normalized, 'disableLinkPreviews')) setHermesExtra(entry, 'disable_link_previews', !!normalized.disableLinkPreviews)
+  } else if (normalizedPlatform === 'discord') {
+    deleteHermesEntryKey(entry, 'token')
+    for (const [formKey, extraKey] of [
+      ['freeResponseChannels', 'free_response_channels'],
+      ['allowedChannels', 'allowed_channels'],
+      ['ignoredChannels', 'ignored_channels'],
+      ['noThreadChannels', 'no_thread_channels'],
+    ]) {
+      if (Array.isArray(normalized[formKey])) setHermesExtra(entry, extraKey, normalized[formKey])
+    }
+    for (const [formKey, extraKey] of [
+      ['autoThread', 'auto_thread'],
+      ['reactions', 'reactions'],
+      ['threadRequireMention', 'thread_require_mention'],
+      ['historyBackfill', 'history_backfill'],
+    ]) {
+      if (Object.hasOwn(normalized, formKey)) setHermesExtra(entry, extraKey, !!normalized[formKey])
+    }
+    setHermesExtra(entry, 'history_backfill_limit', normalized.historyBackfillLimit)
+    setHermesExtra(entry, 'reply_to_mode', normalized.replyToMode)
+  } else if (normalizedPlatform === 'slack') {
+    deleteHermesEntryKey(entry, 'token')
+    deleteHermesExtraKey(entry, 'app_token')
+    deleteHermesExtraKey(entry, 'signing_secret')
+    setHermesExtra(entry, 'webhook_path', String(normalized.webhookPath || '').trim())
+  } else if (normalizedPlatform === 'feishu') {
+    deleteHermesExtraKey(entry, 'app_id')
+    deleteHermesExtraKey(entry, 'app_secret')
+    setHermesExtra(entry, 'domain', normalized.domain)
+    setHermesExtra(entry, 'connection_mode', normalized.connectionMode)
+    setHermesExtra(entry, 'webhook_path', normalized.webhookPath)
+    setHermesExtra(entry, 'reaction_notifications', normalized.reactionNotifications)
+    setHermesExtra(entry, 'typing_indicator', !!normalized.typingIndicator)
+    setHermesExtra(entry, 'resolve_sender_names', !!normalized.resolveSenderNames)
+  } else if (normalizedPlatform === 'dingtalk') {
+    deleteHermesExtraKey(entry, 'client_id')
+    deleteHermesExtraKey(entry, 'client_secret')
+    deleteHermesExtraKey(entry, 'allow_from')
+    deleteHermesExtraKey(entry, 'group_allow_from')
+  } else if (normalizedPlatform === 'teams') {
+    deleteHermesExtraKey(entry, 'client_id')
+    deleteHermesExtraKey(entry, 'client_secret')
+    deleteHermesExtraKey(entry, 'tenant_id')
+    setHermesExtraInteger(entry, 'port', normalized.port)
+    setHermesExtra(entry, 'service_url', String(normalized.serviceUrl || '').trim())
+    setHermesHomeChannel(entry, normalized)
+  } else if (normalizedPlatform === 'google_chat') {
+    setHermesExtra(entry, 'project_id', String(normalized.projectId || '').trim())
+    setHermesExtra(entry, 'subscription_name', String(normalized.subscriptionName || '').trim())
+    deleteHermesExtraKey(entry, 'service_account_json')
+    setHermesHomeChannel(entry, normalized)
+  } else if (normalizedPlatform === 'irc') {
+    setHermesExtra(entry, 'server', String(normalized.server || '').trim())
+    setHermesExtraInteger(entry, 'port', normalized.port)
+    setHermesExtra(entry, 'nickname', String(normalized.nickname || '').trim())
+    setHermesExtra(entry, 'channel', String(normalized.channel || '').trim())
+    if (Object.hasOwn(normalized, 'useTls')) setHermesExtra(entry, 'use_tls', !!normalized.useTls)
+    deleteHermesExtraKey(entry, 'server_password')
+    deleteHermesExtraKey(entry, 'nickserv_password')
+    setHermesHomeChannel(entry, normalized)
+  } else if (normalizedPlatform === 'line') {
+    deleteHermesExtraKey(entry, 'channel_access_token')
+    deleteHermesExtraKey(entry, 'channel_secret')
+    setHermesExtraInteger(entry, 'port', normalized.port)
+    setHermesExtra(entry, 'host', String(normalized.host || '').trim())
+    setHermesExtra(entry, 'public_url', String(normalized.publicUrl || '').trim())
+    if (Array.isArray(normalized.allowedGroups)) setHermesExtra(entry, 'allowed_groups', normalized.allowedGroups)
+    if (Array.isArray(normalized.allowedRooms)) setHermesExtra(entry, 'allowed_rooms', normalized.allowedRooms)
+    setHermesExtra(entry, 'slow_response_threshold', String(normalized.slowResponseThreshold || '').trim())
+    setHermesHomeChannel(entry, normalized)
+  } else if (normalizedPlatform === 'simplex') {
+    setHermesExtra(entry, 'ws_url', String(normalized.wsUrl || '').trim())
+    setHermesHomeChannel(entry, normalized)
+  }
+  if (Object.hasOwn(normalized, 'dmPolicy')) setHermesExtra(entry, 'dm_policy', normalized.dmPolicy)
+  if (Object.hasOwn(normalized, 'groupPolicy')) {
+    setHermesExtra(entry, 'group_policy', normalized.groupPolicy)
+    if (normalizedPlatform === 'feishu') setHermesExtra(entry, 'default_group_policy', normalized.groupPolicy)
+  }
+  if (Object.hasOwn(normalized, 'requireMention')) setHermesExtra(entry, 'require_mention', !!normalized.requireMention)
+  if (Array.isArray(normalized.allowFrom)) {
+    const allowKey = ['dingtalk', 'irc', 'line', 'simplex'].includes(normalizedPlatform) ? 'allowed_users' : 'allow_from'
+    setHermesExtra(entry, allowKey, normalized.allowFrom)
+  }
+  if (Array.isArray(normalized.groupAllowFrom)) {
+    setHermesExtra(entry, normalizedPlatform === 'dingtalk' ? 'allowed_chats' : 'group_allow_from', normalized.groupAllowFrom)
+  }
+  next.platforms[normalizedPlatform] = entry
+  mergeHermesChannelDisplayConfig(next, normalizedPlatform, normalized)
+  return next
+}
+
+function readHermesConfigYamlObject() {
+  const configPath = path.join(hermesHome(), 'config.yaml')
+  if (!fs.existsSync(configPath)) return { configPath, exists: false, config: {} }
+  const raw = fs.readFileSync(configPath, 'utf8')
+  const parsed = raw.trim() ? YAML.parse(raw) : {}
+  if (parsed && (typeof parsed !== 'object' || Array.isArray(parsed))) {
+    throw new Error('config.yaml 顶层必须是对象')
+  }
+  return { configPath, exists: true, config: parsed || {} }
+}
+
+function writeHermesConfigYamlObject(configPath, config) {
+  fs.mkdirSync(path.dirname(configPath), { recursive: true })
+  let backup = ''
+  if (fs.existsSync(configPath)) {
+    backup = `${configPath}.bak-${Math.floor(Date.now() / 1000)}`
+    fs.copyFileSync(configPath, backup)
+  }
+  fs.writeFileSync(configPath, YAML.stringify(config || {}, { lineWidth: 0 }), 'utf8')
+  return backup
+}
+
+function writeHermesEnvValues(updates = {}) {
+  const envPath = path.join(hermesHome(), '.env')
+  fs.mkdirSync(path.dirname(envPath), { recursive: true })
+  const raw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : ''
+  const lines = raw.split('\n')
+  const remaining = new Set(Object.keys(updates))
+  const out = []
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) {
+      out.push(line)
+      continue
+    }
+    const eq = trimmed.indexOf('=')
+    const key = eq > 0 ? trimmed.slice(0, eq).trim() : ''
+    if (key && Object.hasOwn(updates, key)) {
+      const value = updates[key]
+      if (value !== undefined && value !== null && String(value).trim() !== '') {
+        out.push(`${key}=${value}`)
+      }
+      remaining.delete(key)
+      continue
+    }
+    out.push(line)
+  }
+  for (const key of remaining) {
+    const value = updates[key]
+    if (value !== undefined && value !== null && String(value).trim() !== '') out.push(`${key}=${value}`)
+  }
+  let content = out.join('\n').replace(/\n+$/, '')
+  if (content) content += '\n'
+  fs.writeFileSync(envPath, content, 'utf8')
+}
+
+function csvEnvValue(value) {
+  return csvToStringArray(value).join(',')
+}
+
+function boolEnvValue(value) {
+  return value === true || value === 'true' || value === 'on' ? 'true' : 'false'
+}
+
+export function buildHermesChannelEnvUpdates(platform, form = {}) {
+  const updates = {}
+  if (platform === 'telegram') {
+    updates.TELEGRAM_BOT_TOKEN = String(form.botToken || '').trim()
+    updates.TELEGRAM_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    updates.TELEGRAM_GROUP_ALLOWED_USERS = csvEnvValue(form.groupAllowFrom)
+    if (Object.hasOwn(form, 'requireMention')) updates.TELEGRAM_REQUIRE_MENTION = boolEnvValue(form.requireMention)
+    updates.TELEGRAM_REPLY_TO_MODE = normalizeHermesTelegramReplyToMode(form.replyToMode, true)
+    if (Object.hasOwn(form, 'guestMode')) updates.TELEGRAM_GUEST_MODE = boolEnvValue(form.guestMode)
+    if (Object.hasOwn(form, 'disableLinkPreviews')) updates.TELEGRAM_DISABLE_LINK_PREVIEWS = boolEnvValue(form.disableLinkPreviews)
+  } else if (platform === 'discord') {
+    updates.DISCORD_BOT_TOKEN = String(form.token || '').trim()
+    updates.DISCORD_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    if (Object.hasOwn(form, 'requireMention')) updates.DISCORD_REQUIRE_MENTION = boolEnvValue(form.requireMention)
+    updates.DISCORD_FREE_RESPONSE_CHANNELS = csvEnvValue(form.freeResponseChannels)
+    updates.DISCORD_ALLOWED_CHANNELS = csvEnvValue(form.allowedChannels)
+    updates.DISCORD_IGNORED_CHANNELS = csvEnvValue(form.ignoredChannels)
+    updates.DISCORD_NO_THREAD_CHANNELS = csvEnvValue(form.noThreadChannels)
+    if (Object.hasOwn(form, 'autoThread')) updates.DISCORD_AUTO_THREAD = boolEnvValue(form.autoThread)
+    if (Object.hasOwn(form, 'reactions')) updates.DISCORD_REACTIONS = boolEnvValue(form.reactions)
+    if (Object.hasOwn(form, 'threadRequireMention')) updates.DISCORD_THREAD_REQUIRE_MENTION = boolEnvValue(form.threadRequireMention)
+    if (Object.hasOwn(form, 'historyBackfill')) updates.DISCORD_HISTORY_BACKFILL = boolEnvValue(form.historyBackfill)
+    updates.DISCORD_HISTORY_BACKFILL_LIMIT = String(form.historyBackfillLimit || '').trim()
+    updates.DISCORD_REPLY_TO_MODE = String(form.replyToMode || '').trim()
+    updates.DISCORD_HOME_CHANNEL = String(form.homeChannel || '').trim()
+    updates.DISCORD_HOME_CHANNEL_NAME = String(form.homeChannelName || '').trim()
+  } else if (platform === 'slack') {
+    updates.SLACK_BOT_TOKEN = String(form.botToken || '').trim()
+    updates.SLACK_APP_TOKEN = String(form.appToken || '').trim()
+    updates.SLACK_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    if (Object.hasOwn(form, 'requireMention')) updates.SLACK_REQUIRE_MENTION = boolEnvValue(form.requireMention)
+  } else if (platform === 'feishu') {
+    updates.FEISHU_APP_ID = String(form.appId || '').trim()
+    updates.FEISHU_APP_SECRET = String(form.appSecret || '').trim()
+    updates.FEISHU_DOMAIN = String(form.domain || 'feishu').trim()
+    updates.FEISHU_CONNECTION_MODE = String(form.connectionMode || 'websocket').trim()
+    updates.FEISHU_WEBHOOK_PATH = String(form.webhookPath || '/feishu/webhook').trim()
+    updates.FEISHU_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    updates.FEISHU_GROUP_POLICY = String(form.groupPolicy || 'allowlist').trim()
+    updates.FEISHU_REQUIRE_MENTION = Object.hasOwn(form, 'requireMention') ? boolEnvValue(form.requireMention) : 'true'
+    updates.FEISHU_REACTIONS = String(form.reactionNotifications || '').trim() === 'off' ? 'false' : 'true'
+  } else if (platform === 'dingtalk') {
+    updates.DINGTALK_CLIENT_ID = String(form.clientId || '').trim()
+    updates.DINGTALK_CLIENT_SECRET = String(form.clientSecret || '').trim()
+    updates.DINGTALK_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    updates.DINGTALK_ALLOWED_CHATS = csvEnvValue(form.groupAllowFrom)
+    if (Object.hasOwn(form, 'requireMention')) updates.DINGTALK_REQUIRE_MENTION = boolEnvValue(form.requireMention)
+  } else if (platform === 'teams') {
+    updates.TEAMS_CLIENT_ID = String(form.clientId || '').trim()
+    updates.TEAMS_CLIENT_SECRET = String(form.clientSecret || '').trim()
+    updates.TEAMS_TENANT_ID = String(form.tenantId || '').trim()
+    updates.TEAMS_PORT = String(form.port || '').trim()
+    updates.TEAMS_SERVICE_URL = String(form.serviceUrl || '').trim()
+    updates.TEAMS_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    if (Object.hasOwn(form, 'allowAllUsers')) updates.TEAMS_ALLOW_ALL_USERS = boolEnvValue(form.allowAllUsers)
+    updates.TEAMS_HOME_CHANNEL = String(form.homeChannel || '').trim()
+    updates.TEAMS_HOME_CHANNEL_NAME = String(form.homeChannelName || '').trim()
+  } else if (platform === 'google_chat') {
+    updates.GOOGLE_CHAT_PROJECT_ID = String(form.projectId || '').trim()
+    updates.GOOGLE_CHAT_SUBSCRIPTION_NAME = String(form.subscriptionName || '').trim()
+    updates.GOOGLE_CHAT_SERVICE_ACCOUNT_JSON = String(form.serviceAccountJson || '').trim()
+    updates.GOOGLE_CHAT_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    if (Object.hasOwn(form, 'allowAllUsers')) updates.GOOGLE_CHAT_ALLOW_ALL_USERS = boolEnvValue(form.allowAllUsers)
+    updates.GOOGLE_CHAT_HOME_CHANNEL = String(form.homeChannel || '').trim()
+    updates.GOOGLE_CHAT_HOME_CHANNEL_NAME = String(form.homeChannelName || '').trim()
+  } else if (platform === 'irc') {
+    updates.IRC_SERVER = String(form.server || '').trim()
+    updates.IRC_PORT = String(form.port || '').trim()
+    updates.IRC_NICKNAME = String(form.nickname || '').trim()
+    updates.IRC_CHANNEL = String(form.channel || '').trim()
+    if (Object.hasOwn(form, 'useTls')) updates.IRC_USE_TLS = boolEnvValue(form.useTls)
+    updates.IRC_SERVER_PASSWORD = String(form.serverPassword || '').trim()
+    updates.IRC_NICKSERV_PASSWORD = String(form.nickservPassword || '').trim()
+    updates.IRC_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    if (Object.hasOwn(form, 'allowAllUsers')) updates.IRC_ALLOW_ALL_USERS = boolEnvValue(form.allowAllUsers)
+    updates.IRC_HOME_CHANNEL = String(form.homeChannel || '').trim()
+    updates.IRC_HOME_CHANNEL_NAME = String(form.homeChannelName || '').trim()
+  } else if (platform === 'line') {
+    updates.LINE_CHANNEL_ACCESS_TOKEN = String(form.channelAccessToken || '').trim()
+    updates.LINE_CHANNEL_SECRET = String(form.channelSecret || '').trim()
+    updates.LINE_PORT = String(form.port || '').trim()
+    updates.LINE_HOST = String(form.host || '').trim()
+    updates.LINE_PUBLIC_URL = String(form.publicUrl || '').trim()
+    updates.LINE_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    updates.LINE_ALLOWED_GROUPS = csvEnvValue(form.allowedGroups)
+    updates.LINE_ALLOWED_ROOMS = csvEnvValue(form.allowedRooms)
+    if (Object.hasOwn(form, 'allowAllUsers')) updates.LINE_ALLOW_ALL_USERS = boolEnvValue(form.allowAllUsers)
+    updates.LINE_HOME_CHANNEL = String(form.homeChannel || '').trim()
+    updates.LINE_SLOW_RESPONSE_THRESHOLD = String(form.slowResponseThreshold || '').trim()
+  } else if (platform === 'simplex') {
+    updates.SIMPLEX_WS_URL = String(form.wsUrl || '').trim()
+    updates.SIMPLEX_ALLOWED_USERS = csvEnvValue(form.allowFrom)
+    if (Object.hasOwn(form, 'allowAllUsers')) updates.SIMPLEX_ALLOW_ALL_USERS = boolEnvValue(form.allowAllUsers)
+    updates.SIMPLEX_HOME_CHANNEL = String(form.homeChannel || '').trim()
+    updates.SIMPLEX_HOME_CHANNEL_NAME = String(form.homeChannelName || '').trim()
+  }
+  return updates
+}
+
 function channelHasQqbotCredentials(entry) {
   return !!(entry && typeof entry === 'object' && (entry.appId || entry.clientSecret || entry.appSecret || entry.token))
+}
+
+function secretAwareAccountDisplayValue(value) {
+  if (typeof value === 'string') return value.trim()
+  return formatSecretRefPlaceholder(value)
 }
 
 function resolvePlatformConfigEntry(channelRoot, platform, accountId) {
   if (!channelRoot || typeof channelRoot !== 'object') return null
   const accountKey = typeof accountId === 'string' ? accountId.trim() : ''
+  if (platformStorageKey(platform) === 'tlon' && accountKey === QQBOT_DEFAULT_ACCOUNT_ID) return channelRoot
   if (accountKey) return channelRoot.accounts?.[accountKey] || channelRoot
   if (platformStorageKey(platform) === 'qqbot' && !channelHasQqbotCredentials(channelRoot)) {
     return channelRoot.accounts?.[QQBOT_DEFAULT_ACCOUNT_ID] || channelRoot
@@ -2310,14 +6862,16 @@ function resolvePlatformConfigEntry(channelRoot, platform, accountId) {
   return channelRoot
 }
 
-function listPlatformAccounts(channelRoot) {
+export function listPlatformAccounts(channelRoot) {
   if (!channelRoot || typeof channelRoot !== 'object' || !channelRoot.accounts || typeof channelRoot.accounts !== 'object') {
     return []
   }
   return Object.entries(channelRoot.accounts)
     .map(([accountId, value]) => {
       const entry = { accountId }
-      const displayId = value?.appId || value?.clientId || value?.account || null
+      const displayId = ['appId', 'clientId', 'account', 'nick', 'ship']
+        .map(key => secretAwareAccountDisplayValue(value?.[key]))
+        .find(Boolean)
       if (displayId) entry.appId = displayId
       return entry
     })
@@ -2401,10 +6955,376 @@ function bindingIdentityMatches(binding, agentId, targetMatch) {
   )
 }
 
+function mergeMessagingRootEntry(cfg, storageKey, entry) {
+  if (!cfg.channels || typeof cfg.channels !== 'object' || Array.isArray(cfg.channels)) cfg.channels = {}
+  const existing = cfg.channels[storageKey]
+  cfg.channels[storageKey] = existing && typeof existing === 'object' && !Array.isArray(existing)
+    ? { ...existing, ...entry }
+    : entry
+}
+
+function mergeMessagingAccountEntry(cfg, storageKey, accountId, entry) {
+  if (!cfg.channels || typeof cfg.channels !== 'object' || Array.isArray(cfg.channels)) cfg.channels = {}
+  const existingRoot = cfg.channels[storageKey]
+  const root = existingRoot && typeof existingRoot === 'object' && !Array.isArray(existingRoot)
+    ? existingRoot
+    : { enabled: true }
+  const accountsBefore = root.accounts && typeof root.accounts === 'object' && !Array.isArray(root.accounts)
+    ? Object.keys(root.accounts).filter(Boolean)
+    : []
+  const shouldSetDefaultAccount = !String(root.defaultAccount || '').trim()
+    && !channelRootHasMessagingCredential(root)
+    && accountsBefore.length === 0
+  root.enabled = true
+  if (!root.accounts || typeof root.accounts !== 'object' || Array.isArray(root.accounts)) root.accounts = {}
+  const existingAccount = root.accounts[accountId]
+  root.accounts[accountId] = existingAccount && typeof existingAccount === 'object' && !Array.isArray(existingAccount)
+    ? { ...existingAccount, ...entry }
+    : entry
+  if (shouldSetDefaultAccount) root.defaultAccount = accountId
+  cfg.channels[storageKey] = root
+}
+
+function applyMessagingPlatformEntry(cfg, storageKey, accountId, entry) {
+  const normalizedAccountId = typeof accountId === 'string' ? accountId.trim() : ''
+  if (normalizedAccountId) {
+    mergeMessagingAccountEntry(cfg, storageKey, normalizedAccountId, entry)
+  } else {
+    mergeMessagingRootEntry(cfg, storageKey, entry)
+  }
+}
+
+function ensureMessagingPluginAllowed(cfg, pluginId) {
+  if (!pluginId || !pluginId.trim()) return
+  const pid = pluginId.trim()
+  if (!cfg.plugins || typeof cfg.plugins !== 'object' || Array.isArray(cfg.plugins)) cfg.plugins = {}
+  if (!cfg.plugins.entries || typeof cfg.plugins.entries !== 'object' || Array.isArray(cfg.plugins.entries)) cfg.plugins.entries = {}
+  if (!Array.isArray(cfg.plugins.allow)) cfg.plugins.allow = []
+  if (!cfg.plugins.allow.includes(pid)) cfg.plugins.allow.push(pid)
+  if (!cfg.plugins.entries[pid] || typeof cfg.plugins.entries[pid] !== 'object' || Array.isArray(cfg.plugins.entries[pid])) {
+    cfg.plugins.entries[pid] = {}
+  }
+  cfg.plugins.entries[pid].enabled = true
+}
+
+function buildOpenClawMessagingPlatformEntry(platform, form, currentSaved = {}) {
+  const entry = { enabled: true }
+  const storageKey = platformStorageKey(platform)
+  if (storageKey === 'telegram') {
+    entry.botToken = form.botToken
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+  } else if (storageKey === 'discord') {
+    entry.token = form.token
+    if (form.applicationId) entry.applicationId = form.applicationId
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (form.guildId) {
+      const ck = form.channelId || '*'
+      entry.guilds = { [form.guildId]: { users: ['*'], requireMention: true, channels: { [ck]: { allow: true, requireMention: true } } } }
+    }
+  } else if (storageKey === 'feishu') {
+    entry.appId = form.appId
+    entry.appSecret = form.appSecret
+    entry.connectionMode = 'websocket'
+    entry.domain = form.domain
+    entry.webhookPath = form.webhookPath
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Object.hasOwn(form, 'requireMention')) entry.requireMention = !!form.requireMention
+    entry.reactionNotifications = form.reactionNotifications
+    entry.typingIndicator = form.typingIndicator
+    entry.resolveSenderNames = form.resolveSenderNames
+  } else if (storageKey === 'zalo') {
+    for (const key of ['botToken', 'tokenFile', 'webhookUrl', 'webhookSecret', 'webhookPath', 'proxy', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (typeof form.mediaMaxMb === 'number') entry.mediaMaxMb = form.mediaMaxMb
+  } else if (storageKey === 'whatsapp') {
+    entry.enabled = typeof form.enabled === 'boolean' ? form.enabled : true
+    for (const key of ['defaultTo', 'contextVisibility', 'chunkMode', 'reactionLevel', 'replyToMode', 'messagePrefix', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    for (const key of ['configWrites', 'sendReadReceipts', 'selfChatMode', 'blockStreaming']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'mediaMaxMb', 'debounceMs', 'textChunkLimit']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+    const ackReaction = { ...(currentSaved?.ackReaction && typeof currentSaved.ackReaction === 'object' ? currentSaved.ackReaction : {}) }
+    if (form.ackEmoji) ackReaction.emoji = form.ackEmoji
+    if (typeof form.ackDirect === 'boolean') ackReaction.direct = form.ackDirect
+    if (form.ackGroup) ackReaction.group = form.ackGroup
+    if (Object.keys(ackReaction).length) entry.ackReaction = ackReaction
+  } else if (storageKey === 'signal') {
+    for (const key of ['account', 'cliPath', 'httpUrl', 'httpHost', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    if (typeof form.httpPort === 'number') entry.httpPort = form.httpPort
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (typeof form.blockStreaming === 'boolean') entry.blockStreaming = form.blockStreaming
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+  } else if (storageKey === 'imessage') {
+    for (const key of ['cliPath', 'dbPath', 'remoteHost', 'service', 'region', 'defaultTo', 'contextVisibility', 'chunkMode', 'reactionNotifications', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (Array.isArray(form.attachmentRoots) && form.attachmentRoots.length) entry.attachmentRoots = form.attachmentRoots
+    if (Array.isArray(form.remoteAttachmentRoots) && form.remoteAttachmentRoots.length) entry.remoteAttachmentRoots = form.remoteAttachmentRoots
+    for (const key of ['configWrites', 'includeAttachments', 'blockStreaming', 'sendReadReceipts', 'coalesceSameSenderDms']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'mediaMaxMb', 'probeTimeoutMs', 'textChunkLimit']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+  } else if (storageKey === 'msteams') {
+    for (const key of ['appId', 'appPassword', 'tenantId', 'authType', 'certificatePath', 'certificateThumbprint', 'managedIdentityClientId', 'replyStyle', 'sharePointSiteId', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    const webhook = { ...(currentSaved?.webhook && typeof currentSaved.webhook === 'object' ? currentSaved.webhook : {}) }
+    if (typeof form.webhookPort === 'number') webhook.port = form.webhookPort
+    if (form.webhookPath) webhook.path = form.webhookPath
+    if (Object.keys(webhook).length) entry.webhook = webhook
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    for (const key of ['useManagedIdentity', 'requireMention', 'blockStreaming', 'typingIndicator', 'welcomeCard', 'groupWelcomeCard', 'feedbackEnabled', 'feedbackReflection']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb', 'feedbackReflectionCooldownMs']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+    if (Array.isArray(form.promptStarters) && form.promptStarters.length) entry.promptStarters = form.promptStarters
+    const delegatedAuth = { ...(currentSaved?.delegatedAuth && typeof currentSaved.delegatedAuth === 'object' ? currentSaved.delegatedAuth : {}) }
+    if (typeof form.delegatedAuthEnabled === 'boolean') delegatedAuth.enabled = form.delegatedAuthEnabled
+    if (Array.isArray(form.delegatedAuthScopes) && form.delegatedAuthScopes.length) delegatedAuth.scopes = form.delegatedAuthScopes
+    if (Object.keys(delegatedAuth).length) entry.delegatedAuth = delegatedAuth
+    const sso = { ...(currentSaved?.sso && typeof currentSaved.sso === 'object' ? currentSaved.sso : {}) }
+    if (typeof form.ssoEnabled === 'boolean') sso.enabled = form.ssoEnabled
+    if (form.ssoConnectionName) sso.connectionName = form.ssoConnectionName
+    if (Object.keys(sso).length) entry.sso = sso
+  } else if (storageKey === 'zalouser') {
+    for (const key of ['profile', 'messagePrefix', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (typeof form.historyLimit === 'number') entry.historyLimit = form.historyLimit
+    if (typeof form.dangerouslyAllowNameMatching === 'boolean') entry.dangerouslyAllowNameMatching = form.dangerouslyAllowNameMatching
+  } else if (storageKey === 'line') {
+    for (const key of ['channelAccessToken', 'tokenFile', 'channelSecret', 'secretFile', 'webhookPath', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (typeof form.mediaMaxMb === 'number') entry.mediaMaxMb = form.mediaMaxMb
+  } else if (storageKey === 'mattermost') {
+    for (const key of ['botToken', 'baseUrl', 'name', 'replyToMode', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Object.hasOwn(form, 'requireMention')) entry.requireMention = !!form.requireMention
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (typeof form.dangerouslyAllowNameMatching === 'boolean') entry.dangerouslyAllowNameMatching = form.dangerouslyAllowNameMatching
+    if (typeof form.dangerouslyAllowPrivateNetwork === 'boolean') {
+      entry.network = { ...(currentSaved?.network || {}), dangerouslyAllowPrivateNetwork: form.dangerouslyAllowPrivateNetwork }
+    }
+    const commands = {}
+    if (form.callbackPath) commands.callbackPath = form.callbackPath
+    if (form.callbackUrl) commands.callbackUrl = form.callbackUrl
+    if (Object.keys(commands).length) entry.commands = { ...(currentSaved?.commands || {}), ...commands }
+  } else if (storageKey === 'clickclack') {
+    entry.enabled = typeof form.enabled === 'boolean' ? form.enabled : true
+    for (const key of ['name', 'baseUrl', 'token', 'workspace', 'botUserId', 'agentId', 'replyMode', 'model', 'systemPrompt', 'defaultTo']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    if (Array.isArray(form.toolsAllow) && form.toolsAllow.length) entry.toolsAllow = form.toolsAllow
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (typeof form.senderIsOwner === 'boolean') entry.senderIsOwner = form.senderIsOwner
+    for (const key of ['timeoutSeconds', 'reconnectMs']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+  } else if (storageKey === 'nextcloud-talk') {
+    entry.enabled = typeof form.enabled === 'boolean' ? form.enabled : true
+    for (const key of ['name', 'baseUrl', 'botSecret', 'botSecretFile', 'apiUser', 'apiPassword', 'apiPasswordFile', 'webhookHost', 'webhookPath', 'webhookPublicUrl', 'chunkMode', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Object.hasOwn(form, 'requireMention')) entry.requireMention = !!form.requireMention
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (typeof form.blockStreaming === 'boolean') entry.blockStreaming = form.blockStreaming
+    if (typeof form.dangerouslyAllowPrivateNetwork === 'boolean') {
+      entry.network = { ...(currentSaved?.network || {}), dangerouslyAllowPrivateNetwork: form.dangerouslyAllowPrivateNetwork }
+    }
+    for (const key of ['webhookPort', 'historyLimit', 'dmHistoryLimit', 'mediaMaxMb', 'textChunkLimit']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+  } else if (storageKey === 'twitch') {
+    entry.enabled = typeof form.enabled === 'boolean' ? form.enabled : true
+    for (const key of ['username', 'accessToken', 'clientId', 'channel', 'responsePrefix', 'clientSecret', 'refreshToken']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.allowedRoles) && form.allowedRoles.length) entry.allowedRoles = form.allowedRoles
+    if (typeof form.requireMention === 'boolean') entry.requireMention = form.requireMention
+    for (const key of ['expiresIn', 'obtainmentTimestamp']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+  } else if (storageKey === 'nostr') {
+    entry.enabled = typeof form.enabled === 'boolean' ? form.enabled : true
+    for (const key of ['name', 'defaultAccount', 'privateKey', 'dmPolicy']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    if (Array.isArray(form.relays) && form.relays.length) entry.relays = form.relays
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    const profileMap = {
+      profileName: 'name',
+      profileDisplayName: 'displayName',
+      profileAbout: 'about',
+      profilePicture: 'picture',
+      profileBanner: 'banner',
+      profileWebsite: 'website',
+      profileNip05: 'nip05',
+      profileLud16: 'lud16',
+    }
+    const profile = {}
+    for (const [formKey, targetKey] of Object.entries(profileMap)) {
+      if (form[formKey]) profile[targetKey] = form[formKey]
+    }
+    if (Object.keys(profile).length) entry.profile = profile
+  } else if (storageKey === 'irc') {
+    entry.enabled = typeof form.enabled === 'boolean' ? form.enabled : true
+    for (const key of ['name', 'host', 'nick', 'username', 'realname', 'password', 'passwordFile', 'defaultTo', 'chunkMode', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    if (Array.isArray(form.channels) && form.channels.length) entry.channels = form.channels
+    if (Array.isArray(form.mentionPatterns) && form.mentionPatterns.length) entry.mentionPatterns = form.mentionPatterns
+    const groups = buildIrcGroupsFromForm(form)
+    if (groups) entry.groups = groups
+    for (const key of ['tls', 'blockStreaming', 'dangerouslyAllowNameMatching']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+    for (const key of ['port', 'historyLimit', 'dmHistoryLimit', 'mediaMaxMb', 'textChunkLimit']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+    const nickserv = { ...(currentSaved?.nickserv && typeof currentSaved.nickserv === 'object' ? currentSaved.nickserv : {}) }
+    if (typeof form.nickservEnabled === 'boolean') nickserv.enabled = form.nickservEnabled
+    if (form.nickservService) nickserv.service = form.nickservService
+    const nickservPassword = resolveMessagingCredentialFormValueForSave({ form, current: currentSaved?.nickserv || {}, formKey: 'nickservPassword', currentKey: 'password' })
+    if (nickservPassword === undefined) delete nickserv.password
+    else nickserv.password = nickservPassword
+    const nickservPasswordFile = resolveMessagingCredentialFormValueForSave({ form, current: currentSaved?.nickserv || {}, formKey: 'nickservPasswordFile', currentKey: 'passwordFile' })
+    if (nickservPasswordFile === undefined) delete nickserv.passwordFile
+    else nickserv.passwordFile = nickservPasswordFile
+    if (typeof form.nickservRegister === 'boolean') nickserv.register = form.nickservRegister
+    if (form.nickservRegisterEmail) nickserv.registerEmail = form.nickservRegisterEmail
+    if (Object.keys(nickserv).length) entry.nickserv = nickserv
+  } else if (storageKey === 'tlon') {
+    entry.enabled = typeof form.enabled === 'boolean' ? form.enabled : true
+    for (const key of ['name', 'ship', 'url', 'responsePrefix', 'ownerShip']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    const code = resolveMessagingCredentialFormValueForSave({ form, current: currentSaved, formKey: 'code' })
+    if (code === undefined) delete entry.code
+    else entry.code = code
+    if (Array.isArray(form.groupChannels) && form.groupChannels.length) entry.groupChannels = form.groupChannels
+    if (Array.isArray(form.dmAllowlist) && form.dmAllowlist.length) entry.dmAllowlist = form.dmAllowlist
+    if (Array.isArray(form.groupInviteAllowlist) && form.groupInviteAllowlist.length) entry.groupInviteAllowlist = form.groupInviteAllowlist
+    if (Array.isArray(form.defaultAuthorizedShips) && form.defaultAuthorizedShips.length) entry.defaultAuthorizedShips = form.defaultAuthorizedShips
+    for (const key of ['autoDiscoverChannels', 'showModelSignature', 'autoAcceptDmInvites', 'autoAcceptGroupInvites']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+    if (typeof form.dangerouslyAllowPrivateNetwork === 'boolean') {
+      entry.network = { ...(currentSaved?.network || {}), dangerouslyAllowPrivateNetwork: form.dangerouslyAllowPrivateNetwork }
+    }
+  } else if (storageKey === 'synology-chat') {
+    for (const key of ['token', 'incomingUrl', 'nasHost', 'webhookPath', 'botName']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    entry.dmPolicy = form.dmPolicy || 'allowlist'
+    if (Array.isArray(form.allowedUserIds) && form.allowedUserIds.length) entry.allowedUserIds = form.allowedUserIds
+    if (typeof form.rateLimitPerMinute === 'number') entry.rateLimitPerMinute = form.rateLimitPerMinute
+    for (const key of ['dangerouslyAllowNameMatching', 'dangerouslyAllowInheritedWebhookPath', 'allowInsecureSsl']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+  } else if (storageKey === 'googlechat') {
+    for (const key of ['serviceAccount', 'serviceAccountFile', 'serviceAccountRef', 'audienceType', 'audience', 'appPrincipal', 'webhookPath', 'webhookUrl', 'botUser', 'chunkMode', 'replyToMode', 'typingIndicator', 'responsePrefix']) {
+      if (form[key]) entry[key] = form[key]
+    }
+    const dm = { ...(currentSaved?.dm && typeof currentSaved.dm === 'object' ? currentSaved.dm : {}) }
+    if (form.dmPolicy) dm.policy = form.dmPolicy
+    if (Array.isArray(form.allowFrom)) dm.allowFrom = form.allowFrom
+    if (Object.keys(dm).length) entry.dm = dm
+    entry.groupPolicy = form.groupPolicy
+    if (Array.isArray(form.groupAllowFrom) && form.groupAllowFrom.length) entry.groupAllowFrom = form.groupAllowFrom
+    for (const key of ['dangerouslyAllowNameMatching', 'requireMention', 'allowBots', 'blockStreaming']) {
+      if (typeof form[key] === 'boolean') entry[key] = form[key]
+    }
+    for (const key of ['historyLimit', 'dmHistoryLimit', 'textChunkLimit', 'mediaMaxMb']) {
+      if (typeof form[key] === 'number') entry[key] = form[key]
+    }
+  } else {
+    Object.assign(entry, form)
+  }
+  preserveMessagingCredentialRefs(entry, form, currentSaved)
+  return entry
+}
+
+export function mergeOpenClawMessagingPlatformConfig(cfg, { platform, form, accountId } = {}) {
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('openclaw.json 顶层必须是对象')
+  const storageKey = platformStorageKey(platform)
+  const normalizedForm = normalizeMessagingPlatformForm(platform, form || {})
+  const normalizedAccountId = typeof accountId === 'string' ? accountId.trim() : ''
+  const currentSaved = resolvePlatformConfigEntry(cfg.channels?.[storageKey], platform, normalizedAccountId) || {}
+  const entry = buildOpenClawMessagingPlatformEntry(platform, normalizedForm, currentSaved)
+  const targetAccountId = storageKey === 'nostr' || (storageKey === 'tlon' && normalizedAccountId === QQBOT_DEFAULT_ACCOUNT_ID)
+    ? ''
+    : normalizedAccountId
+  applyMessagingPlatformEntry(cfg, storageKey, targetAccountId, entry)
+  if (['zalo', 'zalouser', 'line', 'mattermost', 'clickclack', 'nextcloud-talk', 'twitch', 'nostr', 'irc', 'tlon', 'synology-chat', 'googlechat', 'msteams', 'imessage', 'whatsapp'].includes(storageKey)) {
+    ensureMessagingPluginAllowed(cfg, storageKey)
+  }
+  return { entry, accountId: normalizedAccountId, storageKey }
+}
+
 function triggerGatewayReloadNonBlocking(reason) {
   setTimeout(() => {
     try {
-      handlers.reload_gateway()
+      Promise.resolve(handlers.reload_gateway()).catch((e) => {
+        console.warn(`[dev-api] Gateway reload skipped after ${reason}: ${e.message || e}`)
+      })
     } catch (e) {
       console.warn(`[dev-api] Gateway reload skipped after ${reason}: ${e.message || e}`)
     }
@@ -3782,21 +8702,8 @@ const handlers = {
       if (!appId && !clientSecret) return { exists: false }
       if (appId) form.appId = appId
       if (clientSecret) form.clientSecret = clientSecret
-    } else if (platform === 'telegram') {
-      if (saved.botToken) form.botToken = saved.botToken
-      if (saved.allowFrom) form.allowedUsers = saved.allowFrom.join(', ')
-    } else if (platform === 'discord') {
-      if (saved.token) form.token = saved.token
-      const gid = saved.guilds && Object.keys(saved.guilds)[0]
-      if (gid) form.guildId = gid
-    } else if (platform === 'feishu') {
-      if (saved.appId) form.appId = saved.appId
-      if (saved.appSecret) form.appSecret = saved.appSecret
-      if (saved.domain) form.domain = saved.domain
     } else {
-      for (const [k, v] of Object.entries(saved)) {
-        if (k !== 'enabled' && k !== 'accounts' && typeof v === 'string') form[k] = v
-      }
+      Object.assign(form, buildMessagingPlatformFormValues(platform, saved, { channelRoot }))
     }
     return { exists: true, values: form }
   },
@@ -3804,26 +8711,16 @@ const handlers = {
   save_messaging_platform({ platform, form, accountId }) {
     if (!fs.existsSync(CONFIG_PATH)) throw new Error('openclaw.json 不存在')
     const cfg = readOpenclawConfigRequired()
+    form = normalizeMessagingPlatformForm(platform, form || {})
     if (!cfg.channels) cfg.channels = {}
     const storageKey = platformStorageKey(platform)
     const normalizedAccountId = typeof accountId === 'string' ? accountId.trim() : ''
+    const currentSaved = resolvePlatformConfigEntry(cfg.channels?.[storageKey], platform, normalizedAccountId) || {}
     const setRootChannelEntry = (entry) => {
-      const current = cfg.channels?.[storageKey]
-      // 合并模式：保留用户通过 CLI 或手动编辑的自定义字段（streaming, retry, dmPolicy 等）
-      if (current && typeof current === 'object') {
-        cfg.channels[storageKey] = { ...current, ...entry }
-      } else {
-        cfg.channels[storageKey] = entry
-      }
+      mergeMessagingRootEntry(cfg, storageKey, entry)
     }
     const setAccountChannelEntry = (entry) => {
-      const current = cfg.channels?.[storageKey] && typeof cfg.channels[storageKey] === 'object'
-        ? cfg.channels[storageKey]
-        : { enabled: true }
-      current.enabled = true
-      if (!current.accounts || typeof current.accounts !== 'object') current.accounts = {}
-      current.accounts[normalizedAccountId] = entry
-      cfg.channels[storageKey] = current
+      mergeMessagingAccountEntry(cfg, storageKey, normalizedAccountId, entry)
     }
     const entry = { enabled: true }
     if (platform === 'qqbot') {
@@ -3846,9 +8743,15 @@ const handlers = {
       cfg.channels.qqbot = current
     } else if (platform === 'telegram') {
       entry.botToken = form.botToken
-      if (form.allowedUsers) entry.allowFrom = form.allowedUsers.split(',').map(s => s.trim()).filter(Boolean)
+      entry.dmPolicy = form.dmPolicy
+      entry.groupPolicy = form.groupPolicy
+      if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
     } else if (platform === 'discord') {
       entry.token = form.token
+      if (form.applicationId) entry.applicationId = form.applicationId
+      entry.dmPolicy = form.dmPolicy
+      entry.groupPolicy = form.groupPolicy
+      if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
       if (form.guildId) {
         const ck = form.channelId || '*'
         entry.guilds = { [form.guildId]: { users: ['*'], requireMention: true, channels: { [ck]: { allow: true, requireMention: true } } } }
@@ -3857,7 +8760,16 @@ const handlers = {
       entry.appId = form.appId
       entry.appSecret = form.appSecret
       entry.connectionMode = 'websocket'
-      if (form.domain) entry.domain = form.domain
+      entry.domain = form.domain
+      entry.webhookPath = form.webhookPath
+      entry.dmPolicy = form.dmPolicy
+      entry.groupPolicy = form.groupPolicy
+      if (Array.isArray(form.allowFrom) && form.allowFrom.length) entry.allowFrom = form.allowFrom
+      if (Object.hasOwn(form, 'requireMention')) entry.requireMention = !!form.requireMention
+      entry.reactionNotifications = form.reactionNotifications
+      entry.typingIndicator = form.typingIndicator
+      entry.resolveSenderNames = form.resolveSenderNames
+      preserveMessagingCredentialRefs(entry, form, currentSaved)
       if (normalizedAccountId) {
         setAccountChannelEntry(entry)
       } else {
@@ -3865,22 +8777,28 @@ const handlers = {
       }
     } else if (platform === 'dingtalk' || platform === 'dingtalk-connector') {
       Object.assign(entry, form)
+      preserveMessagingCredentialRefs(entry, form, currentSaved)
       if (normalizedAccountId) {
         setAccountChannelEntry(entry)
       } else {
         setRootChannelEntry(entry)
       }
+    } else if (['line', 'mattermost', 'clickclack', 'nextcloud-talk', 'twitch', 'nostr', 'irc', 'tlon', 'synology-chat', 'googlechat', 'msteams', 'whatsapp'].includes(storageKey)) {
+      const built = buildOpenClawMessagingPlatformEntry(platform, form, currentSaved)
+      const targetAccountId = storageKey === 'nostr' || (storageKey === 'tlon' && normalizedAccountId === QQBOT_DEFAULT_ACCOUNT_ID)
+        ? ''
+        : normalizedAccountId
+      applyMessagingPlatformEntry(cfg, storageKey, targetAccountId, built)
+      ensureMessagingPluginAllowed(cfg, storageKey)
     } else {
       Object.assign(entry, form)
-      setRootChannelEntry(entry)
+      preserveMessagingCredentialRefs(entry, form, currentSaved)
     }
 
-    if (platform !== 'qqbot' && platform !== 'feishu' && platform !== 'dingtalk' && platform !== 'dingtalk-connector') {
+    if (platform !== 'qqbot' && platform !== 'feishu' && platform !== 'dingtalk' && platform !== 'dingtalk-connector' && !['line', 'mattermost', 'clickclack', 'nextcloud-talk', 'twitch', 'nostr', 'irc', 'tlon', 'synology-chat', 'googlechat', 'msteams', 'whatsapp'].includes(storageKey)) {
+      preserveMessagingCredentialRefs(entry, form, currentSaved)
       // 合并模式：保留用户通过 CLI 或手动编辑的自定义字段
-      const existing = cfg.channels[storageKey]
-      cfg.channels[storageKey] = (existing && typeof existing === 'object')
-        ? { ...existing, ...entry }
-        : entry
+      applyMessagingPlatformEntry(cfg, storageKey, normalizedAccountId, entry)
       // Discord: 仅在首次创建时设置默认值，不覆盖用户已有的设置
       if (platform === 'discord') {
         const d = cfg.channels[storageKey]
@@ -3978,6 +8896,48 @@ const handlers = {
         return { valid: false, errors: [`Telegram API 连接失败: ${e.message}`] }
       }
     }
+    if (platform === 'zalo') {
+      if (form.botToken) {
+        try {
+          const resp = await fetch(`https://bot-api.zaloplatforms.com/bot${form.botToken}/getMe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(15000),
+          })
+          const body = await resp.json()
+          if (body.ok) return { valid: true, errors: [], details: ['Zalo Bot Token 已通过 getMe 校验'] }
+          return { valid: false, errors: [body.description || body.message || 'Zalo Bot Token 无效'] }
+        } catch (e) {
+          return { valid: false, errors: [`Zalo API 连接失败: ${e.message}`] }
+        }
+      }
+      if (form.tokenFile) return { valid: true, warnings: ['已配置 Token File；Web 模式不会读取外部文件做在线校验'] }
+      return { valid: false, errors: ['请填写 Bot Token 或 Token File'] }
+    }
+    if (platform === 'zalouser') {
+      return { valid: true, warnings: ['Zalo Personal 通过二维码登录维护本地会话；请使用 openclaw channels status --probe 检查登录状态'] }
+    }
+    if (platform === 'whatsapp') {
+      return { valid: true, warnings: ['WhatsApp 使用扫码登录维护本地会话，无需在线校验 Bot Token；请通过「启动扫码登录」完成配对。'] }
+    }
+    if (platform === 'clickclack') {
+      return { valid: true, warnings: ['ClickClack 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'] }
+    }
+    if (platform === 'nextcloud-talk') {
+      return { valid: true, warnings: ['Nextcloud Talk 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'] }
+    }
+    if (platform === 'twitch') {
+      return { valid: true, warnings: ['Twitch 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'] }
+    }
+    if (platform === 'nostr') {
+      return { valid: true, warnings: ['Nostr 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'] }
+    }
+    if (platform === 'irc') {
+      return { valid: true, warnings: ['IRC 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'] }
+    }
+    if (platform === 'tlon') {
+      return { valid: true, warnings: ['Tlon 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'] }
+    }
     if (platform === 'discord') {
       try {
         const resp = await fetch('https://discord.com/api/v10/users/@me', {
@@ -3990,6 +8950,39 @@ const handlers = {
         return { valid: false, errors: ['提供的 Token 不属于 Bot 账号'] }
       } catch (e) {
         return { valid: false, errors: [`Discord API 连接失败: ${e.message}`] }
+      }
+    }
+    if (platform === 'msteams') {
+      const missing = msteamsCredentialMissingLabels(form)
+      if (missing.length) return { valid: false, errors: [`缺少 ${missing.join(' / ')}`] }
+      if (!hasConfiguredMessagingValue(form.appPassword)) {
+        return {
+          valid: true,
+          warnings: ['当前 Teams 认证模式不使用 Client Secret；面板已完成结构校验，实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。'],
+          details: [`App ID: ${String(form.appId || '').trim()}`],
+        }
+      }
+      const tenantId = String(form.tenantId || 'botframework.com').trim() || 'botframework.com'
+      try {
+        const body = new URLSearchParams({
+          grant_type: 'client_credentials',
+          client_id: String(form.appId || '').trim(),
+          client_secret: String(form.appPassword || '').trim(),
+          scope: 'https://api.botframework.com/.default',
+        })
+        const resp = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+          signal: AbortSignal.timeout(15000),
+        })
+        const result = await resp.json()
+        if (result.access_token) {
+          return { valid: true, errors: [], details: [`App ID: ${form.appId}`, `Tenant: ${tenantId}`, `Token 有效期: ${result.expires_in || 0}s`] }
+        }
+        return { valid: false, errors: [result.error_description || result.error || '凭证无效，请检查 App ID 和 App Password'] }
+      } catch (e) {
+        return { valid: false, errors: [`Azure AD 连接失败: ${e.message}`] }
       }
     }
     return { valid: true, warnings: ['该平台暂不支持在线校验'] }
@@ -4090,7 +9083,7 @@ const handlers = {
       const output = (result.stdout || '') + (result.stderr || '')
       if (result.status === 0 && output.includes(pid) && output.includes('built-in')) builtin = true
     } catch {}
-    const cfg = fs.existsSync(CONFIG_PATH) ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {}
+    const cfg = readOpenclawConfigOptional()
     const allowArr = cfg.plugins?.allow || []
     const allowed = allowArr.includes(pid)
     const enabled = !!cfg.plugins?.entries?.[pid]?.enabled
@@ -6009,13 +11002,13 @@ const handlers = {
 
   // Agent 渠道绑定管理
   list_all_bindings() {
-    const cfg = fs.existsSync(CONFIG_PATH) ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {}
+    const cfg = readOpenclawConfigOptional()
     const bindings = cfg.bindings || []
     return { bindings }
   },
 
   get_agent_bindings({ agentId } = {}) {
-    const cfg = fs.existsSync(CONFIG_PATH) ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {}
+    const cfg = readOpenclawConfigOptional()
     const all = Array.isArray(cfg.bindings) ? cfg.bindings : []
     const bindings = agentId ? all.filter(b => b?.agentId === agentId) : all
     return { bindings }
@@ -6957,6 +11950,27 @@ const handlers = {
     return scanAllOpenclawInstallations()
   },
 
+  scan_openclaw_path_conflicts() {
+    return buildOpenclawPathConflictRecords()
+  },
+
+  quarantine_openclaw_path({ path: targetPath } = {}) {
+    return quarantineOpenclawPathForWeb(targetPath)
+  },
+
+  quarantine_openclaw_paths_bulk({ paths = [] } = {}) {
+    const records = []
+    const failed = []
+    for (const targetPath of Array.isArray(paths) ? paths : []) {
+      try {
+        records.push(quarantineOpenclawPathForWeb(targetPath))
+      } catch (e) {
+        failed.push({ path: targetPath, error: e?.message || String(e) })
+      }
+    }
+    return { records, failed }
+  },
+
   check_openclaw_at_path({ cliPath }) {
     const resolved = resolveOpenclawCliInput(cliPath)
     if (!resolved) {
@@ -7384,6 +12398,934 @@ const handlers = {
     } catch {}
     const displayModel = modelName.includes('/') ? modelName.slice(modelName.indexOf('/') + 1) : modelName
     return { model: displayModel, model_raw: modelName, base_url: baseUrl, provider, api_key: apiKey, config_exists: fs.existsSync(configPath) }
+  },
+
+  hermes_channel_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    const envValues = readHermesEnvValues()
+    return {
+      exists,
+      configPath,
+      values: buildHermesChannelConfigValues(config, envValues),
+    }
+  },
+
+  hermes_channel_config_save({ platform, form } = {}) {
+    const normalizedPlatform = normalizeHermesPlatform(platform)
+    if (!normalizedPlatform) throw new Error(`不支持的 Hermes 渠道: ${platform || ''}`)
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesChannelConfig(config, normalizedPlatform, form || {})
+    writeHermesConfigYamlObject(configPath, next)
+    writeHermesEnvValues(buildHermesChannelEnvUpdates(normalizedPlatform, form || {}))
+    const envValues = { ...readHermesEnvValues(), ...buildHermesChannelEnvUpdates(normalizedPlatform, form || {}) }
+    return {
+      ok: true,
+      configPath,
+      values: buildHermesChannelConfigValues(next, envValues)[normalizedPlatform],
+    }
+  },
+
+  hermes_session_runtime_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesSessionRuntimeConfigValues(config),
+    }
+  },
+
+  hermes_session_runtime_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesSessionRuntimeConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesSessionRuntimeConfigValues(next),
+    }
+  },
+
+  hermes_compression_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesCompressionConfigValues(config),
+    }
+  },
+
+  hermes_compression_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesCompressionConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesCompressionConfigValues(next),
+    }
+  },
+
+  hermes_prompt_caching_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesPromptCachingConfigValues(config),
+    }
+  },
+
+  hermes_prompt_caching_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesPromptCachingConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesPromptCachingConfigValues(next),
+    }
+  },
+
+  hermes_openrouter_cache_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesOpenrouterCacheConfigValues(config),
+    }
+  },
+
+  hermes_openrouter_cache_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesOpenrouterCacheConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesOpenrouterCacheConfigValues(next),
+    }
+  },
+
+  hermes_provider_routing_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesProviderRoutingConfigValues(config),
+    }
+  },
+
+  hermes_provider_routing_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesProviderRoutingConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesProviderRoutingConfigValues(next),
+    }
+  },
+
+  hermes_auxiliary_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesAuxiliaryConfigValues(config),
+    }
+  },
+
+  hermes_auxiliary_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesAuxiliaryConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesAuxiliaryConfigValues(next),
+    }
+  },
+
+  hermes_tool_loop_guardrails_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesToolLoopGuardrailsConfigValues(config),
+    }
+  },
+
+  hermes_tool_loop_guardrails_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesToolLoopGuardrailsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesToolLoopGuardrailsConfigValues(next),
+    }
+  },
+
+  hermes_memory_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesMemoryConfigValues(config),
+    }
+  },
+
+  hermes_memory_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesMemoryConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesMemoryConfigValues(next),
+    }
+  },
+
+  hermes_skills_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesSkillsConfigValues(config),
+    }
+  },
+
+  hermes_skills_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesSkillsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesSkillsConfigValues(next),
+    }
+  },
+
+  hermes_curator_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesCuratorConfigValues(config),
+    }
+  },
+
+  hermes_curator_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesCuratorConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesCuratorConfigValues(next),
+    }
+  },
+
+  hermes_quick_commands_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesQuickCommandsConfigValues(config),
+    }
+  },
+
+  hermes_quick_commands_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesQuickCommandsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesQuickCommandsConfigValues(next),
+    }
+  },
+
+  hermes_model_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesModelConfigValues(config),
+    }
+  },
+
+  hermes_model_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesModelConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesModelConfigValues(next),
+    }
+  },
+
+  hermes_x_search_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesXSearchConfigValues(config),
+    }
+  },
+
+  hermes_x_search_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesXSearchConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesXSearchConfigValues(next),
+    }
+  },
+
+  hermes_context_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesContextConfigValues(config),
+    }
+  },
+
+  hermes_context_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesContextConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesContextConfigValues(next),
+    }
+  },
+
+  hermes_model_aliases_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesModelAliasesConfigValues(config),
+    }
+  },
+
+  hermes_model_aliases_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesModelAliasesConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesModelAliasesConfigValues(next),
+    }
+  },
+
+  hermes_hooks_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesHooksConfigValues(config),
+    }
+  },
+
+  hermes_hooks_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesHooksConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesHooksConfigValues(next),
+    }
+  },
+
+  hermes_provider_overrides_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesProviderOverridesConfigValues(config),
+    }
+  },
+
+  hermes_provider_overrides_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesProviderOverridesConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesProviderOverridesConfigValues(next),
+    }
+  },
+
+  hermes_mcp_servers_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesMcpServersConfigValues(config),
+    }
+  },
+
+  hermes_mcp_servers_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesMcpServersConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesMcpServersConfigValues(next),
+    }
+  },
+
+  hermes_agent_toolsets_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesAgentToolsetsConfigValues(config),
+    }
+  },
+
+  hermes_agent_toolsets_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesAgentToolsetsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesAgentToolsetsConfigValues(next),
+    }
+  },
+
+  hermes_platform_toolsets_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesPlatformToolsetsConfigValues(config),
+    }
+  },
+
+  hermes_platform_toolsets_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesPlatformToolsetsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesPlatformToolsetsConfigValues(next),
+    }
+  },
+
+  hermes_agent_runtime_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesAgentRuntimeConfigValues(config),
+    }
+  },
+
+  hermes_agent_runtime_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesAgentRuntimeConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesAgentRuntimeConfigValues(next),
+    }
+  },
+
+  hermes_unauthorized_dm_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesUnauthorizedDmConfigValues(config),
+    }
+  },
+
+  hermes_unauthorized_dm_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesUnauthorizedDmConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesUnauthorizedDmConfigValues(next),
+    }
+  },
+
+  hermes_security_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesSecurityConfigValues(config),
+    }
+  },
+
+  hermes_security_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesSecurityConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesSecurityConfigValues(next),
+    }
+  },
+
+  hermes_human_delay_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesHumanDelayConfigValues(config),
+    }
+  },
+
+  hermes_human_delay_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesHumanDelayConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesHumanDelayConfigValues(next),
+    }
+  },
+
+  hermes_display_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesDisplayConfigValues(config),
+    }
+  },
+
+  hermes_display_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesDisplayConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesDisplayConfigValues(next),
+    }
+  },
+
+  hermes_kanban_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesKanbanConfigValues(config),
+    }
+  },
+
+  hermes_kanban_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesKanbanConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesKanbanConfigValues(next),
+    }
+  },
+
+  hermes_streaming_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesStreamingConfigValues(config),
+    }
+  },
+
+  hermes_streaming_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesStreamingConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesStreamingConfigValues(next),
+    }
+  },
+
+  hermes_execution_limits_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesExecutionLimitsConfigValues(config),
+    }
+  },
+
+  hermes_execution_limits_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesExecutionLimitsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesExecutionLimitsConfigValues(next),
+    }
+  },
+
+  hermes_io_safety_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesIoSafetyConfigValues(config),
+    }
+  },
+
+  hermes_io_safety_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesIoSafetyConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesIoSafetyConfigValues(next),
+    }
+  },
+
+  hermes_checkpoints_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesCheckpointsConfigValues(config),
+    }
+  },
+
+  hermes_checkpoints_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesCheckpointsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesCheckpointsConfigValues(next),
+    }
+  },
+
+  hermes_cron_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesCronConfigValues(config),
+    }
+  },
+
+  hermes_cron_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesCronConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesCronConfigValues(next),
+    }
+  },
+
+  hermes_sessions_maintenance_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesSessionsMaintenanceConfigValues(config),
+    }
+  },
+
+  hermes_sessions_maintenance_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesSessionsMaintenanceConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesSessionsMaintenanceConfigValues(next),
+    }
+  },
+
+  hermes_updates_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesUpdatesConfigValues(config),
+    }
+  },
+
+  hermes_updates_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesUpdatesConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesUpdatesConfigValues(next),
+    }
+  },
+
+  hermes_logging_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesLoggingConfigValues(config),
+    }
+  },
+
+  hermes_logging_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesLoggingConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesLoggingConfigValues(next),
+    }
+  },
+
+  hermes_approvals_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesApprovalsConfigValues(config),
+    }
+  },
+
+  hermes_approvals_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesApprovalsConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesApprovalsConfigValues(next),
+    }
+  },
+
+  hermes_privacy_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesPrivacyConfigValues(config),
+    }
+  },
+
+  hermes_privacy_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesPrivacyConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesPrivacyConfigValues(next),
+    }
+  },
+
+  hermes_browser_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesBrowserConfigValues(config),
+    }
+  },
+
+  hermes_browser_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesBrowserConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesBrowserConfigValues(next),
+    }
+  },
+
+  hermes_web_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesWebConfigValues(config),
+    }
+  },
+
+  hermes_web_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesWebConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesWebConfigValues(next),
+    }
+  },
+
+  hermes_lsp_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesLspConfigValues(config),
+    }
+  },
+
+  hermes_lsp_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesLspConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesLspConfigValues(next),
+    }
+  },
+
+  hermes_model_catalog_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesModelCatalogConfigValues(config),
+    }
+  },
+
+  hermes_model_catalog_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesModelCatalogConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesModelCatalogConfigValues(next),
+    }
+  },
+
+  hermes_stt_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesSttConfigValues(config),
+    }
+  },
+
+  hermes_stt_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesSttConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesSttConfigValues(next),
+    }
+  },
+
+  hermes_tts_voice_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesTtsVoiceConfigValues(config),
+    }
+  },
+
+  hermes_tts_voice_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesTtsVoiceConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesTtsVoiceConfigValues(next),
+    }
+  },
+
+  hermes_terminal_config_read() {
+    const { configPath, exists, config } = readHermesConfigYamlObject()
+    return {
+      exists,
+      configPath,
+      values: buildHermesTerminalConfigValues(config),
+    }
+  },
+
+  hermes_terminal_config_save({ form } = {}) {
+    const { configPath, config } = readHermesConfigYamlObject()
+    const next = mergeHermesTerminalConfig(config, form || {})
+    const backup = writeHermesConfigYamlObject(configPath, next)
+    return {
+      ok: true,
+      configPath,
+      backup,
+      values: buildHermesTerminalConfigValues(next),
+    }
   },
 
   // P1-3 lazy_deps: Web 模式下不能调 venv python，但仍提供 feature 列表 + 提示用户走桌面端装
@@ -7838,10 +13780,16 @@ const handlers = {
 
   hermes_config_raw_write({ yamlText } = {}) {
     const configPath = path.join(hermesHome(), 'config.yaml')
+    const content = String(yamlText || '')
+    validateHermesConfigYamlText(content)
     fs.mkdirSync(path.dirname(configPath), { recursive: true })
-    if (fs.existsSync(configPath)) fs.copyFileSync(configPath, `${configPath}.bak-${Math.floor(Date.now() / 1000)}`)
-    fs.writeFileSync(configPath, yamlText || '')
-    return { ok: true }
+    let backup = ''
+    if (fs.existsSync(configPath)) {
+      backup = `${configPath}.bak-${Math.floor(Date.now() / 1000)}`
+      fs.copyFileSync(configPath, backup)
+    }
+    fs.writeFileSync(configPath, content)
+    return { ok: true, backup }
   },
 
   hermes_dashboard_themes() {
@@ -8829,8 +14777,46 @@ const handlers = {
     // 静默返回未安装即可，UI 会显示"未安装"
     return { installed: false, version: null, plugin: null }
   },
-  diagnose_channel() {
-    return { ok: false, error: 'Web 模式暂未实现渠道诊断，请使用桌面客户端' }
+  async diagnose_channel({ platform, accountId } = {}) {
+    if (!platform || !String(platform).trim()) throw new Error('platform 不能为空')
+    const platformId = String(platform).trim()
+    const normalizedAccountId = typeof accountId === 'string' ? accountId.trim() : ''
+    const storageKey = platformStorageKey(platformId)
+    const cfg = readOpenclawConfigOptional()
+    const channelRoot = cfg.channels?.[storageKey]
+    const saved = handlers.read_platform_config({ platform: platformId, accountId: normalizedAccountId || null })
+    const form = saved?.values || {}
+    const configExists = !!saved?.exists
+    const channelEnabled = !channelRoot || channelRoot.enabled !== false
+    const credentialsReady = channelDiagnosisCredentialsReady(platformId, form)
+    let verifyResult = null
+    let verifyError = ''
+
+    if (configExists && credentialsReady) {
+      try {
+        verifyResult = await handlers.verify_bot_token({ platform: platformId, form })
+      } catch (e) {
+        verifyError = e?.message || String(e)
+      }
+    }
+
+    const result = buildOpenClawChannelDiagnosis({
+      platform: platformId,
+      accountId: normalizedAccountId,
+      configExists,
+      channelEnabled,
+      form,
+      verifyResult,
+      verifyError,
+    })
+    if (storageKey === 'qqbot') {
+      result.userHints = [
+        'Web 模式已完成配置级检查；QQ 插件、Gateway TCP 和 chatCompletions 深度诊断需要在桌面客户端执行。',
+        ...(result.userHints || []),
+      ]
+      result.faqUrl = 'https://q.qq.com/qqbot/openclaw/faq.html'
+    }
+    return result
   },
   run_channel_action() {
     throw new Error('Web 模式暂未实现渠道操作，请使用桌面客户端')

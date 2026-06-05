@@ -1149,6 +1149,18 @@ mark {
 
 /* === 移动端响应式 === */
 @media (max-width: 768px) {
+  .modal .btn {
+    min-height: 44px;
+    justify-content: center;
+  }
+  .modal .btn-sm,
+  .modal .btn-xs {
+    min-height: 40px;
+    padding: var(--space-sm) var(--space-md);
+  }
+  .modal-actions {
+    flex-wrap: wrap;
+  }
   .stat-cards {
     grid-template-columns: repeat(2, 1fr);
     gap: var(--space-sm);

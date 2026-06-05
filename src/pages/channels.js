@@ -11,8 +11,43 @@ import { CHANNEL_LABELS } from '../lib/channel-labels.js'
 import { t } from '../lib/i18n.js'
 import { termHelpHtml, attachTermTooltips } from '../lib/term-tooltip.js'
 import { wsClient } from '../lib/ws-client.js'
+import {
+  formatRuntimeAge,
+  getChannelRuntimeSummary,
+  getRuntimeStateMeta,
+  normalizeChannelRuntimeStatus,
+} from '../lib/channel-runtime.js'
 
 // ── 渠道注册表：面板内置向导，覆盖 OpenClaw 官方渠道 + 国内扩展渠道 ──
+
+const DM_POLICY_OPTIONS = [
+  { value: '', label: t('channels.policyDefault') },
+  { value: 'pairing', label: t('channels.dmPairing') },
+  { value: 'open', label: t('channels.dmOpen') },
+  { value: 'allowlist', label: t('channels.dmAllowlist') },
+  { value: 'disabled', label: t('channels.dmDisabled') },
+]
+
+const SYNOLOGY_DM_POLICY_OPTIONS = [
+  { value: '', label: t('channels.policyDefault') },
+  { value: 'open', label: t('channels.dmOpen') },
+  { value: 'allowlist', label: t('channels.dmAllowlist') },
+  { value: 'disabled', label: t('channels.dmDisabled') },
+]
+
+const GROUP_POLICY_OPTIONS = (allLabel, { mention = false } = {}) => [
+  { value: '', label: t('channels.policyDefault') },
+  { value: 'open', label: allLabel },
+  ...(mention ? [{ value: 'mentioned', label: t('channels.groupMentionOnly') }] : []),
+  { value: 'allowlist', label: t('channels.groupAllowlist') },
+  { value: 'disabled', label: t('channels.groupDisabled') },
+]
+
+const BOOLEAN_OPTIONS = [
+  { value: '', label: t('channels.policyDefault') },
+  { value: 'true', label: t('channels.enable') },
+  { value: 'false', label: t('channels.disable') },
+]
 
 const PLATFORM_REGISTRY = {
   qqbot: {
@@ -75,11 +110,14 @@ const PLATFORM_REGISTRY = {
       {
         key: 'domain', label: t('channels.feishuDomainLabel'), type: 'select',
         options: [
-          { value: '', label: t('channels.feishuDomainFeishu') },
+          { value: 'feishu', label: t('channels.feishuDomainFeishu') },
           { value: 'lark', label: t('channels.feishuDomainLark') },
         ],
         required: false,
       },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllGroups'), { mention: true }), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.allowFromPh'), required: false, hint: t('channels.allowFromHint') },
     ],
     pluginRequired: '@larksuite/openclaw-lark@latest',
     pluginId: 'openclaw-lark',
@@ -98,9 +136,439 @@ const PLATFORM_REGISTRY = {
     guideFooter: t('channels.telegramGuideFooter'),
     fields: [
       { key: 'botToken', label: 'Bot Token', placeholder: '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11', secret: true, required: true },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllGroups')), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.allowFromPh'), required: false, hint: t('channels.allowFromHint') },
     ],
     configKey: 'telegram',
     pairingChannel: 'telegram',
+  },
+  zalo: {
+    label: 'Zalo',
+    iconName: 'send',
+    desc: t('channels.zaloDesc'),
+    guide: [
+      t('channels.zaloGuide1'),
+      t('channels.zaloGuide2'),
+      t('channels.zaloGuide3'),
+      t('channels.zaloGuide4'),
+      t('channels.zaloGuide5'),
+    ],
+    guideFooter: t('channels.zaloGuideFooter'),
+    fields: [
+      { key: 'botToken', label: 'Bot Token', placeholder: t('channels.zaloBotTokenPh'), secret: true, required: false, hint: t('channels.zaloBotTokenHint') },
+      { key: 'tokenFile', label: 'Token File', placeholder: t('channels.zaloTokenFilePh'), required: false, hint: t('channels.zaloTokenFileHint') },
+      { key: 'webhookUrl', label: 'Webhook URL', placeholder: 'https://example.com/zalo-webhook', required: false },
+      { key: 'webhookSecret', label: 'Webhook Secret', placeholder: t('channels.zaloWebhookSecretPh'), secret: true, required: false },
+      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/zalo-webhook', required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllGroups')), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.zaloAllowFromPh'), required: false, hint: t('channels.zaloAllowFromHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.zaloGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '50', required: false },
+      { key: 'proxy', label: 'Proxy', placeholder: 'http://127.0.0.1:7890', required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[AI]' }), required: false },
+    ],
+    requiredAny: [{ keys: ['botToken', 'tokenFile'], label: t('channels.zaloTokenOrFile') }],
+    configKey: 'zalo',
+    pairingChannel: 'zalo',
+    pluginRequired: '@openclaw/zalo@latest',
+    pluginId: 'zalo',
+  },
+  zalouser: {
+    label: 'Zalo Personal',
+    iconName: 'message-circle',
+    desc: t('channels.zalouserDesc'),
+    guide: [
+      t('channels.zalouserGuide1'),
+      t('channels.zalouserGuide2'),
+      t('channels.zalouserGuide3'),
+      t('channels.zalouserGuide4'),
+      t('channels.zalouserGuide5'),
+    ],
+    guideFooter: t('channels.zalouserGuideFooter'),
+    fields: [
+      { key: 'profile', label: 'Profile', placeholder: 'default', required: false, hint: t('channels.zalouserProfileHint') },
+      { key: 'dangerouslyAllowNameMatching', label: t('channels.zalouserNameMatching'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.zalouserNameMatchingHint') },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllGroups')), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.zalouserAllowFromPh'), required: false, hint: t('channels.zalouserAllowFromHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.zalouserGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '20', required: false },
+      { key: 'messagePrefix', label: 'Message Prefix', placeholder: t('channels.optionalEg', { example: '[Zalo]' }), required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[AI]' }), required: false },
+    ],
+    configKey: 'zalouser',
+    pluginRequired: '@openclaw/zalouser@latest',
+    pluginId: 'zalouser',
+  },
+  line: {
+    label: 'LINE',
+    iconName: 'message-circle',
+    desc: t('channels.lineDesc'),
+    guide: [
+      t('channels.lineGuide1'),
+      t('channels.lineGuide2'),
+      t('channels.lineGuide3'),
+      t('channels.lineGuide4'),
+      t('channels.lineGuide5'),
+    ],
+    guideFooter: t('channels.lineGuideFooter'),
+    fields: [
+      { key: 'channelAccessToken', label: 'Channel Access Token', placeholder: t('channels.lineAccessTokenPh'), secret: true, required: false, hint: t('channels.lineAccessTokenHint') },
+      { key: 'tokenFile', label: 'Token File', placeholder: t('channels.lineTokenFilePh'), required: false, hint: t('channels.lineTokenFileHint') },
+      { key: 'channelSecret', label: 'Channel Secret', placeholder: t('channels.lineChannelSecretPh'), secret: true, required: false, hint: t('channels.lineChannelSecretHint') },
+      { key: 'secretFile', label: 'Secret File', placeholder: t('channels.lineSecretFilePh'), required: false, hint: t('channels.lineSecretFileHint') },
+      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/line/webhook', required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllGroups')), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.lineAllowFromPh'), required: false, hint: t('channels.lineAllowFromHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.lineGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '50', required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[AI]' }), required: false },
+    ],
+    requiredAny: [
+      { keys: ['channelAccessToken', 'tokenFile'], label: t('channels.lineTokenOrFile') },
+      { keys: ['channelSecret', 'secretFile'], label: t('channels.lineSecretOrFile') },
+    ],
+    configKey: 'line',
+    pairingChannel: 'line',
+    pluginRequired: '@openclaw/line@latest',
+    pluginId: 'line',
+  },
+  mattermost: {
+    label: 'Mattermost',
+    iconName: 'message-square',
+    desc: t('channels.mattermostDesc'),
+    guide: [
+      t('channels.mattermostGuide1'),
+      t('channels.mattermostGuide2'),
+      t('channels.mattermostGuide3'),
+      t('channels.mattermostGuide4'),
+      t('channels.mattermostGuide5'),
+    ],
+    guideFooter: t('channels.mattermostGuideFooter'),
+    fields: [
+      { key: 'botToken', label: 'Bot Token', placeholder: t('channels.mattermostBotTokenPh'), secret: true, required: true },
+      { key: 'baseUrl', label: 'Base URL', placeholder: 'https://mattermost.example.com', required: true, hint: t('channels.mattermostBaseUrlHint') },
+      { key: 'name', label: t('channels.accountName'), placeholder: t('channels.optionalEg', { example: 'ops' }), required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllChannels'), { mention: true }), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.mattermostAllowFromPh'), required: false, hint: t('channels.mattermostAllowFromHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.mattermostGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'replyToMode', label: 'Reply To Mode', type: 'select', required: false, options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'off', label: t('channels.disable') },
+        { value: 'first', label: 'First' },
+        { value: 'all', label: 'All' },
+        { value: 'batched', label: 'Batched' },
+      ] },
+      { key: 'callbackPath', label: 'Slash Callback Path', placeholder: '/api/channels/mattermost/command', required: false, hint: t('channels.mattermostCallbackPathHint') },
+      { key: 'callbackUrl', label: 'Slash Callback URL', placeholder: 'https://panel.example.com/api/channels/mattermost/command', required: false },
+      { key: 'dangerouslyAllowNameMatching', label: t('channels.mattermostNameMatching'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.mattermostNameMatchingHint') },
+      { key: 'dangerouslyAllowPrivateNetwork', label: t('channels.mattermostPrivateNetwork'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.mattermostPrivateNetworkHint') },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[AI]' }), required: false },
+    ],
+    configKey: 'mattermost',
+    pairingChannel: 'mattermost',
+    pluginRequired: '@openclaw/mattermost@latest',
+    pluginId: 'mattermost',
+  },
+  clickclack: {
+    label: 'ClickClack',
+    iconName: 'message-square',
+    desc: t('channels.clickclackDesc'),
+    guide: [
+      t('channels.clickclackGuide1'),
+      t('channels.clickclackGuide2'),
+      t('channels.clickclackGuide3'),
+      t('channels.clickclackGuide4'),
+    ],
+    guideFooter: t('channels.clickclackGuideFooter'),
+    fields: [
+      { key: 'baseUrl', label: 'Base URL', placeholder: 'https://clickclack.example.com', required: true, hint: t('channels.clickclackBaseUrlHint') },
+      { key: 'token', label: 'Token', placeholder: t('channels.clickclackTokenPh'), secret: true, required: true },
+      { key: 'workspace', label: 'Workspace', placeholder: 'ops', required: true, hint: t('channels.clickclackWorkspaceHint') },
+      { key: 'name', label: t('channels.accountName'), placeholder: t('channels.optionalEg', { example: 'ops' }), required: false },
+      { key: 'botUserId', label: 'Bot User ID', placeholder: t('channels.optionalEg', { example: 'bot-1' }), required: false },
+      { key: 'agentId', label: 'Agent ID', placeholder: t('channels.optionalEg', { example: 'default' }), required: false },
+      { key: 'replyMode', label: 'Reply Mode', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'agent', label: 'Agent' },
+        { value: 'model', label: 'Model' },
+      ], required: false },
+      { key: 'model', label: 'Model', placeholder: t('channels.optionalEg', { example: 'claude-sonnet-4-5' }), required: false },
+      { key: 'systemPrompt', label: 'System Prompt', placeholder: t('channels.clickclackSystemPromptPh'), multiline: true, required: false },
+      { key: 'timeoutSeconds', label: 'Timeout Seconds', placeholder: '120', required: false, hint: t('channels.clickclackTimeoutHint') },
+      { key: 'toolsAllow', label: 'Tools Allow', placeholder: 'shell, browser.search', required: false, hint: t('channels.clickclackToolsAllowHint') },
+      { key: 'senderIsOwner', label: t('channels.clickclackSenderIsOwner'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.clickclackSenderIsOwnerHint') },
+      { key: 'defaultTo', label: 'Default To', placeholder: 'channel:general', required: false, hint: t('channels.clickclackDefaultToHint') },
+      { key: 'allowFrom', label: 'Allow From', placeholder: '*, channel:general, dm:alice', required: false, hint: t('channels.clickclackAllowFromHint') },
+      { key: 'reconnectMs', label: 'Reconnect MS', placeholder: '1500', required: false },
+    ],
+    configKey: 'clickclack',
+    pairingChannel: 'clickclack',
+    pluginId: 'clickclack',
+  },
+  'nextcloud-talk': {
+    label: 'Nextcloud Talk',
+    iconName: 'message-square',
+    desc: t('channels.nextcloudTalkDesc'),
+    guide: [
+      t('channels.nextcloudTalkGuide1'),
+      t('channels.nextcloudTalkGuide2'),
+      t('channels.nextcloudTalkGuide3'),
+      t('channels.nextcloudTalkGuide4'),
+    ],
+    guideFooter: t('channels.nextcloudTalkGuideFooter'),
+    fields: [
+      { key: 'baseUrl', label: 'Base URL', placeholder: 'https://cloud.example.com', required: true, hint: t('channels.nextcloudTalkBaseUrlHint') },
+      { key: 'botSecret', label: 'Bot Secret', placeholder: t('channels.nextcloudTalkBotSecretPh'), secret: true, required: false, hint: t('channels.nextcloudTalkBotSecretHint') },
+      { key: 'botSecretFile', label: 'Secret File', placeholder: '/run/secrets/nextcloud-talk-bot-secret', required: false, hint: t('channels.nextcloudTalkBotSecretFileHint') },
+      { key: 'apiUser', label: 'API User', placeholder: t('channels.optionalEg', { example: 'openclaw-bot' }), required: false },
+      { key: 'apiPassword', label: 'API Password', placeholder: t('channels.nextcloudTalkApiPasswordPh'), secret: true, required: false, hint: t('channels.nextcloudTalkApiPasswordHint') },
+      { key: 'apiPasswordFile', label: 'API Password File', placeholder: '/run/secrets/nextcloud-talk-api-password', required: false },
+      { key: 'name', label: t('channels.accountName'), placeholder: t('channels.optionalEg', { example: 'work' }), required: false },
+      { key: 'webhookPort', label: 'Webhook Port', placeholder: '8788', required: false },
+      { key: 'webhookHost', label: 'Webhook Host', placeholder: '0.0.0.0', required: false },
+      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/nextcloud-talk-webhook', required: false },
+      { key: 'webhookPublicUrl', label: 'Webhook Public URL', placeholder: 'https://panel.example.com/nextcloud-talk-webhook', required: false, hint: t('channels.nextcloudTalkWebhookPublicUrlHint') },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllRooms'), { mention: true }), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: 'alice, bob', required: false, hint: t('channels.nextcloudTalkAllowFromHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: 'room-token-1, room-token-2', required: false, hint: t('channels.nextcloudTalkGroupAllowFromHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '50', required: false },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '4000', required: false },
+      { key: 'chunkMode', label: 'Chunk Mode', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'length', label: 'Length' },
+        { value: 'newline', label: 'Newline' },
+      ], required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'dangerouslyAllowPrivateNetwork', label: t('channels.mattermostPrivateNetwork'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.nextcloudTalkPrivateNetworkHint') },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[Talk]' }), required: false },
+    ],
+    requiredAny: [{ keys: ['botSecret', 'botSecretFile'], label: t('channels.nextcloudTalkSecretOrFile') }],
+    configKey: 'nextcloud-talk',
+    pairingChannel: 'nextcloud-talk',
+    pluginRequired: '@openclaw/nextcloud-talk@latest',
+    pluginId: 'nextcloud-talk',
+  },
+  twitch: {
+    label: 'Twitch',
+    iconName: 'message-square',
+    desc: t('channels.twitchDesc'),
+    guide: [
+      t('channels.twitchGuide1'),
+      t('channels.twitchGuide2'),
+      t('channels.twitchGuide3'),
+      t('channels.twitchGuide4'),
+    ],
+    guideFooter: t('channels.twitchGuideFooter'),
+    fields: [
+      { key: 'username', label: 'Username', placeholder: t('channels.optionalEg', { example: 'openclaw' }), required: true, hint: t('channels.twitchUsernameHint') },
+      { key: 'accessToken', label: 'Access Token', placeholder: 'oauth:abc123...', secret: true, required: true, hint: t('channels.twitchAccessTokenHint') },
+      { key: 'clientId', label: 'Client ID', placeholder: 'abc123clientid', required: true, hint: t('channels.twitchClientIdHint') },
+      { key: 'channel', label: 'Channel', placeholder: 'openclaw', required: true, hint: t('channels.twitchChannelHint') },
+      { key: 'allowFrom', label: 'Allow From', placeholder: '123456789, 987654321', required: false, hint: t('channels.twitchAllowFromHint') },
+      { key: 'allowedRoles', label: 'Allowed Roles', placeholder: 'moderator, vip, subscriber', required: false, hint: t('channels.twitchAllowedRolesHint') },
+      { key: 'requireMention', label: t('channels.twitchRequireMention'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[AI]' }), required: false },
+      { key: 'clientSecret', label: 'Client Secret', placeholder: t('channels.optionalEg', { example: 'client-secret' }), secret: true, required: false, hint: t('channels.twitchClientSecretHint') },
+      { key: 'refreshToken', label: 'Refresh Token', placeholder: t('channels.optionalEg', { example: 'refresh-token' }), secret: true, required: false, hint: t('channels.twitchRefreshTokenHint') },
+      { key: 'expiresIn', label: 'Expires In', placeholder: '3600', required: false, hint: t('channels.twitchExpiresInHint') },
+      { key: 'obtainmentTimestamp', label: 'Obtainment Timestamp', placeholder: '1779490000', required: false, hint: t('channels.twitchObtainmentTimestampHint') },
+    ],
+    configKey: 'twitch',
+    pairingChannel: 'twitch',
+    pluginRequired: '@openclaw/twitch@latest',
+    pluginId: 'twitch',
+  },
+  nostr: {
+    label: 'Nostr',
+    iconName: 'message-square',
+    desc: t('channels.nostrDesc'),
+    guide: [
+      t('channels.nostrGuide1'),
+      t('channels.nostrGuide2'),
+      t('channels.nostrGuide3'),
+      t('channels.nostrGuide4'),
+    ],
+    guideFooter: t('channels.nostrGuideFooter'),
+    fields: [
+      { key: 'privateKey', label: 'Private Key', placeholder: 'nsec1...', secret: true, required: true, hint: t('channels.nostrPrivateKeyHint') },
+      { key: 'relays', label: 'Relay URLs', placeholder: 'wss://relay.damus.io, wss://nos.lol', required: false, hint: t('channels.nostrRelaysHint') },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: 'npub1..., 0123456789abcdef', required: false, hint: t('channels.nostrAllowFromHint') },
+      { key: 'name', label: t('channels.accountName'), placeholder: t('channels.optionalEg', { example: 'nostr-bot' }), required: false },
+      { key: 'defaultAccount', label: 'Default Account', placeholder: 'default', required: false, hint: t('channels.nostrDefaultAccountHint') },
+      { key: 'profileName', label: 'Profile Name', placeholder: 'openclaw', required: false },
+      { key: 'profileDisplayName', label: 'Profile Display Name', placeholder: 'OpenClaw Bot', required: false },
+      { key: 'profileAbout', label: 'Profile About', placeholder: t('channels.nostrProfileAboutPh'), multiline: true, required: false },
+      { key: 'profilePicture', label: 'Profile Picture URL', placeholder: 'https://example.com/avatar.png', required: false, hint: t('channels.nostrProfileUrlHint') },
+      { key: 'profileBanner', label: 'Profile Banner URL', placeholder: 'https://example.com/banner.png', required: false, hint: t('channels.nostrProfileUrlHint') },
+      { key: 'profileWebsite', label: 'Profile Website', placeholder: 'https://example.com', required: false, hint: t('channels.nostrProfileUrlHint') },
+      { key: 'profileNip05', label: 'NIP-05', placeholder: 'openclaw@example.com', required: false },
+      { key: 'profileLud16', label: 'LUD-16', placeholder: 'openclaw@example.com', required: false },
+    ],
+    configKey: 'nostr',
+    pairingChannel: 'nostr',
+    pluginRequired: '@openclaw/nostr@latest',
+    pluginId: 'nostr',
+  },
+  tlon: {
+    label: 'Tlon',
+    iconName: 'globe',
+    desc: t('channels.tlonDesc'),
+    guide: [
+      t('channels.tlonGuide1'),
+      t('channels.tlonGuide2'),
+      t('channels.tlonGuide3'),
+      t('channels.tlonGuide4'),
+    ],
+    guideFooter: t('channels.tlonGuideFooter'),
+    fields: [
+      { key: 'name', label: t('channels.accountName'), placeholder: t('channels.optionalEg', { example: 'main-ship' }), required: false },
+      { key: 'ship', label: 'Ship', placeholder: '~sampel-palnet', required: true, hint: t('channels.tlonShipHint') },
+      { key: 'url', label: 'URL', placeholder: 'https://urbit.example.com', required: true, hint: t('channels.tlonUrlHint') },
+      { key: 'code', label: 'Code', placeholder: 'lidlut-tabwed-pillex-ridrup', secret: true, required: true, hint: t('channels.tlonCodeHint') },
+      { key: 'dangerouslyAllowPrivateNetwork', label: t('channels.mattermostPrivateNetwork'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.tlonPrivateNetworkHint') },
+      { key: 'groupChannels', label: 'Group Channels', placeholder: 'chat/~host-ship/general, chat/~host-ship/support', required: false, hint: t('channels.tlonGroupChannelsHint') },
+      { key: 'dmAllowlist', label: 'DM Allowlist', placeholder: '~zod, ~nec', required: false, hint: t('channels.tlonDmAllowlistHint') },
+      { key: 'groupInviteAllowlist', label: 'Group Invite Allowlist', placeholder: '~zod, ~nec', required: false, hint: t('channels.tlonGroupInviteAllowlistHint') },
+      { key: 'autoDiscoverChannels', label: t('channels.tlonAutoDiscoverChannels'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.tlonAutoDiscoverChannelsHint') },
+      { key: 'showModelSignature', label: t('channels.tlonShowModelSignature'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[Tlon]' }), required: false },
+      { key: 'autoAcceptDmInvites', label: t('channels.tlonAutoAcceptDmInvites'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.tlonAutoAcceptDmInvitesHint') },
+      { key: 'autoAcceptGroupInvites', label: t('channels.tlonAutoAcceptGroupInvites'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.tlonAutoAcceptGroupInvitesHint') },
+      { key: 'ownerShip', label: 'Owner Ship', placeholder: '~sampel-palnet', required: false, hint: t('channels.tlonOwnerShipHint') },
+      { key: 'defaultAuthorizedShips', label: 'Default Authorized Ships', placeholder: '~zod, ~nec', required: false, hint: t('channels.tlonDefaultAuthorizedShipsHint') },
+    ],
+    configKey: 'tlon',
+    pairingChannel: 'tlon',
+    pluginRequired: '@openclaw/tlon@latest',
+    pluginId: 'tlon',
+  },
+  irc: {
+    label: 'IRC',
+    iconName: 'hash',
+    desc: t('channels.ircDesc'),
+    guide: [
+      t('channels.ircGuide1'),
+      t('channels.ircGuide2'),
+      t('channels.ircGuide3'),
+      t('channels.ircGuide4'),
+    ],
+    guideFooter: t('channels.ircGuideFooter'),
+    fields: [
+      { key: 'host', label: 'Host', placeholder: 'irc.libera.chat', required: true, hint: t('channels.ircHostHint') },
+      { key: 'port', label: 'Port', placeholder: '6697', required: false, hint: t('channels.ircPortHint') },
+      { key: 'tls', label: 'TLS', type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircTlsHint') },
+      { key: 'nick', label: 'Nick', placeholder: 'openclaw-bot', required: true, hint: t('channels.ircNickHint') },
+      { key: 'username', label: 'Username', placeholder: 'openclaw', required: false },
+      { key: 'realname', label: 'Real Name', placeholder: 'OpenClaw Bot', required: false },
+      { key: 'password', label: 'Server Password', placeholder: t('channels.optionalEg', { example: 'server-password' }), secret: true, required: false, hint: t('channels.ircPasswordHint') },
+      { key: 'passwordFile', label: 'Server Password File', placeholder: '/run/secrets/irc-password', required: false, hint: t('channels.ircPasswordFileHint') },
+      { key: 'nickservEnabled', label: t('channels.ircNickservEnabled'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircNickservHint') },
+      { key: 'nickservService', label: 'NickServ Service', placeholder: 'NickServ', required: false },
+      { key: 'nickservPassword', label: 'NickServ Password', placeholder: t('channels.optionalEg', { example: 'nickserv-password' }), secret: true, required: false, hint: t('channels.ircNickservHint') },
+      { key: 'nickservPasswordFile', label: 'NickServ Password File', placeholder: '/run/secrets/irc-nickserv', required: false },
+      { key: 'nickservRegister', label: t('channels.ircNickservRegister'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircNickservRegisterHint') },
+      { key: 'nickservRegisterEmail', label: 'NickServ Register Email', placeholder: 'bot@example.com', required: false },
+      { key: 'channels', label: 'Auto Join Channels', placeholder: '#openclaw, #ops', required: false, hint: t('channels.ircChannelsHint') },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: 'alice!ident@example.org, bob', required: false, hint: t('channels.allowFromHint') },
+      { key: 'defaultTo', label: 'Default To', placeholder: '#openclaw', required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllChannels')), required: false },
+      { key: 'groups', label: 'Allowed Channels', placeholder: '#openclaw, #ops', required: false, hint: t('channels.ircGroupsHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: 'alice!ident@example.org', required: false, hint: t('channels.ircGroupAllowFromHint') },
+      { key: 'requireMention', label: t('channels.ircRequireMention'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'mentionPatterns', label: 'Mention Patterns', placeholder: 'openclaw:, @openclaw', required: false, hint: t('channels.ircMentionPatternsHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '25', required: false },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '350', required: false },
+      { key: 'chunkMode', label: 'Chunk Mode', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'length', label: 'Length' },
+        { value: 'newline', label: 'Newline' },
+      ], required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[IRC]' }), required: false },
+      { key: 'dangerouslyAllowNameMatching', label: t('channels.ircNameMatching'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.ircNameMatchingHint') },
+    ],
+    configKey: 'irc',
+    pairingChannel: 'irc',
+    pluginRequired: '@openclaw/irc@latest',
+    pluginId: 'irc',
+  },
+  'synology-chat': {
+    label: 'Synology Chat',
+    iconName: 'message-square',
+    desc: t('channels.synologyChatDesc'),
+    guide: [
+      t('channels.synologyChatGuide1'),
+      t('channels.synologyChatGuide2'),
+      t('channels.synologyChatGuide3'),
+      t('channels.synologyChatGuide4'),
+    ],
+    guideFooter: t('channels.synologyChatGuideFooter'),
+    fields: [
+      { key: 'token', label: 'Token', placeholder: t('channels.synologyChatTokenPh'), secret: true, required: true },
+      { key: 'incomingUrl', label: 'Incoming URL', placeholder: 'https://nas.example.com/webapi/entry.cgi', required: true, hint: t('channels.synologyChatIncomingUrlHint') },
+      { key: 'nasHost', label: 'NAS Host', placeholder: 'https://nas.example.com', required: false },
+      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/webhook/synology', required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: SYNOLOGY_DM_POLICY_OPTIONS, required: false },
+      { key: 'allowedUserIds', label: 'Allowed User IDs', placeholder: 'alice, bob', required: false, hint: t('channels.synologyChatAllowedUserIdsHint') },
+      { key: 'rateLimitPerMinute', label: 'Rate Limit / Minute', placeholder: '30', required: false },
+      { key: 'botName', label: 'Bot Name', placeholder: 'OpenClaw', required: false },
+      { key: 'dangerouslyAllowNameMatching', label: t('channels.synologyChatNameMatching'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.synologyChatNameMatchingHint') },
+      { key: 'dangerouslyAllowInheritedWebhookPath', label: t('channels.synologyChatInheritedWebhookPath'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.synologyChatInheritedWebhookPathHint') },
+      { key: 'allowInsecureSsl', label: t('channels.synologyChatAllowInsecureSsl'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.synologyChatAllowInsecureSslHint') },
+    ],
+    configKey: 'synology-chat',
+    pluginRequired: '@openclaw/synology-chat@latest',
+    pluginId: 'synology-chat',
+  },
+  googlechat: {
+    label: 'Google Chat',
+    iconName: 'message-square',
+    desc: t('channels.googleChatDesc'),
+    guide: [
+      t('channels.googleChatGuide1'),
+      t('channels.googleChatGuide2'),
+      t('channels.googleChatGuide3'),
+      t('channels.googleChatGuide4'),
+    ],
+    guideFooter: t('channels.googleChatGuideFooter'),
+    fields: [
+      { key: 'serviceAccountFile', label: 'Service Account File', placeholder: '/path/to/service-account.json', required: false, hint: t('channels.googleChatServiceAccountFileHint') },
+      { key: 'serviceAccount', label: 'Service Account JSON', placeholder: '{"type":"service_account", ...}', secret: true, multiline: true, required: false, hint: t('channels.googleChatServiceAccountHint') },
+      { key: 'serviceAccountRef', label: 'Service Account SecretRef', placeholder: 'SecretRef(env:default:GOOGLE_CHAT_SERVICE_ACCOUNT)', required: false, hint: t('channels.googleChatServiceAccountRefHint') },
+      { key: 'audienceType', label: 'Audience Type', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'app-url', label: 'App URL' },
+        { value: 'project-number', label: 'Project Number' },
+      ], required: false },
+      { key: 'audience', label: 'Audience', placeholder: 'https://panel.example.com/googlechat', required: false, hint: t('channels.googleChatAudienceHint') },
+      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/googlechat', required: false },
+      { key: 'webhookUrl', label: 'Webhook URL', placeholder: 'https://panel.example.com/googlechat', required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllSpaces'), { mention: true }), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: 'users/123456789, name@example.com', required: false, hint: t('channels.googleChatAllowFromHint') },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: 'spaces/AAA, spaces/BBB', required: false, hint: t('channels.googleChatGroupAllowFromHint') },
+      { key: 'dangerouslyAllowNameMatching', label: t('channels.googleChatNameMatching'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.googleChatNameMatchingHint') },
+      { key: 'requireMention', label: t('channels.googleChatRequireMention'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '20', required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[AI]' }), required: false },
+    ],
+    requiredAny: [{ keys: ['serviceAccountFile', 'serviceAccount', 'serviceAccountRef'], label: t('channels.googleChatServiceAccountRequired') }],
+    configKey: 'googlechat',
+    pairingChannel: 'googlechat',
+    pluginRequired: '@openclaw/googlechat@latest',
+    pluginId: 'googlechat',
   },
   discord: {
     label: 'Discord',
@@ -115,6 +583,12 @@ const PLATFORM_REGISTRY = {
     guideFooter: t('channels.discordGuideFooter'),
     fields: [
       { key: 'token', label: 'Bot Token', placeholder: 'MTExxxxxxxxx.Gxxxxxx.xxxxxxxx', secret: true, required: true },
+      { key: 'applicationId', label: 'Application ID', placeholder: '123456789012345678', required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllChannels')), required: false },
+      { key: 'guildId', label: 'Guild ID', placeholder: 'Discord Server ID', required: false },
+      { key: 'channelId', label: 'Channel ID', placeholder: 'Discord Channel ID；留空匹配整个服务器', required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.allowFromPh'), required: false, hint: t('channels.allowFromHint') },
     ],
     configKey: 'discord',
     pairingChannel: 'discord',
@@ -144,15 +618,83 @@ const PLATFORM_REGISTRY = {
       { key: 'signingSecret', label: 'Signing Secret', placeholder: t('channels.slackSigningSecretPh'), secret: true, requiredWhen: { mode: 'http' }, hint: t('channels.slackSigningSecretHint') },
       { key: 'teamId', label: 'Team ID', placeholder: t('channels.slackTeamIdPh'), required: false },
       { key: 'webhookPath', label: 'Webhook Path', placeholder: t('channels.slackWebhookPathPh'), required: false },
-      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'allow', label: t('channels.dmAllow') }, { value: 'deny', label: t('channels.dmDeny') }], required: false },
-      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'all', label: t('channels.groupAllChannels') }, { value: 'mentioned', label: t('channels.groupMentionOnly') }, { value: 'allowlist', label: t('channels.groupAllowlist') }], required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllChannels'), { mention: true }), required: false },
       { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.allowFromPh'), required: false, hint: t('channels.allowFromHint') },
     ],
     configKey: 'slack',
     pairingChannel: 'slack',
   },
-  // WhatsApp 已移除：上游插件运行时未加载，web.login.start 返回 "not available"
-  // 等上游修复后可重新启用
+  whatsapp: {
+    label: 'WhatsApp',
+    iconName: 'message-circle',
+    desc: t('channels.whatsappDesc'),
+    guide: [
+      t('channels.whatsappGuide1'),
+      t('channels.whatsappGuide2'),
+      t('channels.whatsappGuide3'),
+      t('channels.whatsappGuide4'),
+    ],
+    guideFooter: t('channels.whatsappGuideFooter'),
+    actions: [
+      { id: 'login', label: t('channels.whatsappLogin'), hint: t('channels.whatsappLoginHint'), useGatewayLogin: true },
+    ],
+    fields: [
+      { key: 'selfChatMode', label: t('channels.whatsappSelfChatMode'), type: 'select', options: BOOLEAN_OPTIONS, required: false, hint: t('channels.whatsappSelfChatHint') },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllGroups')), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.whatsappAllowFromPh'), required: false, hint: t('channels.allowFromHint') },
+      { key: 'defaultTo', label: 'Default To', placeholder: t('channels.optionalEg', { example: '+15550001111' }), required: false },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.whatsappGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '50', required: false },
+      { key: 'debounceMs', label: 'Debounce MS', placeholder: '800', required: false, hint: t('channels.whatsappDebounceHint') },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '1800', required: false },
+      { key: 'contextVisibility', label: 'Context Visibility', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'all', label: 'All' },
+        { value: 'allowlist', label: 'Allowlist' },
+        { value: 'allowlist_quote', label: 'Allowlist + Quote' },
+      ], required: false },
+      { key: 'chunkMode', label: 'Chunk Mode', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'length', label: 'Length' },
+        { value: 'newline', label: 'Newline' },
+      ], required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'sendReadReceipts', label: t('channels.whatsappReadReceipts'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'configWrites', label: t('channels.whatsappConfigWrites'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'reactionLevel', label: 'Reaction Level', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'off', label: t('channels.disable') },
+        { value: 'ack', label: 'Ack' },
+        { value: 'minimal', label: 'Minimal' },
+        { value: 'extensive', label: 'Extensive' },
+      ], required: false },
+      { key: 'replyToMode', label: 'Reply To Mode', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'off', label: t('channels.disable') },
+        { value: 'first', label: 'First' },
+        { value: 'all', label: 'All' },
+        { value: 'batched', label: 'Batched' },
+      ], required: false },
+      { key: 'ackEmoji', label: t('channels.whatsappAckEmoji'), placeholder: t('channels.optionalEg', { example: '✅' }), required: false },
+      { key: 'ackDirect', label: t('channels.whatsappAckDirect'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'ackGroup', label: t('channels.whatsappAckGroup'), type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'always', label: 'Always' },
+        { value: 'mentions', label: 'Mentions' },
+        { value: 'never', label: 'Never' },
+      ], required: false },
+      { key: 'messagePrefix', label: 'Message Prefix', placeholder: t('channels.optionalEg', { example: '[WA]' }), required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[AI]' }), required: false },
+    ],
+    configKey: 'whatsapp',
+    pairingChannel: 'whatsapp',
+    pluginRequired: '@openclaw/whatsapp@latest',
+    pluginId: 'whatsapp',
+  },
   weixin: {
     label: t('channels.weixinLabel'),
     iconName: 'message-circle',
@@ -186,13 +728,34 @@ const PLATFORM_REGISTRY = {
     guideFooter: t('channels.msteamsGuideFooter'),
     fields: [
       { key: 'appId', label: 'App ID', placeholder: 'Azure AD Application ID', required: true },
-      { key: 'appPassword', label: 'App Password', placeholder: 'Azure AD Client Secret', secret: true, required: true },
+      { key: 'appPassword', label: 'App Password', placeholder: 'Azure AD Client Secret', secret: true, required: (form) => form.authType !== 'federated' && form.useManagedIdentity !== 'true', hint: t('channels.msteamsAppPasswordHint') },
       { key: 'tenantId', label: 'Tenant ID', placeholder: t('channels.msteamsTenantIdPh'), required: false },
-      { key: 'botEndpoint', label: 'Bot Endpoint', placeholder: 'https://example.com/api/teams/messages', required: false },
-      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/msteams/messages', required: false },
-      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'allow', label: t('channels.dmAllow') }, { value: 'deny', label: t('channels.dmDeny') }], required: false },
-      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'all', label: t('channels.groupAllTeams') }, { value: 'mentioned', label: t('channels.groupMentionOnly') }, { value: 'allowlist', label: t('channels.groupAllowlist') }], required: false },
+      { key: 'authType', label: 'Auth Type', type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'secret', label: 'Client Secret' }, { value: 'federated', label: 'Federated / Certificate' }], required: false },
+      { key: 'certificatePath', label: 'Certificate Path', placeholder: t('channels.optionalEg', { example: '/run/secrets/teams.pem' }), required: false },
+      { key: 'certificateThumbprint', label: 'Certificate Thumbprint', placeholder: t('channels.optionalEg', { example: 'ABCD1234' }), required: false },
+      { key: 'useManagedIdentity', label: 'Managed Identity', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'managedIdentityClientId', label: 'Managed Identity Client ID', placeholder: t('channels.optionalEg', { example: '00000000-0000-0000-0000-000000000000' }), required: false },
+      { key: 'webhookPort', label: 'Webhook Port', placeholder: '3978', required: false },
+      { key: 'webhookPath', label: 'Webhook Path', placeholder: '/api/teams/messages', required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllTeams'), { mention: true }), required: false },
       { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.msteamsAllowFromPh'), required: false },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.msteamsGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '1800', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '100', required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'typingIndicator', label: 'Typing Indicator', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'replyStyle', label: 'Reply Style', type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'thread', label: 'Thread' }, { value: 'top-level', label: 'Top-level' }], required: false },
+      { key: 'sharePointSiteId', label: 'SharePoint Site ID', placeholder: t('channels.optionalEg', { example: 'contoso.sharepoint.com,guid1,guid2' }), required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[Teams]' }), required: false },
+      { key: 'welcomeCard', label: 'Welcome Card', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'promptStarters', label: 'Prompt Starters', placeholder: t('channels.msteamsPromptStartersPh'), required: false },
+      { key: 'delegatedAuthEnabled', label: 'Delegated Auth', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'delegatedAuthScopes', label: 'Delegated Auth Scopes', placeholder: t('channels.msteamsDelegatedScopesPh'), required: false },
+      { key: 'ssoEnabled', label: 'SSO', type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'ssoConnectionName', label: 'SSO Connection Name', placeholder: t('channels.optionalEg', { example: 'teams-oauth' }), required: false },
     ],
     configKey: 'msteams',
     pluginRequired: '@openclaw/msteams@latest',
@@ -214,11 +777,68 @@ const PLATFORM_REGISTRY = {
       { key: 'httpUrl', label: 'HTTP URL', placeholder: t('channels.optionalEg', { example: 'http://127.0.0.1:8080' }), required: false },
       { key: 'httpHost', label: 'HTTP Host', placeholder: t('channels.optionalEg', { example: '127.0.0.1' }), required: false },
       { key: 'httpPort', label: 'HTTP Port', placeholder: t('channels.optionalEg', { example: '8080' }), required: false },
-      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'allow', label: t('channels.dmAllow') }, { value: 'deny', label: t('channels.dmDeny') }], required: false },
-      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'all', label: t('channels.groupAllGroups') }, { value: 'mentioned', label: t('channels.groupMentionBot') }, { value: 'allowlist', label: t('channels.groupAllowlist') }], required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllGroups')), required: false },
       { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.signalAllowFromPh'), required: false },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.signalGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '1800', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '25', required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[Signal]' }), required: false },
     ],
     configKey: 'signal',
+  },
+  imessage: {
+    label: 'iMessage',
+    iconName: 'message-circle',
+    desc: t('channels.imessageDesc'),
+    guide: [
+      t('channels.imessageGuide1'),
+      t('channels.imessageGuide2'),
+      t('channels.imessageGuide3'),
+      t('channels.imessageGuide4'),
+    ],
+    guideFooter: t('channels.imessageGuideFooter'),
+    fields: [
+      { key: 'cliPath', label: 'Bridge CLI Path', placeholder: t('channels.imessageCliPathPh'), required: false },
+      { key: 'dbPath', label: 'Messages DB Path', placeholder: '~/Library/Messages/chat.db', required: false },
+      { key: 'remoteHost', label: 'Remote Host', placeholder: t('channels.optionalEg', { example: 'mac-mini.local' }), required: false },
+      { key: 'service', label: 'Service', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'imessage', label: 'iMessage' },
+        { value: 'sms', label: 'SMS' },
+        { value: 'auto', label: 'Auto' },
+      ], required: false },
+      { key: 'region', label: 'Region', placeholder: t('channels.optionalEg', { example: 'US' }), required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllChats')), required: false },
+      { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.imessageAllowFromPh'), required: false, hint: t('channels.allowFromHint') },
+      { key: 'defaultTo', label: 'Default To', placeholder: t('channels.optionalEg', { example: '+15550001111' }), required: false },
+      { key: 'groupAllowFrom', label: 'Group Allow From', placeholder: t('channels.imessageGroupAllowFromPh'), required: false, hint: t('channels.groupAllowFromHint') },
+      { key: 'historyLimit', label: 'History Limit', placeholder: '80', required: false },
+      { key: 'dmHistoryLimit', label: 'DM History Limit', placeholder: '20', required: false },
+      { key: 'mediaMaxMb', label: 'Media Max MB', placeholder: '25', required: false },
+      { key: 'probeTimeoutMs', label: 'Probe Timeout MS', placeholder: '5000', required: false },
+      { key: 'textChunkLimit', label: 'Text Chunk Limit', placeholder: '1800', required: false },
+      { key: 'includeAttachments', label: t('channels.imessageIncludeAttachments'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'attachmentRoots', label: 'Attachment Roots', placeholder: t('channels.imessageAttachmentRootsPh'), required: false },
+      { key: 'remoteAttachmentRoots', label: 'Remote Attachment Roots', placeholder: t('channels.imessageRemoteAttachmentRootsPh'), required: false },
+      { key: 'blockStreaming', label: t('channels.signalBlockStreaming'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'sendReadReceipts', label: t('channels.imessageReadReceipts'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'reactionNotifications', label: 'Reaction Notifications', type: 'select', options: [
+        { value: '', label: t('channels.policyDefault') },
+        { value: 'off', label: t('channels.disable') },
+        { value: 'all', label: t('channels.enable') },
+        { value: 'own', label: t('channels.imessageReactionOwn') },
+      ], required: false },
+      { key: 'coalesceSameSenderDms', label: t('channels.imessageCoalesceDms'), type: 'select', options: BOOLEAN_OPTIONS, required: false },
+      { key: 'responsePrefix', label: 'Response Prefix', placeholder: t('channels.optionalEg', { example: '[iMessage]' }), required: false },
+    ],
+    configKey: 'imessage',
+    pluginRequired: '@openclaw/imessage@latest',
+    pluginId: 'imessage',
   },
   matrix: {
     label: 'Matrix',
@@ -237,8 +857,8 @@ const PLATFORM_REGISTRY = {
       { key: 'password', label: 'Password', placeholder: t('channels.matrixPasswordPh'), secret: true, required: false },
       { key: 'deviceId', label: 'Device ID', placeholder: t('channels.optionalEg', { example: 'CLAWPANEL' }), required: false },
       { key: 'e2ee', label: 'E2EE', type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'true', label: t('channels.enable') }, { value: 'false', label: t('channels.disable') }], required: false },
-      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'allow', label: t('channels.dmAllow') }, { value: 'deny', label: t('channels.dmDeny') }], required: false },
-      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: [{ value: '', label: t('channels.policyDefault') }, { value: 'all', label: t('channels.groupAllRooms') }, { value: 'mentioned', label: t('channels.groupMentionBot') }, { value: 'allowlist', label: t('channels.groupAllowlist') }], required: false },
+      { key: 'dmPolicy', label: t('channels.dmPolicy'), type: 'select', options: DM_POLICY_OPTIONS, required: false },
+      { key: 'groupPolicy', label: t('channels.groupPolicy'), type: 'select', options: GROUP_POLICY_OPTIONS(t('channels.groupAllRooms')), required: false },
       { key: 'allowFrom', label: 'Allow From', placeholder: t('channels.matrixAllowFromPh'), required: false },
     ],
     configKey: 'matrix',
@@ -301,6 +921,8 @@ export async function render() {
     configured: [],
     bindings: [],
     agents: [],
+    runtimeStatus: normalizeChannelRuntimeStatus(null),
+    runtimeStatusError: '',
     routeIntent: parseChannelsRouteIntent(),
     routeIntentConsumed: false,
     routeIntentHintShown: false,
@@ -346,6 +968,26 @@ async function loadPlatforms(page, state) {
   renderAvailable(page, state)
   renderAgentBindings(page, state)
   applyRouteIntent(page, state)
+  refreshChannelRuntimeStatus(page, state, { probe: true, timeoutMs: 5000 })
+}
+
+async function loadChannelRuntimeStatus(state, options = {}) {
+  state.runtimeStatusError = ''
+  try {
+    const raw = await wsClient.requestCompat('channels.status', {
+      probe: options.probe !== false,
+      timeoutMs: options.timeoutMs || 5000,
+    }, null)
+    state.runtimeStatus = normalizeChannelRuntimeStatus(raw)
+  } catch (e) {
+    state.runtimeStatus = normalizeChannelRuntimeStatus(null)
+    state.runtimeStatusError = e?.message || String(e)
+  }
+}
+
+async function refreshChannelRuntimeStatus(page, state, options = {}) {
+  await loadChannelRuntimeStatus(state, options)
+  renderConfigured(page, state)
 }
 
 function applyRouteIntent(page, state) {
@@ -383,11 +1025,138 @@ function applyRouteIntent(page, state) {
 
 // ── 已配置平台渲染 ──
 
-// ── 多账号支持的平台（历史配置中飞书/钉钉等多实例仍展示子账号行） ──
-const MULTI_INSTANCE_PLATFORMS = ['feishu', 'dingtalk', 'qqbot']
+// ── 多账号支持的平台：与 OpenClaw 的 accounts/defaultAccount 配置模型保持一致 ──
+const MULTI_INSTANCE_PLATFORMS = ['telegram', 'discord', 'slack', 'feishu', 'dingtalk', 'dingtalk-connector', 'qqbot', 'zalo', 'zalouser', 'line', 'mattermost', 'clickclack', 'nextcloud-talk', 'twitch', 'tlon', 'irc', 'synology-chat', 'googlechat', 'signal']
+
+function supportsMessagingMultiAccount(pid) {
+  return MULTI_INSTANCE_PLATFORMS.includes(pid)
+}
 
 function platformLabel(pid) {
   return PLATFORM_REGISTRY[pid]?.label || CHANNEL_LABELS[pid] || pid
+}
+
+function renderRuntimeNotice(state) {
+  if (state.runtimeStatusError) {
+    return `
+      <div class="channel-runtime-notice error">
+        ${icon('alert-triangle', 14)}
+        <span>无法读取 Gateway 渠道运行态：${escapeAttr(state.runtimeStatusError)}</span>
+      </div>
+    `
+  }
+  if (!state.runtimeStatus?.supported) {
+    return `
+      <div class="channel-runtime-notice warning">
+        ${icon('alert-triangle', 14)}
+        <span>当前 OpenClaw 内核不支持通用渠道运行态，请升级到新版内核；配置编辑仍可继续使用。</span>
+      </div>
+    `
+  }
+  const warnings = Array.isArray(state.runtimeStatus.warnings) ? state.runtimeStatus.warnings : []
+  if (state.runtimeStatus.partial || warnings.length) {
+    return `
+      <div class="channel-runtime-notice warning">
+        ${icon('alert-triangle', 14)}
+        <span>${state.runtimeStatus.partial ? '运行态结果不完整' : '运行态探测有提示'}${warnings.length ? `：${escapeAttr(warnings.join('；'))}` : ''}</span>
+      </div>
+    `
+  }
+  return ''
+}
+
+function renderRuntimeBadge(summary) {
+  if (!summary.supported) return ''
+  const meta = getRuntimeStateMeta(summary.state)
+  return `<span class="runtime-badge ${meta.tone}" title="Gateway 运行态">${icon(meta.icon, 12)} ${meta.label}</span>`
+}
+
+function renderRuntimeSummary(summary) {
+  if (!summary.supported) {
+    return `<div class="channel-runtime-summary muted">通用运行态不可用</div>`
+  }
+  const parts = []
+  if (summary.counts.total) parts.push(`${summary.counts.total} 个账号`)
+  if (summary.counts.connected) parts.push(`${summary.counts.connected} 已连接`)
+  if (summary.counts.running) parts.push(`${summary.counts.running} 运行中`)
+  if (summary.counts.error) parts.push(`${summary.counts.error} 异常`)
+  if (summary.lastInboundAt) parts.push(`最近接收 ${formatRuntimeAge(summary.lastInboundAt)}`)
+  if (summary.lastOutboundAt) parts.push(`最近发送 ${formatRuntimeAge(summary.lastOutboundAt)}`)
+  if (summary.lastError) parts.push(`错误：${summary.lastError}`)
+  return `<div class="channel-runtime-summary ${summary.state}">${escapeAttr(parts.join(' · ') || 'Gateway 暂未返回账号状态')}</div>`
+}
+
+function renderRuntimeAccountInfo(summary, accountId) {
+  if (!summary.supported) return ''
+  const normalizedAccountId = accountId || 'default'
+  const account = summary.accounts.find(a => (a.accountId || 'default') === normalizedAccountId)
+    || (!accountId ? summary.accounts.find(a => a.accountId === summary.defaultAccountId) : null)
+  if (!account) return ''
+  const meta = getRuntimeStateMeta(account.state)
+  const details = []
+  if (account.lastError) details.push(account.lastError)
+  if (account.healthState) details.push(`health=${account.healthState}`)
+  if (account.lastInboundAt) details.push(`收 ${formatRuntimeAge(account.lastInboundAt)}`)
+  if (account.lastOutboundAt) details.push(`发 ${formatRuntimeAge(account.lastOutboundAt)}`)
+  if (account.probe && typeof account.probe === 'object' && account.probe.ok === false) details.push('探测失败')
+  return `
+    <span class="runtime-account ${meta.tone}" title="${escapeAttr(details.join(' · ') || meta.label)}">
+      ${icon(meta.icon, 12)} ${meta.label}
+    </span>
+  `
+}
+
+function renderRuntimeActions(summary, accountId = '') {
+  if (!summary.supported) {
+    return `<button class="btn btn-sm btn-secondary" data-runtime-action="refresh">${icon('refresh-cw', 14)} 刷新状态</button>`
+  }
+  const accountAttr = escapeAttr(accountId || '')
+  const stopDisabled = summary.state === 'missing' || summary.state === 'configured'
+  const logoutDisabled = summary.state === 'missing'
+  return `
+    <button class="btn btn-sm btn-secondary" data-runtime-action="refresh" data-account-id="${accountAttr}" title="刷新 Gateway 渠道状态">${icon('refresh-cw', 14)} 刷新</button>
+    <button class="btn btn-sm btn-secondary" data-runtime-action="start" data-account-id="${accountAttr}" title="启动该渠道运行时">${icon('play', 14)} 启动</button>
+    <button class="btn btn-sm btn-secondary" data-runtime-action="stop" data-account-id="${accountAttr}" ${stopDisabled ? 'disabled' : ''} title="停止该渠道运行时">${icon('stop', 14)} 停止</button>
+    <button class="btn btn-sm btn-secondary" data-runtime-action="logout" data-account-id="${accountAttr}" ${logoutDisabled ? 'disabled' : ''} title="注销该渠道账号登录态">${icon('x-circle', 14)} 注销</button>
+  `
+}
+
+async function handleRuntimeAction(pid, action, accountId, btn, page, state) {
+  const channel = getChannelBindingKey(pid)
+  const prevHtml = btn?.innerHTML
+  if (btn) {
+    btn.disabled = true
+    btn.textContent = action === 'refresh' ? '刷新中' : '处理中'
+  }
+  try {
+    if (action === 'refresh') {
+      await loadChannelRuntimeStatus(state, { probe: true, timeoutMs: 7000 })
+      renderConfigured(page, state)
+      toast('渠道运行态已刷新', 'success')
+      return
+    }
+
+    if (!wsClient.connected || !wsClient.gatewayReady) {
+      throw new Error('Gateway WebSocket 未连接，请先启动 OpenClaw Gateway')
+    }
+
+    const params = { channel }
+    if (accountId) params.accountId = accountId
+    await wsClient.request(`channels.${action}`, params)
+    await loadChannelRuntimeStatus(state, { probe: true, timeoutMs: 7000 })
+    renderConfigured(page, state)
+    const actionText = action === 'start' ? '启动' : action === 'stop' ? '停止' : '注销'
+    toast(`${platformLabel(pid)} ${actionText}完成`, 'success')
+  } catch (e) {
+    state.runtimeStatusError = e?.message || String(e)
+    renderConfigured(page, state)
+    toast(humanizeError(e, '渠道运行时操作失败'), 'error')
+  } finally {
+    if (btn) {
+      btn.disabled = false
+      if (prevHtml != null) btn.innerHTML = prevHtml
+    }
+  }
 }
 
 function renderConfigured(page, state) {
@@ -400,15 +1169,17 @@ function renderConfigured(page, state) {
   el.innerHTML = `
     <div class="config-section">
       <div class="config-section-title">${t('channels.configured')}</div>
+      ${renderRuntimeNotice(state)}
       <div class="platforms-grid">
         ${state.configured.map(p => {
           const reg = PLATFORM_REGISTRY[p.id]
           const label = platformLabel(p.id)
           const ic = icon(reg?.iconName || 'radio', 22)
           const channelKey = getChannelBindingKey(p.id)
+          const runtimeSummary = getChannelRuntimeSummary(state.runtimeStatus, channelKey, label)
           const accounts = Array.isArray(p.accounts) ? p.accounts : []
           const hasAccounts = accounts.length > 0
-          const supportsMulti = MULTI_INSTANCE_PLATFORMS.includes(p.id)
+          const supportsMulti = supportsMessagingMultiAccount(p.id)
 
           if (hasAccounts) {
             const accountsHtml = accounts.map(acc => {
@@ -426,9 +1197,10 @@ function renderConfigured(page, state) {
                   <span class="account-id">${escapeAttr(accId)}</span>
                   ${acc.appId ? `<span class="account-appid">${escapeAttr(acc.appId)}</span>` : ''}
                   ${badgesHtml}
+                  ${renderRuntimeAccountInfo(runtimeSummary, acc.accountId || '')}
                   <span class="account-actions">
                     <button class="btn btn-xs btn-secondary" data-action="edit-account" data-account-id="${escapeAttr(acc.accountId || '')}">${icon('edit', 12)} ${t('channels.editAccount')}</button>
-                    <button class="btn btn-xs btn-danger" data-action="remove-account" data-account-id="${escapeAttr(acc.accountId || '')}">${icon('trash', 12)}</button>
+                    <button class="btn btn-xs btn-danger" data-action="remove-account" data-account-id="${escapeAttr(acc.accountId || '')}" aria-label="${escapeAttr(t('channels.remove'))}" title="${escapeAttr(t('channels.remove'))}">${icon('trash', 12)}</button>
                   </span>
                 </div>
               `
@@ -440,14 +1212,17 @@ function renderConfigured(page, state) {
                   <span class="platform-emoji">${ic}</span>
                   <span class="platform-name">${label}</span>
                   <span class="account-count">${t('channels.accountCount', { count: accounts.length })}</span>
+                  ${renderRuntimeBadge(runtimeSummary)}
                   <span class="platform-status-dot ${p.enabled ? 'on' : 'off'}"></span>
                 </div>
+                ${renderRuntimeSummary(runtimeSummary)}
                 <div class="platform-accounts">${accountsHtml}</div>
                 <div class="platform-card-actions">
+                  ${renderRuntimeActions(runtimeSummary)}
                   ${supportsMulti ? `<button class="btn btn-sm btn-secondary" data-action="add-account">${icon('plus', 14)} ${t('channels.addAccount')}</button>` : ''}
                   ${reg ? `<button class="btn btn-sm btn-secondary" data-action="edit">${icon('edit', 14)} ${t('channels.editDefault')}</button>` : `<span class="form-hint" style="align-self:center">${t('channels.noGuide')}</span>`}
                   <button class="btn btn-sm btn-secondary" data-action="toggle">${p.enabled ? icon('pause', 14) + ' ' + t('channels.disable') : icon('play', 14) + ' ' + t('channels.enable')}</button>
-                  <button class="btn btn-sm btn-danger" data-action="remove">${icon('trash', 14)}</button>
+                  <button class="btn btn-sm btn-danger" data-action="remove" aria-label="${escapeAttr(t('channels.removePlatformBtn'))}" title="${escapeAttr(t('channels.removePlatformBtn'))}">${icon('trash', 14)}</button>
                 </div>
               </div>
             `
@@ -465,13 +1240,16 @@ function renderConfigured(page, state) {
                 <span class="platform-emoji">${ic}</span>
                 <span class="platform-name">${label}</span>
                 ${agentBadges}
+                ${renderRuntimeBadge(runtimeSummary)}
                 <span class="platform-status-dot ${p.enabled ? 'on' : 'off'}"></span>
               </div>
+              ${renderRuntimeSummary(runtimeSummary)}
               <div class="platform-card-actions">
+                ${renderRuntimeActions(runtimeSummary)}
                 ${supportsMulti ? `<button class="btn btn-sm btn-secondary" data-action="add-account">${icon('plus', 14)} ${t('channels.addAccount')}</button>` : ''}
                 ${reg ? `<button class="btn btn-sm btn-secondary" data-action="edit">${icon('edit', 14)} ${t('channels.editAccount')}</button>` : `<span class="form-hint" style="align-self:center">${t('channels.noGuide')}</span>`}
                 <button class="btn btn-sm btn-secondary" data-action="toggle">${p.enabled ? icon('pause', 14) + ' ' + t('channels.disable') : icon('play', 14) + ' ' + t('channels.enable')}</button>
-                <button class="btn btn-sm btn-danger" data-action="remove">${icon('trash', 14)}</button>
+                <button class="btn btn-sm btn-danger" data-action="remove" aria-label="${escapeAttr(t('channels.removePlatformBtn'))}" title="${escapeAttr(t('channels.removePlatformBtn'))}">${icon('trash', 14)}</button>
               </div>
             </div>
           `
@@ -487,7 +1265,7 @@ function renderConfigured(page, state) {
 
     const accounts = Array.isArray(configured.accounts) ? configured.accounts : []
     const hasAccounts = accounts.length > 0
-    const supportsMulti = MULTI_INSTANCE_PLATFORMS.includes(pid)
+    const supportsMulti = supportsMessagingMultiAccount(pid)
 
     // 统计当前 channel+accountId 组合已有的 agent 绑定
     const channelKey = getChannelBindingKey(pid)
@@ -691,6 +1469,11 @@ function renderConfigured(page, state) {
 
     card.querySelector('[data-action="add-account"]')?.addEventListener('click', () => openConfigDialog(pid, page, state, ''))
     card.querySelector('[data-action="edit"]')?.addEventListener('click', () => openConfigDialog(pid, page, state))
+    card.querySelectorAll('[data-runtime-action]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        handleRuntimeAction(pid, btn.dataset.runtimeAction, btn.dataset.accountId || '', btn, page, state)
+      })
+    })
 
     card.querySelectorAll('[data-action="edit-account"]').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -1137,16 +1920,25 @@ function getManualCommandSpecs(pid, reg) {
     ]
   }
 
-  if (!['qqbot', 'feishu', 'dingtalk'].includes(pid) || !reg.pluginRequired) {
+  if (!reg.pluginRequired) {
     return []
   }
 
-  return [{
+  const commands = [{
     id: 'install',
     title: t('channels.manualInstallCommand'),
     hint: t('channels.manualInstallHint', { platform: reg.label }),
     command: `openclaw plugins install ${reg.pluginRequired}`,
   }]
+  if (pid === 'zalouser') {
+    commands.push({
+      id: 'login',
+      title: t('channels.manualLoginCommand'),
+      hint: t('channels.zalouserManualLoginHint'),
+      command: 'openclaw channels login --channel zalouser',
+    })
+  }
+  return commands
 }
 
 function buildManualCommandPanel(commandSpecs) {
@@ -1279,6 +2071,39 @@ function showQqDiagnoseModal(result, options = {}) {
   })
 }
 
+function showChannelDiagnoseModal(result, options = {}) {
+  const platformName = options.platformName || result?.platform || t('channels.channel')
+  const checks = Array.isArray(result?.checks) ? result.checks : []
+  const summaryOk = !!result?.overallReady
+  const summary = summaryOk
+    ? `<div style="background:var(--success-muted);color:var(--success);padding:10px 14px;border-radius:var(--radius-md);margin-bottom:12px;font-size:var(--font-size-sm);line-height:1.5">${icon('check', 14)} ${t('channels.channelDiagAllPassed')}</div>`
+    : `<div style="background:var(--warning-muted);color:var(--warning);padding:10px 14px;border-radius:var(--radius-md);margin-bottom:12px;font-size:var(--font-size-sm);line-height:1.5">${icon('alert-triangle', 14)} ${t('channels.channelDiagHasFailed')}</div>`
+  const list = checks.map(c => {
+    const ok = !!c.ok
+    const tone = ok ? 'var(--success)' : 'var(--error)'
+    const bg = ok ? 'var(--success-muted)' : 'var(--error-muted, rgba(220,38,38,0.1))'
+    const label = ok ? t('channels.channelDiagPassed') : t('channels.channelDiagNeedsAction')
+    return `<div style="border:1px solid ${bg};border-left:3px solid ${tone};padding:10px 12px;margin-bottom:8px;background:var(--bg-tertiary);border-radius:var(--radius-md)">
+      <div style="display:flex;align-items:center;gap:8px;font-weight:600;color:var(--text-primary)">
+        <span style="color:${tone};min-width:18px">${ok ? icon('check', 14) : icon('x', 14)}</span>
+        <span>${escapeAttr(c.title || '')}</span>
+        <span style="margin-left:auto;font-size:var(--font-size-xs);font-weight:600;color:${tone};background:${bg};padding:2px 8px;border-radius:999px;white-space:nowrap">${label}</span>
+      </div>
+      <div style="font-size:var(--font-size-sm);color:var(--text-secondary);margin-top:6px;line-height:1.55;white-space:pre-wrap">${escapeAttr(c.detail || '')}</div>
+    </div>`
+  }).join('')
+  const hints = (result?.userHints || []).map(h =>
+    `<li style="margin-bottom:8px;line-height:1.5">${escapeAttr(h)}</li>`
+  ).join('')
+  const empty = `<div class="form-hint" style="padding:12px 0">${t('channels.channelDiagNoChecks')}</div>`
+
+  showContentModal({
+    title: t('channels.channelDiagTitle', { platform: platformName }),
+    content: `${summary}<div style="max-height:min(52vh,420px);overflow-y:auto;margin-bottom:12px;margin-top:12px">${list || empty}</div><div style="font-weight:600;margin-bottom:8px;font-size:var(--font-size-sm)">${t('channels.notes')}</div><ul style="padding-left:18px;font-size:var(--font-size-sm);color:var(--text-secondary);margin:0">${hints}</ul>`,
+    width: 540,
+  })
+}
+
 async function runChannelTestForBinding(binding, btnEl) {
   const match = binding?.match || {}
   const channel = match.channel
@@ -1292,30 +2117,18 @@ async function runChannelTestForBinding(binding, btnEl) {
   const prevHtml = btnEl?.innerHTML
   if (btnEl) {
     btnEl.disabled = true
-    btnEl.textContent = channel === 'qqbot' ? t('channels.diagnosing') : t('channels.testing')
+    btnEl.textContent = t('channels.diagnosing')
   }
   try {
+    const result = await api.diagnoseChannel(platformId, accountId)
     if (channel === 'qqbot') {
-      const result = await api.diagnoseChannel('qqbot', accountId)
       showQqDiagnoseModal(result, { accountId })
       return
     }
-    const res = await api.readPlatformConfig(platformId, accountId)
-    if (!res?.exists) {
-      toast(t('channels.noCredentialsFound'), 'warning')
-      return
-    }
-    const form = res.values || {}
-    const out = await api.verifyBotToken(platformId, form)
-    if (out.valid) {
-      const details = (out.details || []).join(' · ')
-      toast(`${t('channels.testPassed')}${details ? ': ' + details : ''}`, 'success')
-    } else {
-      const errs = (out.errors || [t('channels.verifyFailed')]).join('; ')
-      toast(t('channels.testFailed') + ': ' + errs, 'error')
-    }
+    const platformName = PLATFORM_REGISTRY[platformId]?.label || CHANNEL_LABELS[platformId] || platformId
+    showChannelDiagnoseModal(result, { platformName, accountId })
   } catch (e) {
-    toast(humanizeError(e, channel === 'qqbot' ? t('channels.diagFailed') : t('channels.testFailed')), 'error')
+    toast(humanizeError(e, t('channels.diagFailed')), 'error')
   } finally {
     if (btnEl) {
       btnEl.disabled = false
@@ -1731,7 +2544,7 @@ async function openConfigDialog(pid, page, state, accountId) {
 
   const formId = 'platform-form-' + Date.now()
 
-  const supportsMultiAccount = ['feishu', 'dingtalk', 'dingtalk-connector', 'qqbot'].includes(pid)
+  const supportsMultiAccount = supportsMessagingMultiAccount(pid)
 
   // 账号标识（多账号）；编辑时 accountId 非空会在 input value 中显示
   const accountIdHtml = supportsMultiAccount ? `
@@ -1760,6 +2573,7 @@ async function openConfigDialog(pid, page, state, accountId) {
   `
 
   const isFieldRequired = (field, form) => {
+    if (typeof field.required === 'function') return field.required(form || {})
     if (field.required) return true
     if (!field.requiredWhen) return false
     return Object.entries(field.requiredWhen).every(([k, expected]) => (form[k] || '') === expected)
@@ -1776,10 +2590,16 @@ async function openConfigDialog(pid, page, state, accountId) {
 
   const fieldsHtml = reg.fields.map((f, i) => {
     const val = existing[f.key] || ''
+    const secretRefLocked = existing.__secretRefs?.[f.key]
+    const fieldRequired = isFieldRequired(f, existing)
+    const fieldHint = [
+      f.hint,
+      secretRefLocked ? t('channels.secretRefPreserveHint') : '',
+    ].filter(Boolean).join('<br>')
     if (f.type === 'select' && f.options) {
       return `
         <div class="form-group">
-          <label class="form-label">${labelWithHelp(f.label)}${f.required ? ' *' : ''}</label>
+          <label class="form-label">${labelWithHelp(f.label)}<span class="required-marker" data-required-for="${escapeAttr(f.key)}">${fieldRequired ? ' *' : ''}</span></label>
           <select class="form-input" name="${f.key}" data-name="${f.key}">
             ${f.options.map(o => `<option value="${o.value}" ${val === o.value ? 'selected' : ''}>${o.label}</option>`).join('')}
           </select>
@@ -1787,16 +2607,25 @@ async function openConfigDialog(pid, page, state, accountId) {
         </div>
       `
     }
+    if (f.multiline) {
+      return `
+        <div class="form-group">
+          <label class="form-label">${labelWithHelp(f.label)}<span class="required-marker" data-required-for="${escapeAttr(f.key)}">${fieldRequired ? ' *' : ''}</span></label>
+          <textarea class="form-input" name="${f.key}" rows="5" placeholder="${escapeAttr(f.placeholder || '')}" ${i === 0 ? 'autofocus' : ''} style="width:100%;min-height:112px;resize:vertical;font-family:var(--font-mono);line-height:1.5">${escapeAttr(val)}</textarea>
+          ${fieldHint ? `<div class="form-hint">${fieldHint}</div>` : ''}
+        </div>
+      `
+    }
     return `
       <div class="form-group">
-        <label class="form-label">${labelWithHelp(f.label)}${f.required ? ' *' : ''}</label>
+        <label class="form-label">${labelWithHelp(f.label)}<span class="required-marker" data-required-for="${escapeAttr(f.key)}">${fieldRequired ? ' *' : ''}</span></label>
         <div style="display:flex;gap:8px">
           <input class="form-input" name="${f.key}" type="${f.secret ? 'password' : 'text'}"
-                 value="${escapeAttr(val)}" placeholder="${f.placeholder || ''}"
+                 value="${escapeAttr(val)}" placeholder="${escapeAttr(f.placeholder || '')}"
                  ${i === 0 ? 'autofocus' : ''} style="flex:1">
           ${f.secret ? `<button type="button" class="btn btn-sm btn-secondary toggle-vis" data-field="${f.key}">${t('channels.show')}</button>` : ''}
         </div>
-        ${f.hint ? `<div class="form-hint">${f.hint}</div>` : ''}
+        ${fieldHint ? `<div class="form-hint">${fieldHint}</div>` : ''}
       </div>
     `
   }).join('')
@@ -1915,11 +2744,24 @@ async function openConfigDialog(pid, page, state, accountId) {
   const collectForm = () => {
     const obj = {}
     reg.fields.forEach(f => {
-      const el = modal.querySelector(`input[name="${f.key}"]`) || modal.querySelector(`select[name="${f.key}"]`)
+      const el = modal.querySelector(`input[name="${f.key}"]`) || modal.querySelector(`select[name="${f.key}"]`) || modal.querySelector(`textarea[name="${f.key}"]`)
       if (el) obj[f.key] = el.value.trim()
     })
     return obj
   }
+
+  const updateRequiredMarkers = () => {
+    const form = collectForm()
+    reg.fields.forEach(f => {
+      const marker = modal.querySelector(`.required-marker[data-required-for="${f.key}"]`)
+      if (marker) marker.textContent = isFieldRequired(f, form) ? ' *' : ''
+    })
+  }
+  modal.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
+    el.addEventListener('input', updateRequiredMarkers)
+    el.addEventListener('change', updateRequiredMarkers)
+  })
+  updateRequiredMarkers()
 
   // 校验按钮
   const btnVerify = modal.querySelector('#btn-verify')
@@ -2075,6 +2917,12 @@ async function openConfigDialog(pid, page, state, accountId) {
         return
       }
     }
+    for (const group of reg.requiredAny || []) {
+      if (!group.keys.some(key => form[key])) {
+        toast(t('channels.pleaseFill', { field: group.label }), 'warning')
+        return
+      }
+    }
     btnVerify.disabled = true
     btnVerify.textContent = t('channels.verifying')
     resultEl.innerHTML = ''
@@ -2108,6 +2956,12 @@ async function openConfigDialog(pid, page, state, accountId) {
     for (const f of reg.fields) {
       if (isFieldRequired(f, form) && !form[f.key]) {
         toast(t('channels.pleaseFill', { field: f.label }), 'warning')
+        return
+      }
+    }
+    for (const group of reg.requiredAny || []) {
+      if (!group.keys.some(key => form[key])) {
+        toast(t('channels.pleaseFill', { field: group.label }), 'warning')
         return
       }
     }

@@ -12,10 +12,91 @@
  *   - 不持久化（一次性会话，刷新清空）
  */
 import { t } from '../../../lib/i18n.js'
-import { api, isTauriRuntime } from '../../../lib/tauri-api.js'
-import { toast } from '../../../components/toast.js'
-import { humanizeError } from '../../../lib/humanize-error.js'
+import { api, isTauriRuntime, safeTauriListen } from '../../../lib/tauri-api.js'
 import { svgIcon } from '../lib/svg-icons.js'
+
+/**
+ * Hermes `hermes_agent_run` 是 streaming-with-events：它通过 SSE 消费 Hermes Gateway
+ * 的 `/v1/runs/{id}/events` 并把每个事件用 `app.emit("hermes-run-*")` 派发到前端，
+ * 命令本身 resolve 的是 *run_id 字符串*（不是 final 输出）。
+ *
+ * 群聊页之前把 run_id 当成回复直接展示出来（典型现象：消息气泡里只有 `"run_xxx..."`），
+ * 是因为 onSend 把 `await api.hermesAgentRun(...)` 的返回值当成结果对象去解析。
+ *
+ * 这个 helper 串联两端：
+ *   1. 注册 `hermes-run-{started,delta,done,error,cancelled}` listener
+ *   2. 调用 `hermesAgentRun(input)` 触发 run；命令在 SSE 流结束后才 resolve，
+ *      所以 done 事件一般已经先到了 — listener 即可拿到 `payload.output`。
+ *   3. 兜底：done 没到时累积 delta 文本作为最终结果。
+ *
+ * 注意：并发场景下 listener 会全局收事件，因此用 run_id 过滤，
+ * 串行模式（当前群聊调度方式）也能 race-safe。
+ */
+async function runHermesAgentAndWaitFinal(input) {
+  if (!isTauriRuntime()) {
+    throw new Error('Hermes group chat requires Tauri runtime')
+  }
+  return new Promise((resolve, reject) => {
+    const unsubs = []
+    let runId = null
+    let accumulated = ''
+    let settled = false
+    const cleanup = () => {
+      for (const u of unsubs) {
+        try { u() } catch { /* listener already detached */ }
+      }
+    }
+    const finish = (text) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(text)
+    }
+    const fail = (err) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(err)
+    }
+    const matchesRun = (rid) => !runId || !rid || rid === runId
+    ;(async () => {
+      try {
+        unsubs.push(await safeTauriListen('hermes-run-started', (e) => {
+          if (!runId && e?.payload?.run_id) runId = e.payload.run_id
+        }))
+        unsubs.push(await safeTauriListen('hermes-run-delta', (e) => {
+          if (!matchesRun(e?.payload?.run_id)) return
+          accumulated += e?.payload?.delta || ''
+        }))
+        unsubs.push(await safeTauriListen('hermes-run-done', (e) => {
+          if (!matchesRun(e?.payload?.run_id)) return
+          const out = (e?.payload?.output || accumulated || '').trim()
+          finish(out)
+        }))
+        unsubs.push(await safeTauriListen('hermes-run-error', (e) => {
+          if (!matchesRun(e?.payload?.run_id)) return
+          fail(new Error(e?.payload?.error || 'unknown error'))
+        }))
+        unsubs.push(await safeTauriListen('hermes-run-cancelled', (e) => {
+          if (!matchesRun(e?.payload?.run_id)) return
+          finish(accumulated.trim() || '(cancelled)')
+        }))
+
+        // 触发 run。Rust 端 hermes_agent_run 内部消费 SSE 直到 [DONE] 才 resolve，
+        // 因此 done 事件一般已经先到，listener 已经 finish 过；这里拿到的 run_id 仅作兜底。
+        const ridFromAck = await api.hermesAgentRun(input, null, null, null, null)
+        if (!runId) runId = ridFromAck
+
+        // 防御：如果 done 事件因为顺序问题尚未派发（理论上不会发生），等一拍兜底
+        setTimeout(() => {
+          if (!settled) finish(accumulated.trim())
+        }, 300)
+      } catch (e) {
+        fail(e)
+      }
+    })()
+  })
+}
 
 function escHtml(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -238,16 +319,11 @@ export function render() {
           await api.hermesProfileUse(profile)
           activeProfile = profile
         }
-        // 调 agent run（非流式）
-        const result = await api.hermesAgentRun(text, null, null, null, null)
-        // result 形如 { final, messages, ... }
-        const finalText = result?.final?.content
-          || result?.final
-          || result?.output
-          || (Array.isArray(result?.messages) && result.messages.filter(m => m.role === 'assistant').slice(-1)[0]?.content)
-          || JSON.stringify(result || '').slice(0, 500)
+        // 触发 agent run，并通过 hermes-run-* 事件等真正的 final 输出。
+        // 不能直接用 hermesAgentRun 的返回值，它只是 run_id 字符串，不是回复内容。
+        const finalText = await runHermesAgentAndWaitFinal(text)
         placeholder.loading = false
-        placeholder.content = String(finalText || '').trim() || t('engine.hermesGroupChatNoOutput')
+        placeholder.content = finalText || t('engine.hermesGroupChatNoOutput')
         placeholder.ts = Date.now()
       } catch (e) {
         placeholder.loading = false

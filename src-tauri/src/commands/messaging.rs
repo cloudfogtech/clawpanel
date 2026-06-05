@@ -57,6 +57,657 @@ fn insert_string_if_present(form: &mut Map<String, Value>, source: &Value, key: 
     }
 }
 
+fn secret_ref_parts(value: &Value) -> Option<(&str, &str, &str)> {
+    let obj = value.as_object()?;
+    let source = obj.get("source").and_then(|v| v.as_str())?.trim();
+    if !matches!(source, "env" | "file" | "exec") {
+        return None;
+    }
+    let provider = obj
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some((source, provider, id))
+}
+
+fn secret_ref_placeholder(value: &Value) -> Option<String> {
+    let (source, provider, id) = secret_ref_parts(value)?;
+    Some(format!("SecretRef({}:{}:{})", source, provider, id))
+}
+
+fn insert_secret_aware_form_value(form: &mut Map<String, Value>, source: &Value, key: &str) {
+    if let Some(v) = source.get(key).and_then(|v| v.as_str()) {
+        form.insert(key.into(), Value::String(v.into()));
+        return;
+    }
+
+    let Some(value) = source.get(key) else {
+        return;
+    };
+    let Some(placeholder) = secret_ref_placeholder(value) else {
+        return;
+    };
+    form.insert(key.into(), Value::String(placeholder));
+    let refs = form
+        .entry("__secretRefs")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(obj) = refs.as_object_mut() {
+        obj.insert(key.into(), value.clone());
+    }
+}
+
+fn insert_secret_aware_form_alias(
+    form: &mut Map<String, Value>,
+    source: &Value,
+    source_key: &str,
+    form_key: &str,
+) {
+    if let Some(v) = source.get(source_key).and_then(|v| v.as_str()) {
+        form.insert(form_key.into(), Value::String(v.into()));
+        return;
+    }
+
+    let Some(value) = source.get(source_key) else {
+        return;
+    };
+    let Some(placeholder) = secret_ref_placeholder(value) else {
+        return;
+    };
+    form.insert(form_key.into(), Value::String(placeholder));
+    let refs = form
+        .entry("__secretRefs")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(obj) = refs.as_object_mut() {
+        obj.insert(form_key.into(), value.clone());
+    }
+}
+
+fn resolve_messaging_credential_value_for_save(
+    form_obj: &Map<String, Value>,
+    current: &Value,
+    key: &str,
+) -> Option<Value> {
+    let raw_value = form_obj.get(key)?;
+    let Value::String(raw) = raw_value else {
+        return Some(raw_value.clone());
+    };
+    let value = raw.trim();
+    if let Some(current_value) = current.get(key) {
+        if let Some(placeholder) = secret_ref_placeholder(current_value) {
+            if value.is_empty() || value == placeholder {
+                return Some(current_value.clone());
+            }
+        }
+    }
+    if value.is_empty() {
+        None
+    } else {
+        Some(Value::String(value.to_string()))
+    }
+}
+
+fn resolve_messaging_credential_value_for_save_alias(
+    form_obj: &Map<String, Value>,
+    current: &Value,
+    form_key: &str,
+    current_key: &str,
+) -> Option<Value> {
+    let raw_value = form_obj.get(form_key)?;
+    let Value::String(raw) = raw_value else {
+        return Some(raw_value.clone());
+    };
+    let value = raw.trim();
+    if let Some(current_value) = current.get(current_key) {
+        if let Some(placeholder) = secret_ref_placeholder(current_value) {
+            if value.is_empty() || value == placeholder {
+                return Some(current_value.clone());
+            }
+        }
+    }
+    if value.is_empty() {
+        None
+    } else {
+        Some(Value::String(value.to_string()))
+    }
+}
+
+fn preserve_messaging_credential_refs(
+    entry: &mut Map<String, Value>,
+    form_obj: &Map<String, Value>,
+    current: &Value,
+) {
+    entry.remove("__secretRefs");
+    for key in [
+        "accessToken",
+        "appId",
+        "appPassword",
+        "appSecret",
+        "appToken",
+        "apiPassword",
+        "apiPasswordFile",
+        "botSecret",
+        "botSecretFile",
+        "botToken",
+        "channelAccessToken",
+        "channelSecret",
+        "code",
+        "clientId",
+        "clientSecret",
+        "refreshToken",
+        "gatewayPassword",
+        "gatewayToken",
+        "password",
+        "passwordFile",
+        "privateKey",
+        "secretFile",
+        "serviceAccount",
+        "serviceAccountFile",
+        "serviceAccountRef",
+        "signingSecret",
+        "token",
+        "tokenFile",
+        "webhookSecret",
+    ] {
+        if !form_obj.contains_key(key) {
+            continue;
+        }
+        match resolve_messaging_credential_value_for_save(form_obj, current, key) {
+            Some(value) => {
+                entry.insert(key.into(), value);
+            }
+            None => {
+                entry.remove(key);
+            }
+        }
+    }
+}
+
+fn has_configured_messaging_value(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(raw)) => !raw.trim().is_empty(),
+        Some(value) if secret_ref_parts(value).is_some() => true,
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
+fn is_enabled_form_flag(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(v)) => *v,
+        Some(Value::Number(v)) => v.as_i64().map(|n| n != 0).unwrap_or(false),
+        Some(Value::String(raw)) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on" | "enabled"
+        ),
+        _ => false,
+    }
+}
+
+fn msteams_credential_missing_labels(form: &Map<String, Value>) -> Vec<&'static str> {
+    if !has_configured_messaging_value(form.get("appId")) {
+        return vec!["App ID"];
+    }
+    if has_configured_messaging_value(form.get("appPassword")) {
+        return vec![];
+    }
+    if is_enabled_form_flag(form.get("useManagedIdentity")) {
+        return vec![];
+    }
+
+    let auth_type = form_string(form, "authType").to_ascii_lowercase();
+    let has_federated_credential = has_configured_messaging_value(form.get("certificatePath"))
+        || has_configured_messaging_value(form.get("certificateThumbprint"));
+    if auth_type == "federated" && has_federated_credential {
+        return vec![];
+    }
+    if auth_type == "federated" {
+        return vec!["Certificate Path / Certificate Thumbprint / Managed Identity / App Password"];
+    }
+    vec!["App Password"]
+}
+
+fn channel_root_has_messaging_credential(root: &Map<String, Value>) -> bool {
+    [
+        "accessToken",
+        "appId",
+        "appPassword",
+        "appSecret",
+        "appToken",
+        "apiPassword",
+        "apiPasswordFile",
+        "botSecret",
+        "botSecretFile",
+        "botToken",
+        "channelAccessToken",
+        "channelSecret",
+        "code",
+        "clientId",
+        "clientSecret",
+        "refreshToken",
+        "gatewayPassword",
+        "gatewayToken",
+        "password",
+        "privateKey",
+        "secretFile",
+        "serviceAccount",
+        "serviceAccountFile",
+        "serviceAccountRef",
+        "signingSecret",
+        "token",
+        "tokenFile",
+        "webhookSecret",
+    ]
+    .iter()
+    .any(|key| has_configured_messaging_value(root.get(*key)))
+}
+
+fn value_has_messaging_credential(value: &Value) -> bool {
+    value
+        .as_object()
+        .map(channel_root_has_messaging_credential)
+        .unwrap_or(false)
+}
+
+fn required_channel_credential_fields(
+    platform: &str,
+    form: &Map<String, Value>,
+) -> Vec<(&'static str, &'static str)> {
+    match platform_storage_key(platform) {
+        "telegram" => vec![("botToken", "Bot Token")],
+        "discord" => vec![("token", "Bot Token")],
+        "feishu" => vec![("appId", "App ID"), ("appSecret", "App Secret")],
+        "dingtalk-connector" => vec![("clientId", "Client ID"), ("clientSecret", "Client Secret")],
+        "mattermost" => vec![("botToken", "Bot Token"), ("baseUrl", "Base URL")],
+        "synology-chat" => vec![("token", "Token"), ("incomingUrl", "Incoming URL")],
+        "clickclack" => vec![
+            ("baseUrl", "Base URL"),
+            ("token", "Token"),
+            ("workspace", "Workspace"),
+        ],
+        "nextcloud-talk" => vec![("baseUrl", "Base URL")],
+        "nostr" => vec![("privateKey", "Private Key")],
+        "irc" => vec![("host", "Host"), ("nick", "Nick")],
+        "tlon" => vec![("ship", "Ship"), ("url", "URL"), ("code", "Code")],
+        "twitch" => vec![
+            ("username", "Username"),
+            ("accessToken", "Access Token"),
+            ("clientId", "Client ID"),
+            ("channel", "Channel"),
+        ],
+        "signal" => vec![("account", "Signal 账号")],
+        "slack" => {
+            let mode = form_string(form, "mode");
+            vec![
+                ("botToken", "Bot Token"),
+                if mode == "http" {
+                    ("signingSecret", "Signing Secret")
+                } else {
+                    ("appToken", "App Token")
+                },
+            ]
+        }
+        "matrix" => {
+            if has_configured_messaging_value(form.get("accessToken")) {
+                vec![("accessToken", "Access Token")]
+            } else {
+                vec![
+                    ("homeserver", "Homeserver"),
+                    ("userId", "User ID"),
+                    ("password", "Password"),
+                ]
+            }
+        }
+        "msteams" => msteams_credential_missing_labels(form)
+            .into_iter()
+            .map(|label| {
+                if label == "App ID" {
+                    ("appId", "App ID")
+                } else {
+                    ("__msteamsAuth", label)
+                }
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn channel_any_credential_fields(platform: &str) -> Vec<(&'static str, &'static str)> {
+    match platform_storage_key(platform) {
+        "zalo" => vec![("botToken", "Bot Token"), ("tokenFile", "Token File")],
+        "googlechat" => vec![
+            ("serviceAccountFile", "Service Account File"),
+            ("serviceAccount", "Service Account JSON"),
+            ("serviceAccountRef", "Service Account SecretRef"),
+        ],
+        _ => vec![],
+    }
+}
+
+fn channel_any_credential_groups(
+    platform: &str,
+) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    match platform_storage_key(platform) {
+        "line" => vec![
+            (
+                "Channel Access Token 或 Token File",
+                vec![
+                    ("channelAccessToken", "Channel Access Token"),
+                    ("tokenFile", "Token File"),
+                ],
+            ),
+            (
+                "Channel Secret 或 Secret File",
+                vec![
+                    ("channelSecret", "Channel Secret"),
+                    ("secretFile", "Secret File"),
+                ],
+            ),
+        ],
+        "nextcloud-talk" => vec![(
+            "Bot Secret 或 Secret File",
+            vec![
+                ("botSecret", "Bot Secret"),
+                ("botSecretFile", "Secret File"),
+            ],
+        )],
+        _ => vec![],
+    }
+}
+
+fn channel_diagnosis_credentials_ready(platform: &str, form: &Map<String, Value>) -> bool {
+    if matches!(
+        platform_storage_key(platform),
+        "zalouser" | "imessage" | "whatsapp"
+    ) {
+        return true;
+    }
+    if platform_storage_key(platform) == "msteams" {
+        return msteams_credential_missing_labels(form).is_empty();
+    }
+    let required_fields = required_channel_credential_fields(platform, form);
+    let any_groups = channel_any_credential_groups(platform);
+    if !required_fields.is_empty() {
+        return required_fields
+            .iter()
+            .all(|(key, _)| has_configured_messaging_value(form.get(*key)))
+            && any_groups.iter().all(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|(key, _)| has_configured_messaging_value(form.get(*key)))
+            });
+    }
+    if !any_groups.is_empty() {
+        return any_groups.iter().all(|(_, fields)| {
+            fields
+                .iter()
+                .any(|(key, _)| has_configured_messaging_value(form.get(*key)))
+        });
+    }
+    let any_fields = channel_any_credential_fields(platform);
+    if !any_fields.is_empty() {
+        return any_fields
+            .iter()
+            .any(|(key, _)| has_configured_messaging_value(form.get(*key)));
+    }
+    channel_root_has_messaging_credential(form)
+}
+
+fn credential_labels(fields: &[(&'static str, &'static str)]) -> String {
+    fields
+        .iter()
+        .map(|(_, label)| *label)
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn json_string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn compact_diagnostic_details(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
+fn build_openclaw_channel_diagnosis(
+    platform: &str,
+    account_id: Option<&str>,
+    config_exists: bool,
+    channel_enabled: bool,
+    form: &Map<String, Value>,
+    verify_result: Option<Value>,
+    verify_error: Option<String>,
+) -> Value {
+    let storage_key = platform_storage_key(platform);
+    let display_platform = platform_list_id(storage_key);
+    let account_id = account_id.map(str::trim).filter(|id| !id.is_empty());
+    let mut checks = Vec::new();
+
+    checks.push(json!({
+        "id": "config_exists",
+        "ok": config_exists,
+        "title": "渠道配置已保存",
+        "detail": if config_exists {
+            format!(
+                "已读取 channels.{}{} 的配置。",
+                storage_key,
+                account_id.map(|id| format!(".accounts.{}", id)).unwrap_or_default()
+            )
+        } else {
+            format!(
+                "未在 openclaw.json 中找到 {} 渠道配置，请先在「渠道列表」接入并保存。",
+                display_platform
+            )
+        }
+    }));
+
+    checks.push(json!({
+        "id": "channel_enabled",
+        "ok": channel_enabled,
+        "title": "渠道已启用",
+        "detail": if channel_enabled {
+            "渠道未被显式禁用，Gateway 重启/重载后会尝试加载。".to_string()
+        } else {
+            format!("channels.{}.enabled 为 false，请先在渠道列表中启用该渠道。", storage_key)
+        }
+    }));
+
+    let required_fields = required_channel_credential_fields(storage_key, form);
+    let any_fields = channel_any_credential_fields(storage_key);
+    let any_groups = channel_any_credential_groups(storage_key);
+    let missing: Vec<&str> = if storage_key == "msteams" {
+        msteams_credential_missing_labels(form)
+    } else {
+        required_fields
+            .iter()
+            .filter(|(key, _)| !has_configured_messaging_value(form.get(*key)))
+            .map(|(_, label)| *label)
+            .collect()
+    };
+    let missing_groups: Vec<&str> = any_groups
+        .iter()
+        .filter(|(_, fields)| {
+            !fields
+                .iter()
+                .any(|(key, _)| has_configured_messaging_value(form.get(*key)))
+        })
+        .map(|(label, _)| *label)
+        .collect();
+    let any_credential_ok = if any_fields.is_empty() {
+        false
+    } else {
+        any_fields
+            .iter()
+            .any(|(key, _)| has_configured_messaging_value(form.get(*key)))
+    };
+    let credential_ok = if matches!(storage_key, "zalouser" | "imessage" | "whatsapp") {
+        config_exists
+    } else if !required_fields.is_empty() {
+        missing.is_empty() && missing_groups.is_empty()
+    } else if !any_groups.is_empty() {
+        missing_groups.is_empty()
+    } else if !any_fields.is_empty() {
+        any_credential_ok
+    } else {
+        channel_root_has_messaging_credential(form)
+    };
+    let required_labels = credential_labels(&required_fields);
+    let any_labels = credential_labels(&any_fields);
+    checks.push(json!({
+        "id": "credentials",
+        "ok": credential_ok,
+        "title": if storage_key == "zalouser" {
+            "登录/会话配置"
+        } else if storage_key == "imessage" {
+            "桥接运行配置"
+        } else if storage_key == "whatsapp" {
+            "扫码/会话配置"
+        } else {
+            "必要凭证字段"
+        },
+        "detail": if storage_key == "zalouser" {
+            "Zalo Personal 通过二维码登录保存本地会话；配置已保存后，请按手动命令完成或刷新登录。".to_string()
+        } else if storage_key == "imessage" {
+            if config_exists {
+                "iMessage 使用本机或远端桥接运行，不需要 Bot Token；已保存基础运行配置。".to_string()
+            } else {
+                "尚未保存 iMessage 渠道配置，请先填写并保存。".to_string()
+            }
+        } else if storage_key == "whatsapp" {
+            if config_exists {
+                "WhatsApp 使用扫码登录保存本地会话，不需要 Bot Token；已保存扫码运行配置。".to_string()
+            } else {
+                "尚未保存 WhatsApp 渠道配置，请先填写并保存，再启动扫码登录。".to_string()
+            }
+        } else if credential_ok {
+            if !required_fields.is_empty() {
+                if !any_groups.is_empty() {
+                    format!(
+                        "已填写 {}；{}。",
+                        required_labels,
+                        any_groups
+                            .iter()
+                            .map(|(label, _)| *label)
+                            .collect::<Vec<_>>()
+                            .join("；")
+                    )
+                } else {
+                    format!("已填写 {}。", required_labels)
+                }
+            } else if !any_groups.is_empty() {
+                format!(
+                    "已填写 {}。",
+                    any_groups
+                        .iter()
+                        .map(|(label, _)| *label)
+                        .collect::<Vec<_>>()
+                        .join("；")
+                )
+            } else if !any_fields.is_empty() {
+                format!("已填写 {} 其中一项。", any_labels)
+            } else {
+                "已检测到可用凭证字段。".to_string()
+            }
+        } else if !missing.is_empty() {
+            format!("缺少 {}，请补齐后保存。", missing.join(" / "))
+        } else if !missing_groups.is_empty() {
+            format!("缺少 {}，请补齐后保存。", missing_groups.join("；"))
+        } else if !any_fields.is_empty() {
+            format!("缺少 {}，至少填写一项后保存。", any_labels)
+        } else {
+            "未检测到可用凭证字段，请检查渠道配置。".to_string()
+        }
+    }));
+
+    if let Some(error) = verify_error.filter(|error| !error.trim().is_empty()) {
+        checks.push(json!({
+            "id": "online_verify",
+            "ok": false,
+            "title": "平台在线校验",
+            "detail": error
+        }));
+    } else if let Some(result) = verify_result {
+        let valid = result.get("valid").and_then(|v| v.as_bool()) == Some(true);
+        let errors = json_string_list(result.get("errors"));
+        let warnings = json_string_list(result.get("warnings"));
+        let details = json_string_list(result.get("details"));
+        let verify_ok = valid || (!warnings.is_empty() && errors.is_empty());
+        checks.push(json!({
+            "id": "online_verify",
+            "ok": verify_ok,
+            "title": "平台在线校验",
+            "detail": if valid {
+                let detail = compact_diagnostic_details(&details);
+                if detail.is_empty() {
+                    "平台 API 已接受当前凭证。".to_string()
+                } else {
+                    detail
+                }
+            } else {
+                let detail = compact_diagnostic_details(&errors);
+                if detail.is_empty() {
+                    let warning_detail = compact_diagnostic_details(&warnings);
+                    if warning_detail.is_empty() {
+                        "该平台暂不支持在线校验。".to_string()
+                    } else {
+                        warning_detail
+                    }
+                } else {
+                    detail
+                }
+            }
+        }));
+    } else {
+        checks.push(json!({
+            "id": "online_verify",
+            "ok": true,
+            "title": "平台在线校验",
+            "detail": "未执行在线校验，仅完成本地配置检查。"
+        }));
+    }
+
+    let failed_count = checks
+        .iter()
+        .filter(|check| check.get("ok").and_then(|v| v.as_bool()) != Some(true))
+        .count();
+    json!({
+        "ok": failed_count == 0,
+        "overallReady": failed_count == 0,
+        "platform": display_platform,
+        "accountId": account_id,
+        "checks": checks,
+        "userHints": if failed_count == 0 {
+            vec!["配置侧检查已通过。若仍收不到消息，请确认 Gateway 已重启、机器人已加入目标会话，并检查 Gateway 日志。"]
+        } else {
+            vec![
+                "先修复未通过的检查项，保存渠道后重启或重载 Gateway。",
+                "在线校验只能证明平台凭证可用；群聊白名单、机器人邀请和平台回调仍需在对应平台控制台确认。",
+            ]
+        }
+    })
+}
+
 fn insert_bool_as_string(form: &mut Map<String, Value>, source: &Value, key: &str) {
     if let Some(v) = source.get(key).and_then(|v| v.as_bool()) {
         form.insert(
@@ -80,6 +731,65 @@ fn insert_array_as_csv(form: &mut Map<String, Value>, source: &Value, key: &str)
     }
 }
 
+fn insert_irc_groups_form_values(form: &mut Map<String, Value>, source: &Value) {
+    let Some(groups) = source.get("groups").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let group_ids = groups
+        .keys()
+        .filter(|key| !key.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !group_ids.is_empty() {
+        form.insert("groups".into(), Value::String(group_ids.join(", ")));
+    }
+    let mention_values = group_ids
+        .iter()
+        .filter_map(|group_id| {
+            groups
+                .get(group_id)
+                .and_then(|group| group.get("requireMention"))
+                .and_then(|v| v.as_bool())
+        })
+        .collect::<Vec<_>>();
+    if let Some(first) = mention_values.first() {
+        if mention_values.iter().all(|value| value == first) {
+            form.insert(
+                "requireMention".into(),
+                Value::String(if *first { "true" } else { "false" }.into()),
+            );
+        }
+    }
+}
+
+fn insert_number_as_string(form: &mut Map<String, Value>, source: &Value, key: &str) {
+    if let Some(v) = source.get(key).and_then(|v| v.as_f64()) {
+        form.insert(key.into(), Value::String(v.to_string()));
+    }
+}
+
+fn insert_access_policy_form_values(
+    form: &mut Map<String, Value>,
+    source: &Value,
+    telegram_compat: bool,
+    mention_compat: bool,
+) {
+    insert_string_if_present(form, source, "dmPolicy");
+    insert_string_if_present(form, source, "groupPolicy");
+    if mention_compat
+        && form.get("groupPolicy").and_then(|v| v.as_str()) == Some("open")
+        && source.get("requireMention").and_then(|v| v.as_bool()) == Some(true)
+    {
+        form.insert("groupPolicy".into(), Value::String("mentioned".into()));
+    }
+    insert_array_as_csv(form, source, "allowFrom");
+    if telegram_compat {
+        if let Some(v) = form.get("allowFrom").cloned() {
+            form.insert("allowedUsers".into(), v);
+        }
+    }
+}
+
 fn csv_to_json_array(raw: &str) -> Option<Value> {
     let items = raw
         .split(&[',', '\n', ';'][..])
@@ -91,6 +801,32 @@ fn csv_to_json_array(raw: &str) -> Option<Value> {
         None
     } else {
         Some(Value::Array(items))
+    }
+}
+
+fn json_array_from_csv_value(value: Option<&Value>) -> Vec<Value> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| {
+                if let Some(s) = v.as_str() {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(Value::String(trimmed.to_string()))
+                    }
+                } else if v.is_number() || v.is_boolean() {
+                    Some(Value::String(v.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Some(Value::String(raw)) => csv_to_json_array(raw)
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default(),
+        _ => vec![],
     }
 }
 
@@ -114,10 +850,344 @@ fn put_bool_from_form(entry: &mut Map<String, Value>, key: &str, raw: &str) {
     }
 }
 
-fn put_csv_array_from_form(entry: &mut Map<String, Value>, key: &str, raw: &str) {
-    if let Some(v) = csv_to_json_array(raw) {
-        entry.insert(key.into(), v);
+fn put_number_from_form(entry: &mut Map<String, Value>, key: &str, raw: &str) {
+    let value = raw.trim();
+    if value.is_empty() {
+        return;
     }
+    if let Ok(number) = value.parse::<f64>() {
+        if let Some(json_number) = serde_json::Number::from_f64(number) {
+            entry.insert(key.into(), Value::Number(json_number));
+        }
+    }
+}
+
+fn put_number_value_if_present(entry: &mut Map<String, Value>, key: &str, value: Option<&Value>) {
+    if let Some(number) = value.and_then(|v| v.as_f64()) {
+        if let Some(json_number) = serde_json::Number::from_f64(number) {
+            entry.insert(key.into(), Value::Number(json_number));
+        }
+        return;
+    }
+    put_number_from_form(entry, key, value.and_then(|v| v.as_str()).unwrap_or(""));
+}
+
+fn normalize_numeric_form_value(map: &mut Map<String, Value>, key: &str) {
+    let Some(value) = map.get(key).cloned() else {
+        return;
+    };
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                map.remove(key);
+                return;
+            }
+            if let Ok(number) = trimmed.parse::<f64>() {
+                if let Some(json_number) = serde_json::Number::from_f64(number) {
+                    map.insert(key.into(), Value::Number(json_number));
+                }
+            }
+        }
+        Value::Null => {
+            map.remove(key);
+        }
+        _ => {}
+    }
+}
+
+fn put_bool_value_if_present(entry: &mut Map<String, Value>, key: &str, value: Option<&Value>) {
+    match value {
+        Some(Value::Bool(v)) => {
+            entry.insert(key.into(), Value::Bool(*v));
+        }
+        Some(Value::String(raw)) => put_bool_from_form(entry, key, raw),
+        _ => {}
+    }
+}
+
+fn put_array_from_form_value(entry: &mut Map<String, Value>, key: &str, value: Option<&Value>) {
+    let items = json_array_from_csv_value(value);
+    if !items.is_empty() {
+        entry.insert(key.into(), Value::Array(items));
+    }
+}
+
+fn build_irc_groups_from_form(form_obj: &Map<String, Value>) -> Option<Value> {
+    let group_ids = json_array_from_csv_value(form_obj.get("groups"));
+    if group_ids.is_empty() {
+        return None;
+    }
+    let require_mention = form_obj.get("requireMention").and_then(|v| v.as_bool());
+    let mut groups = Map::new();
+    for value in group_ids {
+        let Some(group_id) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let mut group = Map::new();
+        if let Some(require_mention) = require_mention {
+            group.insert("requireMention".into(), Value::Bool(require_mention));
+        }
+        groups.insert(group_id.to_string(), Value::Object(group));
+    }
+    if groups.is_empty() {
+        None
+    } else {
+        Some(Value::Object(groups))
+    }
+}
+
+fn normalize_dm_policy_value(raw: Option<&Value>, fallback: &str) -> String {
+    let value = raw.and_then(|v| v.as_str()).unwrap_or("").trim();
+    match value {
+        "" => fallback.to_string(),
+        "allow" | "open" => "open".into(),
+        "deny" | "disabled" => "disabled".into(),
+        "pairing" => "pairing".into(),
+        "allowlist" => "allowlist".into(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn normalize_group_policy_value(raw: Option<&Value>, fallback: &str) -> String {
+    let value = raw.and_then(|v| v.as_str()).unwrap_or("").trim();
+    match value {
+        "" => fallback.to_string(),
+        "all" | "mentioned" | "open" => "open".into(),
+        "deny" | "disabled" => "disabled".into(),
+        "allowlist" => "allowlist".into(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn platform_supports_top_level_require_mention(platform: &str) -> bool {
+    matches!(
+        platform_storage_key(platform),
+        "feishu" | "slack" | "msteams" | "mattermost" | "googlechat" | "nextcloud-talk" | "twitch"
+    )
+}
+
+fn normalize_messaging_platform_form(
+    platform: &str,
+    form: &Map<String, Value>,
+) -> Map<String, Value> {
+    let storage_key = platform_storage_key(platform);
+    let mut normalized = form.clone();
+
+    if !normalized.contains_key("allowFrom") {
+        if let Some(v) = normalized.get("allowedUsers").cloned() {
+            normalized.insert("allowFrom".into(), v);
+        }
+    }
+
+    let needs_access_defaults = matches!(
+        storage_key,
+        "telegram"
+            | "discord"
+            | "feishu"
+            | "slack"
+            | "signal"
+            | "msteams"
+            | "whatsapp"
+            | "zalo"
+            | "zalouser"
+            | "line"
+            | "mattermost"
+            | "googlechat"
+            | "nextcloud-talk"
+            | "imessage"
+            | "irc"
+    );
+    let has_dm_field = normalized.contains_key("dmPolicy") || needs_access_defaults;
+    let has_group_field = normalized.contains_key("groupPolicy") || needs_access_defaults;
+
+    if has_dm_field {
+        let dm_policy = normalize_dm_policy_value(normalized.get("dmPolicy"), "pairing");
+        normalized.insert("dmPolicy".into(), Value::String(dm_policy.clone()));
+        if normalized.contains_key("allowFrom") {
+            let items = json_array_from_csv_value(normalized.get("allowFrom"));
+            normalized.insert("allowFrom".into(), Value::Array(items));
+        }
+        if dm_policy == "open" {
+            let mut items = json_array_from_csv_value(normalized.get("allowFrom"));
+            if !items.iter().any(|v| v.as_str() == Some("*")) {
+                items.push(Value::String("*".into()));
+            }
+            normalized.insert("allowFrom".into(), Value::Array(items));
+        }
+    } else if normalized.contains_key("allowFrom") {
+        let items = json_array_from_csv_value(normalized.get("allowFrom"));
+        normalized.insert("allowFrom".into(), Value::Array(items));
+    }
+
+    if has_group_field {
+        let requested_group_policy = normalized
+            .get("groupPolicy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let group_policy = normalize_group_policy_value(normalized.get("groupPolicy"), "allowlist");
+        normalized.insert("groupPolicy".into(), Value::String(group_policy));
+        if requested_group_policy == "mentioned"
+            && platform_supports_top_level_require_mention(storage_key)
+        {
+            normalized.insert("requireMention".into(), Value::Bool(true));
+        } else if requested_group_policy != "mentioned" {
+            if platform_supports_top_level_require_mention(storage_key) {
+                normalized.insert("requireMention".into(), Value::Bool(false));
+            } else if normalized.contains_key("requireMention") {
+                let value = match normalized.get("requireMention") {
+                    Some(Value::Bool(v)) => *v,
+                    Some(Value::String(s)) => bool_from_form_value(s).unwrap_or(false),
+                    _ => false,
+                };
+                normalized.insert("requireMention".into(), Value::Bool(value));
+            }
+        }
+    }
+
+    if normalized.contains_key("groupAllowFrom") {
+        let items = json_array_from_csv_value(normalized.get("groupAllowFrom"));
+        normalized.insert("groupAllowFrom".into(), Value::Array(items));
+    }
+
+    if normalized.contains_key("allowedUserIds") {
+        let items = json_array_from_csv_value(normalized.get("allowedUserIds"));
+        normalized.insert("allowedUserIds".into(), Value::Array(items));
+    }
+
+    normalize_numeric_form_value(&mut normalized, "mediaMaxMb");
+    normalize_numeric_form_value(&mut normalized, "historyLimit");
+    normalize_numeric_form_value(&mut normalized, "dmHistoryLimit");
+    normalize_numeric_form_value(&mut normalized, "textChunkLimit");
+    normalize_numeric_form_value(&mut normalized, "probeTimeoutMs");
+    normalize_numeric_form_value(&mut normalized, "debounceMs");
+    normalize_numeric_form_value(&mut normalized, "rateLimitPerMinute");
+    normalize_numeric_form_value(&mut normalized, "httpPort");
+    normalize_numeric_form_value(&mut normalized, "webhookPort");
+    normalize_numeric_form_value(&mut normalized, "feedbackReflectionCooldownMs");
+    normalize_numeric_form_value(&mut normalized, "timeoutSeconds");
+    normalize_numeric_form_value(&mut normalized, "reconnectMs");
+    normalize_numeric_form_value(&mut normalized, "expiresIn");
+    normalize_numeric_form_value(&mut normalized, "obtainmentTimestamp");
+    normalize_numeric_form_value(&mut normalized, "port");
+
+    for key in [
+        "promptStarters",
+        "delegatedAuthScopes",
+        "attachmentRoots",
+        "remoteAttachmentRoots",
+        "toolsAllow",
+        "allowedRoles",
+        "relays",
+        "channels",
+        "groups",
+        "mentionPatterns",
+        "groupChannels",
+        "dmAllowlist",
+        "groupInviteAllowlist",
+        "defaultAuthorizedShips",
+    ] {
+        if normalized.contains_key(key) {
+            let items = json_array_from_csv_value(normalized.get(key));
+            normalized.insert(key.into(), Value::Array(items));
+        }
+    }
+
+    for key in [
+        "dangerouslyAllowNameMatching",
+        "dangerouslyAllowPrivateNetwork",
+        "dangerouslyAllowInheritedWebhookPath",
+        "allowInsecureSsl",
+        "enabled",
+        "allowBots",
+        "blockStreaming",
+        "useManagedIdentity",
+        "typingIndicator",
+        "welcomeCard",
+        "groupWelcomeCard",
+        "feedbackEnabled",
+        "feedbackReflection",
+        "delegatedAuthEnabled",
+        "ssoEnabled",
+        "configWrites",
+        "includeAttachments",
+        "sendReadReceipts",
+        "coalesceSameSenderDms",
+        "selfChatMode",
+        "ackDirect",
+        "senderIsOwner",
+        "requireMention",
+        "tls",
+        "nickservEnabled",
+        "nickservRegister",
+        "autoDiscoverChannels",
+        "showModelSignature",
+        "autoAcceptDmInvites",
+        "autoAcceptGroupInvites",
+    ] {
+        if normalized.contains_key(key) {
+            let value = match normalized.get(key) {
+                Some(Value::Bool(v)) => Some(*v),
+                Some(Value::String(raw)) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(bool_from_form_value(trimmed).unwrap_or(false))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(v) = value {
+                normalized.insert(key.into(), Value::Bool(v));
+            } else {
+                normalized.remove(key);
+            }
+        }
+    }
+
+    if storage_key == "feishu" {
+        let domain = normalized
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        normalized.insert(
+            "domain".into(),
+            Value::String(if domain.is_empty() { "feishu" } else { domain }.into()),
+        );
+        normalized
+            .entry("connectionMode")
+            .or_insert(Value::String("websocket".into()));
+        normalized
+            .entry("webhookPath")
+            .or_insert(Value::String("/feishu/events".into()));
+        normalized
+            .entry("reactionNotifications")
+            .or_insert(Value::String("off".into()));
+        normalized
+            .entry("typingIndicator")
+            .or_insert(Value::Bool(true));
+        normalized
+            .entry("resolveSenderNames")
+            .or_insert(Value::Bool(true));
+    }
+
+    if storage_key == "slack" {
+        normalized
+            .entry("mode")
+            .or_insert(Value::String("socket".into()));
+        normalized
+            .entry("webhookPath")
+            .or_insert(Value::String("/slack/events".into()));
+        normalized
+            .entry("userTokenReadOnly")
+            .or_insert(Value::Bool(false));
+    }
+
+    normalized
 }
 
 /// 合并渠道配置：将新的表单字段覆盖到现有配置上，保留用户通过 CLI 或手动编辑的自定义字段。
@@ -137,6 +1207,68 @@ fn merge_channel_entry(
         new_entry
     };
     channels_map.insert(key.to_string(), Value::Object(merged));
+}
+
+/// 合并账号级渠道配置：保留渠道根节点和账号已有自定义字段，只覆盖本次表单字段。
+fn merge_account_channel_entry(
+    channels_map: &mut Map<String, Value>,
+    key: &str,
+    account_id: &str,
+    new_entry: Map<String, Value>,
+) -> Result<(), String> {
+    let channel = channels_map
+        .entry(key.to_string())
+        .or_insert_with(|| json!({ "enabled": true }));
+    let channel_obj = channel
+        .as_object_mut()
+        .ok_or(format!("{} 节点格式错误", key))?;
+    let accounts_before = channel_obj
+        .get("accounts")
+        .and_then(|value| value.as_object())
+        .map(|accounts| accounts.keys().filter(|id| !id.is_empty()).count())
+        .unwrap_or(0);
+    let should_set_default_account = channel_obj
+        .get("defaultAccount")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+        && !channel_root_has_messaging_credential(channel_obj)
+        && accounts_before == 0;
+    channel_obj.insert("enabled".into(), Value::Bool(true));
+    let accounts = channel_obj.entry("accounts").or_insert_with(|| json!({}));
+    let accounts_obj = accounts.as_object_mut().ok_or("accounts 格式错误")?;
+    let merged = if let Some(Value::Object(existing)) = accounts_obj.get(account_id) {
+        let mut m = existing.clone();
+        for (k, v) in new_entry {
+            m.insert(k, v);
+        }
+        m
+    } else {
+        new_entry
+    };
+    accounts_obj.insert(account_id.to_string(), Value::Object(merged));
+    if should_set_default_account {
+        channel_obj.insert(
+            "defaultAccount".into(),
+            Value::String(account_id.to_string()),
+        );
+    }
+    Ok(())
+}
+
+fn merge_channel_entry_for_account(
+    channels_map: &mut Map<String, Value>,
+    key: &str,
+    account_id: Option<&str>,
+    new_entry: Map<String, Value>,
+) -> Result<(), String> {
+    if let Some(acct) = account_id.map(str::trim).filter(|s| !s.is_empty()) {
+        merge_account_channel_entry(channels_map, key, acct, new_entry)
+    } else {
+        merge_channel_entry(channels_map, key, new_entry);
+        Ok(())
+    }
 }
 
 fn normalize_binding_match_value(value: &Value) -> Option<Value> {
@@ -280,6 +1412,37 @@ fn gateway_auth_value(cfg: &Value, key: &str) -> Option<String> {
         .map(|v| v.to_string())
 }
 
+fn resolve_platform_config_entry(
+    channel_root: Option<&Value>,
+    platform: &str,
+    account_id: Option<&str>,
+) -> Option<Value> {
+    let root = channel_root?;
+    let account = account_id.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(acct) = account {
+        if platform_storage_key(platform) == "tlon" && acct == QQBOT_DEFAULT_ACCOUNT_ID {
+            return Some(root.clone());
+        }
+        if let Some(value) = root.get("accounts").and_then(|a| a.get(acct)) {
+            return Some(value.clone());
+        }
+        if platform_storage_key(platform) == "qqbot" && !qqbot_channel_has_credentials(root) {
+            return None;
+        }
+        return Some(root.clone());
+    }
+
+    if platform_storage_key(platform) == "qqbot" && !qqbot_channel_has_credentials(root) {
+        return root
+            .get("accounts")
+            .and_then(|a| a.get(QQBOT_DEFAULT_ACCOUNT_ID))
+            .cloned()
+            .or_else(|| Some(root.clone()));
+    }
+
+    Some(root.clone())
+}
+
 /// 读取指定平台的当前配置（从 openclaw.json 中提取表单可用的值）
 /// account_id: 可选，指定时读取 channels.<platform>.accounts.<account_id>（多账号模式）
 #[tauri::command]
@@ -295,25 +1458,8 @@ pub async fn read_platform_config(
     // 多账号模式：读凭证位置
     // 飞书：credentials 可写在 root 或 accounts.<id> 下，优先找非空那个
     let channel_root = cfg.get("channels").and_then(|c| c.get(storage_key));
-    let saved = match (&account_id, channel_root) {
-        // 读指定账号的凭证（accounts.<id>），查不到时再试 root
-        (Some(acct), Some(ch)) if !acct.is_empty() => {
-            ch.get("accounts")
-                .and_then(|a| a.get(acct.as_str()))
-                .cloned()
-                .or_else(|| {
-                    // accountId 指定但该账号不存在 → 尝试读 root（可能是旧格式直接写在 root）
-                    ch.get("appId")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|_| ch.clone())
-                })
-                .unwrap_or(Value::Null)
-        }
-        // 无账号：直接读 channel root（单账号场景）
-        (_, Some(ch)) => ch.clone(),
-        _ => Value::Null,
-    };
+    let saved = resolve_platform_config_entry(channel_root, &platform, account_id.as_deref())
+        .unwrap_or(Value::Null);
 
     let exists = !saved.is_null();
 
@@ -324,9 +1470,9 @@ pub async fn read_platform_config(
             }
             // Discord 配置在 openclaw.json 中是展开的 guilds 结构
             // 需要反向提取成表单字段：token, guildId, channelId
-            if let Some(t) = saved.get("token").and_then(|v| v.as_str()) {
-                form.insert("token".into(), Value::String(t.into()));
-            }
+            insert_secret_aware_form_value(&mut form, &saved, "token");
+            insert_string_if_present(&mut form, &saved, "applicationId");
+            insert_access_policy_form_values(&mut form, &saved, false, false);
             if let Some(guilds) = saved.get("guilds").and_then(|v| v.as_object()) {
                 if let Some(gid) = guilds.keys().next() {
                     form.insert("guildId".into(), Value::String(gid.clone()));
@@ -346,13 +1492,8 @@ pub async fn read_platform_config(
                 return Ok(json!({ "exists": false }));
             }
             // Telegram: botToken 直接保存, allowFrom 数组需要拼回逗号字符串
-            if let Some(t) = saved.get("botToken").and_then(|v| v.as_str()) {
-                form.insert("botToken".into(), Value::String(t.into()));
-            }
-            if let Some(arr) = saved.get("allowFrom").and_then(|v| v.as_array()) {
-                let users: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                form.insert("allowedUsers".into(), Value::String(users.join(", ")));
-            }
+            insert_secret_aware_form_value(&mut form, &saved, "botToken");
+            insert_access_policy_form_values(&mut form, &saved, true, false);
         }
         "qqbot" => {
             // 多账号：读 accounts.<account_id>；单账号：先读 qqbot 根节点，若无凭证再读 accounts.default（与官方 CLI 一致）
@@ -465,59 +1606,85 @@ pub async fn read_platform_config(
                 return Ok(json!({ "exists": false }));
             }
             // 飞书凭证：优先从 accounts.<id> 读（多账号），否则从 root 读
-            if let Some(v) = saved.get("appId").and_then(|v| v.as_str()) {
-                form.insert("appId".into(), Value::String(v.into()));
-            }
-            if let Some(v) = saved.get("appSecret").and_then(|v| v.as_str()) {
-                form.insert("appSecret".into(), Value::String(v.into()));
-            }
+            insert_secret_aware_form_value(&mut form, &saved, "appId");
+            insert_secret_aware_form_value(&mut form, &saved, "appSecret");
             // 读 shared fields：优先从 channel root 读（多账号模式下 credentials 在 accounts 下，shared fields 在 root）
             if let Some(ref acct) = account_id {
                 if !acct.is_empty() {
                     // 从 channel root 补 shared fields
+                    let mut shared_source = saved.clone();
                     if let Some(ch_root) = channel_root {
+                        if let (Some(target), Some(root)) =
+                            (shared_source.as_object_mut(), ch_root.as_object())
+                        {
+                            for key in &[
+                                "domain",
+                                "connectionMode",
+                                "webhookPath",
+                                "dmPolicy",
+                                "groupPolicy",
+                                "allowFrom",
+                                "reactionNotifications",
+                                "typingIndicator",
+                                "resolveSenderNames",
+                                "requireMention",
+                                "textChunkLimit",
+                                "mediaMaxMb",
+                            ] {
+                                if let Some(v) = root.get(*key) {
+                                    target.insert(key.to_string(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    {
                         for key in &[
                             "domain",
                             "connectionMode",
-                            "dmPolicy",
-                            "groupPolicy",
+                            "webhookPath",
                             "groupAllowFrom",
                             "groups",
+                            "reactionNotifications",
                             "streaming",
                             "blockStreaming",
-                            "typingIndicator",
-                            "resolveSenderNames",
                             "textChunkLimit",
                             "mediaMaxMb",
                         ] {
-                            if let Some(v) = ch_root.get(*key) {
+                            if let Some(v) = shared_source.get(*key) {
                                 if !v.is_null() {
                                     form.insert(key.to_string(), v.clone());
                                 }
                             }
                         }
+                        insert_access_policy_form_values(&mut form, &shared_source, false, true);
+                        insert_bool_as_string(&mut form, &shared_source, "typingIndicator");
+                        insert_bool_as_string(&mut form, &shared_source, "resolveSenderNames");
+                        insert_bool_as_string(&mut form, &shared_source, "requireMention");
                     }
                 }
             } else {
                 // 无账号：直接从 root 读 shared fields
-                if let Some(v) = saved.get("domain").and_then(|v| v.as_str()) {
-                    form.insert("domain".into(), Value::String(v.into()));
+                for key in &[
+                    "domain",
+                    "connectionMode",
+                    "webhookPath",
+                    "reactionNotifications",
+                    "textChunkLimit",
+                    "mediaMaxMb",
+                ] {
+                    insert_string_if_present(&mut form, &saved, key);
                 }
+                insert_access_policy_form_values(&mut form, &saved, false, true);
+                insert_bool_as_string(&mut form, &saved, "typingIndicator");
+                insert_bool_as_string(&mut form, &saved, "resolveSenderNames");
+                insert_bool_as_string(&mut form, &saved, "requireMention");
             }
         }
         "dingtalk" | "dingtalk-connector" => {
-            if let Some(v) = saved.get("clientId").and_then(|v| v.as_str()) {
-                form.insert("clientId".into(), Value::String(v.into()));
-            }
-            if let Some(v) = saved.get("clientSecret").and_then(|v| v.as_str()) {
-                form.insert("clientSecret".into(), Value::String(v.into()));
-            }
-            if let Some(v) = saved.get("gatewayToken").and_then(|v| v.as_str()) {
-                form.insert("gatewayToken".into(), Value::String(v.into()));
-            }
-            if let Some(v) = saved.get("gatewayPassword").and_then(|v| v.as_str()) {
-                form.insert("gatewayPassword".into(), Value::String(v.into()));
-            }
+            insert_secret_aware_form_value(&mut form, &saved, "clientId");
+            insert_secret_aware_form_value(&mut form, &saved, "clientSecret");
+            insert_secret_aware_form_value(&mut form, &saved, "gatewayToken");
+            insert_secret_aware_form_value(&mut form, &saved, "gatewayPassword");
             match gateway_auth_mode(&cfg) {
                 Some("token") => {
                     if let Some(v) = gateway_auth_value(&cfg, "token") {
@@ -536,43 +1703,129 @@ pub async fn read_platform_config(
         }
         "slack" => {
             insert_string_if_present(&mut form, &saved, "mode");
-            insert_string_if_present(&mut form, &saved, "botToken");
-            insert_string_if_present(&mut form, &saved, "appToken");
-            insert_string_if_present(&mut form, &saved, "signingSecret");
+            insert_secret_aware_form_value(&mut form, &saved, "botToken");
+            insert_secret_aware_form_value(&mut form, &saved, "appToken");
+            insert_secret_aware_form_value(&mut form, &saved, "signingSecret");
             insert_string_if_present(&mut form, &saved, "webhookPath");
             insert_string_if_present(&mut form, &saved, "teamId");
             insert_string_if_present(&mut form, &saved, "appId");
             insert_string_if_present(&mut form, &saved, "socketMode");
-            insert_string_if_present(&mut form, &saved, "dmPolicy");
-            insert_string_if_present(&mut form, &saved, "groupPolicy");
-            insert_array_as_csv(&mut form, &saved, "allowFrom");
+            insert_access_policy_form_values(&mut form, &saved, false, true);
+            insert_bool_as_string(&mut form, &saved, "userTokenReadOnly");
+            insert_bool_as_string(&mut form, &saved, "requireMention");
         }
         "whatsapp" => {
-            insert_string_if_present(&mut form, &saved, "dmPolicy");
-            insert_string_if_present(&mut form, &saved, "groupPolicy");
-            insert_array_as_csv(&mut form, &saved, "allowFrom");
+            insert_access_policy_form_values(&mut form, &saved, false, false);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
             insert_bool_as_string(&mut form, &saved, "enabled");
+            for key in [
+                "configWrites",
+                "sendReadReceipts",
+                "selfChatMode",
+                "blockStreaming",
+            ] {
+                insert_bool_as_string(&mut form, &saved, key);
+            }
+            for key in [
+                "defaultTo",
+                "contextVisibility",
+                "chunkMode",
+                "reactionLevel",
+                "replyToMode",
+                "messagePrefix",
+                "responsePrefix",
+            ] {
+                insert_string_if_present(&mut form, &saved, key);
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "debounceMs",
+                "textChunkLimit",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
+            if let Some(ack_reaction) = saved.get("ackReaction") {
+                if let Some(v) = ack_reaction.get("emoji").and_then(|v| v.as_str()) {
+                    form.insert("ackEmoji".into(), Value::String(v.into()));
+                }
+                if let Some(v) = ack_reaction.get("direct").and_then(|v| v.as_bool()) {
+                    form.insert(
+                        "ackDirect".into(),
+                        Value::String(if v { "true" } else { "false" }.into()),
+                    );
+                }
+                if let Some(v) = ack_reaction.get("group").and_then(|v| v.as_str()) {
+                    form.insert("ackGroup".into(), Value::String(v.into()));
+                }
+            }
         }
         "signal" => {
             insert_string_if_present(&mut form, &saved, "account");
             insert_string_if_present(&mut form, &saved, "cliPath");
             insert_string_if_present(&mut form, &saved, "httpUrl");
             insert_string_if_present(&mut form, &saved, "httpHost");
-            insert_string_if_present(&mut form, &saved, "httpPort");
-            insert_string_if_present(&mut form, &saved, "dmPolicy");
-            insert_string_if_present(&mut form, &saved, "groupPolicy");
-            insert_array_as_csv(&mut form, &saved, "allowFrom");
+            insert_number_as_string(&mut form, &saved, "httpPort");
+            insert_string_if_present(&mut form, &saved, "responsePrefix");
+            insert_access_policy_form_values(&mut form, &saved, false, false);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_bool_as_string(&mut form, &saved, "blockStreaming");
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
+        }
+        "imessage" => {
+            for key in [
+                "cliPath",
+                "dbPath",
+                "remoteHost",
+                "service",
+                "region",
+                "defaultTo",
+                "contextVisibility",
+                "chunkMode",
+                "reactionNotifications",
+                "responsePrefix",
+            ] {
+                insert_string_if_present(&mut form, &saved, key);
+            }
+            insert_access_policy_form_values(&mut form, &saved, false, false);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_array_as_csv(&mut form, &saved, "attachmentRoots");
+            insert_array_as_csv(&mut form, &saved, "remoteAttachmentRoots");
+            for key in [
+                "configWrites",
+                "includeAttachments",
+                "blockStreaming",
+                "sendReadReceipts",
+                "coalesceSameSenderDms",
+            ] {
+                insert_bool_as_string(&mut form, &saved, key);
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "probeTimeoutMs",
+                "textChunkLimit",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
         }
         "matrix" => {
             insert_string_if_present(&mut form, &saved, "homeserver");
-            insert_string_if_present(&mut form, &saved, "accessToken");
+            insert_secret_aware_form_value(&mut form, &saved, "accessToken");
             insert_string_if_present(&mut form, &saved, "userId");
-            insert_string_if_present(&mut form, &saved, "password");
+            insert_secret_aware_form_value(&mut form, &saved, "password");
             insert_string_if_present(&mut form, &saved, "deviceId");
-            insert_string_if_present(&mut form, &saved, "dmPolicy");
-            insert_string_if_present(&mut form, &saved, "groupPolicy");
+            insert_access_policy_form_values(&mut form, &saved, false, false);
             insert_bool_as_string(&mut form, &saved, "e2ee");
-            insert_array_as_csv(&mut form, &saved, "allowFrom");
             if saved.get("accessToken").and_then(|v| v.as_str()).is_some() {
                 form.insert("authMode".into(), Value::String("token".into()));
             } else if saved.get("userId").and_then(|v| v.as_str()).is_some()
@@ -582,14 +1835,367 @@ pub async fn read_platform_config(
             }
         }
         "msteams" => {
-            insert_string_if_present(&mut form, &saved, "appId");
-            insert_string_if_present(&mut form, &saved, "appPassword");
-            insert_string_if_present(&mut form, &saved, "tenantId");
-            insert_string_if_present(&mut form, &saved, "botEndpoint");
-            insert_string_if_present(&mut form, &saved, "webhookPath");
-            insert_string_if_present(&mut form, &saved, "dmPolicy");
-            insert_string_if_present(&mut form, &saved, "groupPolicy");
+            insert_secret_aware_form_value(&mut form, &saved, "appId");
+            insert_secret_aware_form_value(&mut form, &saved, "appPassword");
+            for key in [
+                "tenantId",
+                "authType",
+                "certificatePath",
+                "certificateThumbprint",
+                "managedIdentityClientId",
+                "botEndpoint",
+                "replyStyle",
+                "sharePointSiteId",
+                "responsePrefix",
+            ] {
+                insert_string_if_present(&mut form, &saved, key);
+            }
+            if let Some(webhook) = saved.get("webhook") {
+                insert_string_if_present(&mut form, webhook, "path");
+                if let Some(v) = form.remove("path") {
+                    form.insert("webhookPath".into(), v);
+                }
+                insert_number_as_string(&mut form, webhook, "port");
+                if let Some(v) = form.remove("port") {
+                    form.insert("webhookPort".into(), v);
+                }
+            } else {
+                insert_string_if_present(&mut form, &saved, "webhookPath");
+            }
+            insert_access_policy_form_values(&mut form, &saved, false, true);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_bool_as_string(&mut form, &saved, "requireMention");
+            for key in [
+                "useManagedIdentity",
+                "blockStreaming",
+                "typingIndicator",
+                "welcomeCard",
+                "groupWelcomeCard",
+                "feedbackEnabled",
+                "feedbackReflection",
+            ] {
+                insert_bool_as_string(&mut form, &saved, key);
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+                "feedbackReflectionCooldownMs",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
+            insert_array_as_csv(&mut form, &saved, "promptStarters");
+            if let Some(delegated_auth) = saved.get("delegatedAuth") {
+                insert_bool_as_string(&mut form, delegated_auth, "enabled");
+                if let Some(v) = form.remove("enabled") {
+                    form.insert("delegatedAuthEnabled".into(), v);
+                }
+                insert_array_as_csv(&mut form, delegated_auth, "scopes");
+                if let Some(v) = form.remove("scopes") {
+                    form.insert("delegatedAuthScopes".into(), v);
+                }
+            }
+            if let Some(sso) = saved.get("sso") {
+                insert_bool_as_string(&mut form, sso, "enabled");
+                if let Some(v) = form.remove("enabled") {
+                    form.insert("ssoEnabled".into(), v);
+                }
+                insert_string_if_present(&mut form, sso, "connectionName");
+                if let Some(v) = form.remove("connectionName") {
+                    form.insert("ssoConnectionName".into(), v);
+                }
+            }
+        }
+        "line" => {
+            for key in [
+                "channelAccessToken",
+                "tokenFile",
+                "channelSecret",
+                "secretFile",
+                "webhookPath",
+                "responsePrefix",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            insert_access_policy_form_values(&mut form, &saved, false, false);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            if let Some(v) = saved.get("mediaMaxMb").and_then(|v| v.as_i64()) {
+                form.insert("mediaMaxMb".into(), Value::String(v.to_string()));
+            }
+        }
+        "mattermost" => {
+            for key in [
+                "botToken",
+                "baseUrl",
+                "name",
+                "replyToMode",
+                "responsePrefix",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            insert_access_policy_form_values(&mut form, &saved, false, true);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_bool_as_string(&mut form, &saved, "dangerouslyAllowNameMatching");
+            if let Some(network) = saved.get("network") {
+                insert_bool_as_string(&mut form, network, "dangerouslyAllowPrivateNetwork");
+            }
+            if let Some(commands) = saved.get("commands") {
+                insert_string_if_present(&mut form, commands, "callbackPath");
+                insert_string_if_present(&mut form, commands, "callbackUrl");
+            }
+        }
+        "clickclack" => {
+            for key in [
+                "name",
+                "baseUrl",
+                "token",
+                "workspace",
+                "botUserId",
+                "agentId",
+                "replyMode",
+                "model",
+                "systemPrompt",
+                "defaultTo",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            insert_bool_as_string(&mut form, &saved, "enabled");
+            insert_bool_as_string(&mut form, &saved, "senderIsOwner");
+            insert_array_as_csv(&mut form, &saved, "toolsAllow");
             insert_array_as_csv(&mut form, &saved, "allowFrom");
+            insert_number_as_string(&mut form, &saved, "timeoutSeconds");
+            insert_number_as_string(&mut form, &saved, "reconnectMs");
+        }
+        "nextcloud-talk" => {
+            for key in [
+                "name",
+                "baseUrl",
+                "botSecret",
+                "botSecretFile",
+                "apiUser",
+                "apiPassword",
+                "apiPasswordFile",
+                "webhookHost",
+                "webhookPath",
+                "webhookPublicUrl",
+                "chunkMode",
+                "responsePrefix",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            insert_bool_as_string(&mut form, &saved, "enabled");
+            insert_access_policy_form_values(&mut form, &saved, false, true);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_bool_as_string(&mut form, &saved, "blockStreaming");
+            if let Some(network) = saved.get("network") {
+                insert_bool_as_string(&mut form, network, "dangerouslyAllowPrivateNetwork");
+            }
+            for key in [
+                "webhookPort",
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "textChunkLimit",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
+        }
+        "twitch" => {
+            for key in [
+                "username",
+                "accessToken",
+                "clientId",
+                "channel",
+                "responsePrefix",
+                "clientSecret",
+                "refreshToken",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            insert_bool_as_string(&mut form, &saved, "enabled");
+            insert_array_as_csv(&mut form, &saved, "allowFrom");
+            insert_array_as_csv(&mut form, &saved, "allowedRoles");
+            insert_bool_as_string(&mut form, &saved, "requireMention");
+            insert_number_as_string(&mut form, &saved, "expiresIn");
+            insert_number_as_string(&mut form, &saved, "obtainmentTimestamp");
+        }
+        "nostr" => {
+            insert_secret_aware_form_value(&mut form, &saved, "privateKey");
+            for key in ["name", "defaultAccount", "dmPolicy"] {
+                insert_string_if_present(&mut form, &saved, key);
+            }
+            insert_bool_as_string(&mut form, &saved, "enabled");
+            insert_array_as_csv(&mut form, &saved, "relays");
+            insert_array_as_csv(&mut form, &saved, "allowFrom");
+            if let Some(profile) = saved.get("profile") {
+                for (source_key, form_key) in [
+                    ("name", "profileName"),
+                    ("displayName", "profileDisplayName"),
+                    ("about", "profileAbout"),
+                    ("picture", "profilePicture"),
+                    ("banner", "profileBanner"),
+                    ("website", "profileWebsite"),
+                    ("nip05", "profileNip05"),
+                    ("lud16", "profileLud16"),
+                ] {
+                    if let Some(v) = profile.get(source_key).and_then(|v| v.as_str()) {
+                        form.insert(form_key.into(), Value::String(v.into()));
+                    }
+                }
+            }
+        }
+        "irc" => {
+            for key in [
+                "name",
+                "host",
+                "nick",
+                "username",
+                "realname",
+                "password",
+                "passwordFile",
+                "defaultTo",
+                "chunkMode",
+                "responsePrefix",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            for key in [
+                "enabled",
+                "tls",
+                "blockStreaming",
+                "dangerouslyAllowNameMatching",
+            ] {
+                insert_bool_as_string(&mut form, &saved, key);
+            }
+            insert_access_policy_form_values(&mut form, &saved, false, false);
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_array_as_csv(&mut form, &saved, "channels");
+            insert_array_as_csv(&mut form, &saved, "mentionPatterns");
+            insert_irc_groups_form_values(&mut form, &saved);
+            for key in [
+                "port",
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "textChunkLimit",
+            ] {
+                insert_number_as_string(&mut form, &saved, key);
+            }
+            if let Some(nickserv) = saved.get("nickserv") {
+                if let Some(v) = nickserv.get("enabled").and_then(|v| v.as_bool()) {
+                    form.insert(
+                        "nickservEnabled".into(),
+                        Value::String(if v { "true" } else { "false" }.into()),
+                    );
+                }
+                insert_secret_aware_form_alias(&mut form, nickserv, "service", "nickservService");
+                insert_secret_aware_form_alias(&mut form, nickserv, "password", "nickservPassword");
+                insert_secret_aware_form_alias(
+                    &mut form,
+                    nickserv,
+                    "passwordFile",
+                    "nickservPasswordFile",
+                );
+                if let Some(v) = nickserv.get("register").and_then(|v| v.as_bool()) {
+                    form.insert(
+                        "nickservRegister".into(),
+                        Value::String(if v { "true" } else { "false" }.into()),
+                    );
+                }
+                if let Some(v) = nickserv.get("registerEmail").and_then(|v| v.as_str()) {
+                    form.insert("nickservRegisterEmail".into(), Value::String(v.into()));
+                }
+            }
+        }
+        "tlon" => {
+            let mut shared = channel_root
+                .and_then(|root| root.as_object())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(saved_obj) = saved.as_object() {
+                for (key, value) in saved_obj {
+                    shared.insert(key.clone(), value.clone());
+                }
+            }
+            let shared = Value::Object(shared);
+            for key in ["name", "ship", "url", "code", "responsePrefix", "ownerShip"] {
+                insert_secret_aware_form_value(&mut form, &shared, key);
+            }
+            insert_bool_as_string(&mut form, &shared, "enabled");
+            if let Some(network) = shared.get("network") {
+                insert_bool_as_string(&mut form, network, "dangerouslyAllowPrivateNetwork");
+            }
+            for key in [
+                "groupChannels",
+                "dmAllowlist",
+                "groupInviteAllowlist",
+                "defaultAuthorizedShips",
+            ] {
+                insert_array_as_csv(&mut form, &shared, key);
+            }
+            for key in [
+                "autoDiscoverChannels",
+                "showModelSignature",
+                "autoAcceptDmInvites",
+                "autoAcceptGroupInvites",
+            ] {
+                insert_bool_as_string(&mut form, &shared, key);
+            }
+        }
+        "synology-chat" => {
+            for key in ["token", "incomingUrl", "nasHost", "webhookPath", "botName"] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            insert_string_if_present(&mut form, &saved, "dmPolicy");
+            insert_array_as_csv(&mut form, &saved, "allowedUserIds");
+            if let Some(v) = saved.get("rateLimitPerMinute").and_then(|v| v.as_i64()) {
+                form.insert("rateLimitPerMinute".into(), Value::String(v.to_string()));
+            }
+            insert_bool_as_string(&mut form, &saved, "dangerouslyAllowNameMatching");
+            insert_bool_as_string(&mut form, &saved, "dangerouslyAllowInheritedWebhookPath");
+            insert_bool_as_string(&mut form, &saved, "allowInsecureSsl");
+        }
+        "googlechat" => {
+            for key in [
+                "serviceAccount",
+                "serviceAccountFile",
+                "serviceAccountRef",
+                "audienceType",
+                "audience",
+                "appPrincipal",
+                "webhookPath",
+                "webhookUrl",
+                "botUser",
+                "chunkMode",
+                "replyToMode",
+                "typingIndicator",
+                "responsePrefix",
+            ] {
+                insert_secret_aware_form_value(&mut form, &saved, key);
+            }
+            if let Some(dm) = saved.get("dm") {
+                if let Some(policy) = dm.get("policy").and_then(|v| v.as_str()) {
+                    form.insert("dmPolicy".into(), Value::String(policy.into()));
+                }
+                insert_array_as_csv(&mut form, dm, "allowFrom");
+            }
+            insert_string_if_present(&mut form, &saved, "groupPolicy");
+            insert_array_as_csv(&mut form, &saved, "groupAllowFrom");
+            insert_bool_as_string(&mut form, &saved, "requireMention");
+            insert_bool_as_string(&mut form, &saved, "dangerouslyAllowNameMatching");
+            insert_bool_as_string(&mut form, &saved, "allowBots");
+            insert_bool_as_string(&mut form, &saved, "blockStreaming");
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+            ] {
+                if let Some(v) = saved.get(key).and_then(|v| v.as_f64()) {
+                    form.insert(key.into(), Value::String(v.to_string()));
+                }
+            }
         }
         _ => {
             if saved.is_null() {
@@ -601,7 +2207,9 @@ pub async fn read_platform_config(
                     if k == "enabled" {
                         continue;
                     }
-                    if let Some(s) = v.as_str() {
+                    if secret_ref_placeholder(v).is_some() {
+                        insert_secret_aware_form_value(&mut form, &saved, k);
+                    } else if let Some(s) = v.as_str() {
                         form.insert(k.clone(), Value::String(s.into()));
                     } else if v.is_array() {
                         insert_array_as_csv(&mut form, &saved, k);
@@ -610,6 +2218,8 @@ pub async fn read_platform_config(
                             k.clone(),
                             Value::String(if b { "true" } else { "false" }.into()),
                         );
+                    } else if v.is_number() {
+                        form.insert(k.clone(), Value::String(v.to_string()));
                     }
                 }
             }
@@ -641,7 +2251,15 @@ pub async fn save_messaging_platform(
         .or_insert_with(|| json!({}));
     let channels_map = channels.as_object_mut().ok_or("channels 节点格式错误")?;
 
-    let form_obj = form.as_object().ok_or("表单数据格式错误")?;
+    let raw_form_obj = form.as_object().ok_or("表单数据格式错误")?;
+    let normalized_form = normalize_messaging_platform_form(&platform, raw_form_obj);
+    let form_obj = &normalized_form;
+    let current_saved = resolve_platform_config_entry(
+        channels_map.get(storage_key.as_str()),
+        &platform,
+        account_id.as_deref(),
+    )
+    .unwrap_or(Value::Null);
 
     // 用于后续创建 bindings 的平台信息
     let saved_account_id = account_id.clone();
@@ -654,7 +2272,19 @@ pub async fn save_messaging_platform(
             if let Some(t) = form_obj.get("token").and_then(|v| v.as_str()) {
                 entry.insert("token".into(), Value::String(t.trim().into()));
             }
+            put_string(
+                &mut entry,
+                "applicationId",
+                form_string(form_obj, "applicationId"),
+            );
             entry.insert("enabled".into(), Value::Bool(true));
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
 
             // guildId + channelId 展开为 guilds 嵌套结构
             let guild_id = form_obj
@@ -690,7 +2320,8 @@ pub async fn save_messaging_platform(
             }
 
             // 合并到现有配置，保留用户通过 CLI 设置的 streaming / retry / dmPolicy 等
-            merge_channel_entry(channels_map, "discord", entry);
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(channels_map, "discord", account_id.as_deref(), entry)?;
             // 仅在首次创建时设置默认值，不覆盖用户已有的设置
             if let Some(Value::Object(d)) = channels_map.get_mut("discord") {
                 d.entry("groupPolicy")
@@ -711,21 +2342,127 @@ pub async fn save_messaging_platform(
                 entry.insert("botToken".into(), Value::String(t.trim().into()));
             }
             entry.insert("enabled".into(), Value::Bool(true));
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
 
-            // allowedUsers 逗号字符串 → allowFrom 数组
-            if let Some(users_str) = form_obj.get("allowedUsers").and_then(|v| v.as_str()) {
-                let users: Vec<Value> = users_str
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| Value::String(s.into()))
-                    .collect();
-                if !users.is_empty() {
-                    entry.insert("allowFrom".into(), Value::Array(users));
-                }
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                "telegram",
+                account_id.as_deref(),
+                entry,
+            )?;
+        }
+        "zalo" => {
+            let bot_token = form_string(form_obj, "botToken");
+            let token_file = form_string(form_obj, "tokenFile");
+            if bot_token.is_empty() && token_file.is_empty() {
+                return Err("Bot Token 或 Token File 至少填写一项".into());
             }
 
-            merge_channel_entry(channels_map, "telegram", entry);
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_string(&mut entry, "botToken", bot_token);
+            put_string(&mut entry, "tokenFile", token_file);
+            put_string(
+                &mut entry,
+                "webhookUrl",
+                form_string(form_obj, "webhookUrl"),
+            );
+            put_string(
+                &mut entry,
+                "webhookSecret",
+                form_string(form_obj, "webhookSecret"),
+            );
+            put_string(
+                &mut entry,
+                "webhookPath",
+                form_string(form_obj, "webhookPath"),
+            );
+            put_string(&mut entry, "proxy", form_string(form_obj, "proxy"));
+            put_string(
+                &mut entry,
+                "responsePrefix",
+                form_string(form_obj, "responsePrefix"),
+            );
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            if let Some(value) = form_obj.get("mediaMaxMb").and_then(|v| v.as_f64()) {
+                if let Some(number) = serde_json::Number::from_f64(value) {
+                    entry.insert("mediaMaxMb".into(), Value::Number(number));
+                }
+            } else {
+                put_number_from_form(
+                    &mut entry,
+                    "mediaMaxMb",
+                    &form_string(form_obj, "mediaMaxMb"),
+                );
+            }
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "zalo")?;
+        }
+        "zalouser" => {
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_string(&mut entry, "profile", form_string(form_obj, "profile"));
+            put_string(
+                &mut entry,
+                "messagePrefix",
+                form_string(form_obj, "messagePrefix"),
+            );
+            put_string(
+                &mut entry,
+                "responsePrefix",
+                form_string(form_obj, "responsePrefix"),
+            );
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            put_bool_value_if_present(
+                &mut entry,
+                "dangerouslyAllowNameMatching",
+                form_obj.get("dangerouslyAllowNameMatching"),
+            );
+            if let Some(value) = form_obj.get("historyLimit").and_then(|v| v.as_f64()) {
+                if let Some(number) = serde_json::Number::from_f64(value) {
+                    entry.insert("historyLimit".into(), Value::Number(number));
+                }
+            } else {
+                put_number_from_form(
+                    &mut entry,
+                    "historyLimit",
+                    &form_string(form_obj, "historyLimit"),
+                );
+            }
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "zalouser")?;
         }
         "qqbot" => {
             let app_id = form_obj
@@ -805,35 +2542,48 @@ pub async fn save_messaging_platform(
             entry.insert("appId".into(), Value::String(app_id));
             entry.insert("appSecret".into(), Value::String(app_secret));
             entry.insert("enabled".into(), Value::Bool(true));
-            entry.insert("connectionMode".into(), Value::String("websocket".into()));
+            put_string(
+                &mut entry,
+                "connectionMode",
+                form_string(form_obj, "connectionMode"),
+            );
+            put_string(&mut entry, "domain", form_string(form_obj, "domain"));
+            put_string(
+                &mut entry,
+                "webhookPath",
+                form_string(form_obj, "webhookPath"),
+            );
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_string(
+                &mut entry,
+                "reactionNotifications",
+                form_string(form_obj, "reactionNotifications"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_bool_value_if_present(
+                &mut entry,
+                "typingIndicator",
+                form_obj.get("typingIndicator"),
+            );
+            put_bool_value_if_present(
+                &mut entry,
+                "resolveSenderNames",
+                form_obj.get("resolveSenderNames"),
+            );
+            put_bool_value_if_present(&mut entry, "requireMention", form_obj.get("requireMention"));
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
 
-            let domain = form_obj
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !domain.is_empty() {
-                entry.insert("domain".into(), Value::String(domain));
-            }
-
-            // 多账号模式：写入 channels.<storage_key>.accounts.<account_id>
-            if let Some(ref acct) = account_id {
-                if !acct.is_empty() {
-                    let feishu = channels_map
-                        .entry(storage_key.as_str())
-                        .or_insert_with(|| json!({ "enabled": true }));
-                    let feishu_obj = feishu.as_object_mut().ok_or("飞书节点格式错误")?;
-                    feishu_obj.entry("enabled").or_insert(Value::Bool(true));
-                    let accounts = feishu_obj.entry("accounts").or_insert_with(|| json!({}));
-                    let accounts_obj = accounts.as_object_mut().ok_or("accounts 格式错误")?;
-                    accounts_obj.insert(acct.clone(), Value::Object(entry));
-                } else {
-                    merge_channel_entry(channels_map, &storage_key, entry);
-                }
-            } else {
-                merge_channel_entry(channels_map, &storage_key, entry);
-            }
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
             ensure_plugin_allowed(&mut cfg, "openclaw-lark")?;
             // 禁用旧版 feishu 插件，防止新旧插件同时运行冲突
             disable_legacy_plugin(&mut cfg, "feishu");
@@ -884,7 +2634,13 @@ pub async fn save_messaging_platform(
                 );
             }
 
-            merge_channel_entry(channels_map, &storage_key, entry);
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
             ensure_plugin_allowed(&mut cfg, "dingtalk-connector")?;
             ensure_chat_completions_enabled(&mut cfg)?;
             let _ = cleanup_legacy_plugin_backup_dir("dingtalk-connector");
@@ -926,27 +2682,93 @@ pub async fn save_messaging_platform(
             );
             put_string(&mut entry, "teamId", form_string(form_obj, "teamId"));
             put_string(&mut entry, "appId", form_string(form_obj, "appId"));
+            put_bool_value_if_present(
+                &mut entry,
+                "userTokenReadOnly",
+                form_obj.get("userTokenReadOnly"),
+            );
+            put_bool_value_if_present(&mut entry, "requireMention", form_obj.get("requireMention"));
             put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
             put_string(
                 &mut entry,
                 "groupPolicy",
                 form_string(form_obj, "groupPolicy"),
             );
-            put_csv_array_from_form(&mut entry, "allowFrom", &form_string(form_obj, "allowFrom"));
-            merge_channel_entry(channels_map, &storage_key, entry);
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
         }
         "whatsapp" => {
             let mut entry = Map::new();
             entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            for key in [
+                "defaultTo",
+                "contextVisibility",
+                "chunkMode",
+                "reactionLevel",
+                "replyToMode",
+                "messagePrefix",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
             put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
             put_string(
                 &mut entry,
                 "groupPolicy",
                 form_string(form_obj, "groupPolicy"),
             );
-            put_csv_array_from_form(&mut entry, "allowFrom", &form_string(form_obj, "allowFrom"));
-            put_bool_from_form(&mut entry, "enabled", &form_string(form_obj, "enabled"));
-            merge_channel_entry(channels_map, &storage_key, entry);
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            for key in [
+                "configWrites",
+                "sendReadReceipts",
+                "selfChatMode",
+                "blockStreaming",
+            ] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "debounceMs",
+                "textChunkLimit",
+            ] {
+                put_number_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            let mut ack_reaction = current_saved
+                .get("ackReaction")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_string(
+                &mut ack_reaction,
+                "emoji",
+                form_string(form_obj, "ackEmoji"),
+            );
+            put_bool_value_if_present(&mut ack_reaction, "direct", form_obj.get("ackDirect"));
+            put_string(
+                &mut ack_reaction,
+                "group",
+                form_string(form_obj, "ackGroup"),
+            );
+            if !ack_reaction.is_empty() {
+                entry.insert("ackReaction".into(), Value::Object(ack_reaction));
+            }
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "whatsapp")?;
         }
         "signal" => {
             let account = form_string(form_obj, "account");
@@ -960,15 +2782,97 @@ pub async fn save_messaging_platform(
             put_string(&mut entry, "cliPath", form_string(form_obj, "cliPath"));
             put_string(&mut entry, "httpUrl", form_string(form_obj, "httpUrl"));
             put_string(&mut entry, "httpHost", form_string(form_obj, "httpHost"));
-            put_string(&mut entry, "httpPort", form_string(form_obj, "httpPort"));
+            put_number_from_form(&mut entry, "httpPort", &form_string(form_obj, "httpPort"));
+            put_string(
+                &mut entry,
+                "responsePrefix",
+                form_string(form_obj, "responsePrefix"),
+            );
             put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
             put_string(
                 &mut entry,
                 "groupPolicy",
                 form_string(form_obj, "groupPolicy"),
             );
-            put_csv_array_from_form(&mut entry, "allowFrom", &form_string(form_obj, "allowFrom"));
-            merge_channel_entry(channels_map, &storage_key, entry);
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            put_bool_value_if_present(&mut entry, "blockStreaming", form_obj.get("blockStreaming"));
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+            ] {
+                put_number_from_form(&mut entry, key, &form_string(form_obj, key));
+            }
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+        }
+        "imessage" => {
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            for key in [
+                "cliPath",
+                "dbPath",
+                "remoteHost",
+                "service",
+                "region",
+                "defaultTo",
+                "contextVisibility",
+                "chunkMode",
+                "reactionNotifications",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            put_array_from_form_value(
+                &mut entry,
+                "attachmentRoots",
+                form_obj.get("attachmentRoots"),
+            );
+            put_array_from_form_value(
+                &mut entry,
+                "remoteAttachmentRoots",
+                form_obj.get("remoteAttachmentRoots"),
+            );
+            for key in [
+                "configWrites",
+                "includeAttachments",
+                "blockStreaming",
+                "sendReadReceipts",
+                "coalesceSameSenderDms",
+            ] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "probeTimeoutMs",
+                "textChunkLimit",
+            ] {
+                put_number_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "imessage")?;
         }
         "matrix" => {
             let homeserver = form_string(form_obj, "homeserver");
@@ -997,31 +2901,148 @@ pub async fn save_messaging_platform(
                 form_string(form_obj, "groupPolicy"),
             );
             put_bool_from_form(&mut entry, "e2ee", &form_string(form_obj, "e2ee"));
-            put_csv_array_from_form(&mut entry, "allowFrom", &form_string(form_obj, "allowFrom"));
-            merge_channel_entry(channels_map, &storage_key, entry);
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
             ensure_plugin_allowed(&mut cfg, "matrix")?;
         }
         "msteams" => {
             let app_id = form_string(form_obj, "appId");
             let app_password = form_string(form_obj, "appPassword");
-            if app_id.is_empty() || app_password.is_empty() {
-                return Err("App ID 和 App Password 不能为空".into());
+            let missing_credentials = msteams_credential_missing_labels(form_obj);
+            if !missing_credentials.is_empty() {
+                return Err(format!("缺少 {}", missing_credentials.join(" / ")));
             }
 
             let mut entry = Map::new();
             entry.insert("enabled".into(), Value::Bool(true));
             put_string(&mut entry, "appId", app_id);
             put_string(&mut entry, "appPassword", app_password);
-            put_string(&mut entry, "tenantId", form_string(form_obj, "tenantId"));
+            for key in [
+                "tenantId",
+                "authType",
+                "certificatePath",
+                "certificateThumbprint",
+                "managedIdentityClientId",
+                "replyStyle",
+                "sharePointSiteId",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            let mut webhook = current_saved
+                .get("webhook")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_number_from_form(&mut webhook, "port", &form_string(form_obj, "webhookPort"));
+            put_string(&mut webhook, "path", form_string(form_obj, "webhookPath"));
+            if !webhook.is_empty() {
+                entry.insert("webhook".into(), Value::Object(webhook));
+            }
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
             put_string(
                 &mut entry,
-                "botEndpoint",
-                form_string(form_obj, "botEndpoint"),
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
             );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            for key in [
+                "useManagedIdentity",
+                "requireMention",
+                "blockStreaming",
+                "typingIndicator",
+                "welcomeCard",
+                "groupWelcomeCard",
+                "feedbackEnabled",
+                "feedbackReflection",
+            ] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+                "feedbackReflectionCooldownMs",
+            ] {
+                put_number_from_form(&mut entry, key, &form_string(form_obj, key));
+            }
+            put_array_from_form_value(&mut entry, "promptStarters", form_obj.get("promptStarters"));
+            let mut delegated_auth = current_saved
+                .get("delegatedAuth")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_bool_value_if_present(
+                &mut delegated_auth,
+                "enabled",
+                form_obj.get("delegatedAuthEnabled"),
+            );
+            put_array_from_form_value(
+                &mut delegated_auth,
+                "scopes",
+                form_obj.get("delegatedAuthScopes"),
+            );
+            if !delegated_auth.is_empty() {
+                entry.insert("delegatedAuth".into(), Value::Object(delegated_auth));
+            }
+            let mut sso = current_saved
+                .get("sso")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_bool_value_if_present(&mut sso, "enabled", form_obj.get("ssoEnabled"));
+            put_string(
+                &mut sso,
+                "connectionName",
+                form_string(form_obj, "ssoConnectionName"),
+            );
+            if !sso.is_empty() {
+                entry.insert("sso".into(), Value::Object(sso));
+            }
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "msteams")?;
+        }
+        "line" => {
+            let channel_access_token = form_string(form_obj, "channelAccessToken");
+            let token_file = form_string(form_obj, "tokenFile");
+            let channel_secret = form_string(form_obj, "channelSecret");
+            let secret_file = form_string(form_obj, "secretFile");
+            if channel_access_token.is_empty() && token_file.is_empty() {
+                return Err("Channel Access Token 或 Token File 至少填写一项".into());
+            }
+            if channel_secret.is_empty() && secret_file.is_empty() {
+                return Err("Channel Secret 或 Secret File 至少填写一项".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_string(&mut entry, "channelAccessToken", channel_access_token);
+            put_string(&mut entry, "tokenFile", token_file);
+            put_string(&mut entry, "channelSecret", channel_secret);
+            put_string(&mut entry, "secretFile", secret_file);
             put_string(
                 &mut entry,
                 "webhookPath",
                 form_string(form_obj, "webhookPath"),
+            );
+            put_string(
+                &mut entry,
+                "responsePrefix",
+                form_string(form_obj, "responsePrefix"),
             );
             put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
             put_string(
@@ -1029,9 +3050,660 @@ pub async fn save_messaging_platform(
                 "groupPolicy",
                 form_string(form_obj, "groupPolicy"),
             );
-            put_csv_array_from_form(&mut entry, "allowFrom", &form_string(form_obj, "allowFrom"));
-            merge_channel_entry(channels_map, &storage_key, entry);
-            ensure_plugin_allowed(&mut cfg, "msteams")?;
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            if let Some(value) = form_obj.get("mediaMaxMb").and_then(|v| v.as_f64()) {
+                if let Some(number) = serde_json::Number::from_f64(value) {
+                    entry.insert("mediaMaxMb".into(), Value::Number(number));
+                }
+            } else {
+                put_number_from_form(
+                    &mut entry,
+                    "mediaMaxMb",
+                    &form_string(form_obj, "mediaMaxMb"),
+                );
+            }
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "line")?;
+        }
+        "mattermost" => {
+            let bot_token = form_string(form_obj, "botToken");
+            let base_url = form_string(form_obj, "baseUrl");
+            if bot_token.is_empty() {
+                return Err("Mattermost Bot Token 不能为空".into());
+            }
+            if base_url.is_empty() {
+                return Err("Mattermost Base URL 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_string(&mut entry, "botToken", bot_token);
+            put_string(&mut entry, "baseUrl", base_url);
+            put_string(&mut entry, "name", form_string(form_obj, "name"));
+            put_string(
+                &mut entry,
+                "replyToMode",
+                form_string(form_obj, "replyToMode"),
+            );
+            put_string(
+                &mut entry,
+                "responsePrefix",
+                form_string(form_obj, "responsePrefix"),
+            );
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_bool_value_if_present(&mut entry, "requireMention", form_obj.get("requireMention"));
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            put_bool_value_if_present(
+                &mut entry,
+                "dangerouslyAllowNameMatching",
+                form_obj.get("dangerouslyAllowNameMatching"),
+            );
+
+            if form_obj.contains_key("dangerouslyAllowPrivateNetwork") {
+                let mut network = current_saved
+                    .get("network")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                match form_obj.get("dangerouslyAllowPrivateNetwork") {
+                    Some(Value::Bool(v)) => {
+                        network.insert("dangerouslyAllowPrivateNetwork".into(), Value::Bool(*v));
+                    }
+                    Some(Value::String(raw)) => {
+                        if let Some(v) = bool_from_form_value(raw) {
+                            network.insert("dangerouslyAllowPrivateNetwork".into(), Value::Bool(v));
+                        }
+                    }
+                    _ => {}
+                }
+                if !network.is_empty() {
+                    entry.insert("network".into(), Value::Object(network));
+                }
+            }
+
+            let mut commands = current_saved
+                .get("commands")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_string(
+                &mut commands,
+                "callbackPath",
+                form_string(form_obj, "callbackPath"),
+            );
+            put_string(
+                &mut commands,
+                "callbackUrl",
+                form_string(form_obj, "callbackUrl"),
+            );
+            if !commands.is_empty() {
+                entry.insert("commands".into(), Value::Object(commands));
+            }
+
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "mattermost")?;
+        }
+        "clickclack" => {
+            let base_url = form_string(form_obj, "baseUrl");
+            let token = form_string(form_obj, "token");
+            let workspace = form_string(form_obj, "workspace");
+            if base_url.is_empty() {
+                return Err("ClickClack Base URL 不能为空".into());
+            }
+            if token.is_empty() {
+                return Err("ClickClack Token 不能为空".into());
+            }
+            if workspace.is_empty() {
+                return Err("ClickClack Workspace 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            put_string(&mut entry, "baseUrl", base_url);
+            put_string(&mut entry, "token", token);
+            put_string(&mut entry, "workspace", workspace);
+            for key in [
+                "name",
+                "botUserId",
+                "agentId",
+                "replyMode",
+                "model",
+                "systemPrompt",
+                "defaultTo",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_array_from_form_value(&mut entry, "toolsAllow", form_obj.get("toolsAllow"));
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_bool_value_if_present(&mut entry, "senderIsOwner", form_obj.get("senderIsOwner"));
+            put_number_value_if_present(
+                &mut entry,
+                "timeoutSeconds",
+                form_obj.get("timeoutSeconds"),
+            );
+            put_number_value_if_present(&mut entry, "reconnectMs", form_obj.get("reconnectMs"));
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "clickclack")?;
+        }
+        "nextcloud-talk" => {
+            let base_url = form_string(form_obj, "baseUrl");
+            let bot_secret = form_string(form_obj, "botSecret");
+            let bot_secret_file = form_string(form_obj, "botSecretFile");
+            if base_url.is_empty() {
+                return Err("Nextcloud Talk Base URL 不能为空".into());
+            }
+            if bot_secret.is_empty()
+                && bot_secret_file.is_empty()
+                && !has_configured_messaging_value(form_obj.get("botSecret"))
+                && !has_configured_messaging_value(form_obj.get("botSecretFile"))
+            {
+                return Err("Nextcloud Talk Bot Secret 或 Secret File 至少填写一项".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            for key in [
+                "name",
+                "baseUrl",
+                "botSecret",
+                "botSecretFile",
+                "apiUser",
+                "apiPassword",
+                "apiPasswordFile",
+                "webhookHost",
+                "webhookPath",
+                "webhookPublicUrl",
+                "chunkMode",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_bool_value_if_present(&mut entry, "requireMention", form_obj.get("requireMention"));
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            put_bool_value_if_present(&mut entry, "blockStreaming", form_obj.get("blockStreaming"));
+            for key in [
+                "webhookPort",
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "textChunkLimit",
+            ] {
+                put_number_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            if form_obj.contains_key("dangerouslyAllowPrivateNetwork") {
+                let mut network = current_saved
+                    .get("network")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                put_bool_value_if_present(
+                    &mut network,
+                    "dangerouslyAllowPrivateNetwork",
+                    form_obj.get("dangerouslyAllowPrivateNetwork"),
+                );
+                if !network.is_empty() {
+                    entry.insert("network".into(), Value::Object(network));
+                }
+            }
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "nextcloud-talk")?;
+        }
+        "twitch" => {
+            let username = form_string(form_obj, "username");
+            let access_token = form_string(form_obj, "accessToken");
+            let client_id = form_string(form_obj, "clientId");
+            let channel = form_string(form_obj, "channel");
+            if username.is_empty() {
+                return Err("Twitch Username 不能为空".into());
+            }
+            if access_token.is_empty()
+                && !has_configured_messaging_value(form_obj.get("accessToken"))
+            {
+                return Err("Twitch Access Token 不能为空".into());
+            }
+            if client_id.is_empty() {
+                return Err("Twitch Client ID 不能为空".into());
+            }
+            if channel.is_empty() {
+                return Err("Twitch Channel 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            for key in [
+                "username",
+                "accessToken",
+                "clientId",
+                "channel",
+                "responsePrefix",
+                "clientSecret",
+                "refreshToken",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "allowedRoles", form_obj.get("allowedRoles"));
+            put_bool_value_if_present(&mut entry, "requireMention", form_obj.get("requireMention"));
+            put_number_value_if_present(&mut entry, "expiresIn", form_obj.get("expiresIn"));
+            put_number_value_if_present(
+                &mut entry,
+                "obtainmentTimestamp",
+                form_obj.get("obtainmentTimestamp"),
+            );
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "twitch")?;
+        }
+        "nostr" => {
+            let private_key = form_string(form_obj, "privateKey");
+            if private_key.is_empty() && !has_configured_messaging_value(form_obj.get("privateKey"))
+            {
+                return Err("Nostr Private Key 不能为空".into());
+            }
+
+            let root_saved = channels_map
+                .get(storage_key.as_str())
+                .cloned()
+                .unwrap_or(Value::Null);
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            for key in ["name", "defaultAccount", "privateKey", "dmPolicy"] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_array_from_form_value(&mut entry, "relays", form_obj.get("relays"));
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+
+            let mut profile = Map::new();
+            for (form_key, target_key) in [
+                ("profileName", "name"),
+                ("profileDisplayName", "displayName"),
+                ("profileAbout", "about"),
+                ("profilePicture", "picture"),
+                ("profileBanner", "banner"),
+                ("profileWebsite", "website"),
+                ("profileNip05", "nip05"),
+                ("profileLud16", "lud16"),
+            ] {
+                put_string(&mut profile, target_key, form_string(form_obj, form_key));
+            }
+            if !profile.is_empty() {
+                entry.insert("profile".into(), Value::Object(profile));
+            }
+
+            preserve_messaging_credential_refs(&mut entry, form_obj, &root_saved);
+            merge_channel_entry_for_account(channels_map, &storage_key, None, entry)?;
+            ensure_plugin_allowed(&mut cfg, "nostr")?;
+        }
+        "irc" => {
+            let host = form_string(form_obj, "host");
+            let nick = form_string(form_obj, "nick");
+            if host.is_empty() {
+                return Err("IRC Host 不能为空".into());
+            }
+            if nick.is_empty() {
+                return Err("IRC Nick 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            for key in [
+                "name",
+                "host",
+                "nick",
+                "username",
+                "realname",
+                "password",
+                "passwordFile",
+                "defaultTo",
+                "chunkMode",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "allowFrom", form_obj.get("allowFrom"));
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            put_array_from_form_value(&mut entry, "channels", form_obj.get("channels"));
+            put_array_from_form_value(
+                &mut entry,
+                "mentionPatterns",
+                form_obj.get("mentionPatterns"),
+            );
+            if let Some(groups) = build_irc_groups_from_form(form_obj) {
+                entry.insert("groups".into(), groups);
+            }
+            for key in ["tls", "blockStreaming", "dangerouslyAllowNameMatching"] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "port",
+                "historyLimit",
+                "dmHistoryLimit",
+                "mediaMaxMb",
+                "textChunkLimit",
+            ] {
+                put_number_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+
+            let mut nickserv = current_saved
+                .get("nickserv")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_bool_value_if_present(&mut nickserv, "enabled", form_obj.get("nickservEnabled"));
+            put_string(
+                &mut nickserv,
+                "service",
+                form_string(form_obj, "nickservService"),
+            );
+            match resolve_messaging_credential_value_for_save_alias(
+                form_obj,
+                current_saved.get("nickserv").unwrap_or(&Value::Null),
+                "nickservPassword",
+                "password",
+            ) {
+                Some(value) => {
+                    nickserv.insert("password".into(), value);
+                }
+                None => {
+                    nickserv.remove("password");
+                }
+            }
+            match resolve_messaging_credential_value_for_save_alias(
+                form_obj,
+                current_saved.get("nickserv").unwrap_or(&Value::Null),
+                "nickservPasswordFile",
+                "passwordFile",
+            ) {
+                Some(value) => {
+                    nickserv.insert("passwordFile".into(), value);
+                }
+                None => {
+                    nickserv.remove("passwordFile");
+                }
+            }
+            put_bool_value_if_present(&mut nickserv, "register", form_obj.get("nickservRegister"));
+            put_string(
+                &mut nickserv,
+                "registerEmail",
+                form_string(form_obj, "nickservRegisterEmail"),
+            );
+            if !nickserv.is_empty() {
+                entry.insert("nickserv".into(), Value::Object(nickserv));
+            }
+
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "irc")?;
+        }
+        "tlon" => {
+            let ship = form_string(form_obj, "ship");
+            let url = form_string(form_obj, "url");
+            let code = form_string(form_obj, "code");
+            if ship.is_empty() {
+                return Err("Tlon Ship 不能为空".into());
+            }
+            if url.is_empty() {
+                return Err("Tlon URL 不能为空".into());
+            }
+            if code.is_empty() && !has_configured_messaging_value(form_obj.get("code")) {
+                return Err("Tlon Code 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_bool_value_if_present(&mut entry, "enabled", form_obj.get("enabled"));
+            for key in ["name", "ship", "url", "responsePrefix", "ownerShip"] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+            match resolve_messaging_credential_value_for_save(form_obj, &current_saved, "code") {
+                Some(value) => {
+                    entry.insert("code".into(), value);
+                }
+                None => {
+                    entry.remove("code");
+                }
+            }
+            for key in [
+                "groupChannels",
+                "dmAllowlist",
+                "groupInviteAllowlist",
+                "defaultAuthorizedShips",
+            ] {
+                put_array_from_form_value(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "autoDiscoverChannels",
+                "showModelSignature",
+                "autoAcceptDmInvites",
+                "autoAcceptGroupInvites",
+            ] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            if form_obj.contains_key("dangerouslyAllowPrivateNetwork") {
+                let mut network = current_saved
+                    .get("network")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                put_bool_value_if_present(
+                    &mut network,
+                    "dangerouslyAllowPrivateNetwork",
+                    form_obj.get("dangerouslyAllowPrivateNetwork"),
+                );
+                if !network.is_empty() {
+                    entry.insert("network".into(), Value::Object(network));
+                }
+            }
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            let target_account_id =
+                if account_id.as_deref().map(str::trim) == Some(QQBOT_DEFAULT_ACCOUNT_ID) {
+                    None
+                } else {
+                    account_id.as_deref()
+                };
+            merge_channel_entry_for_account(channels_map, &storage_key, target_account_id, entry)?;
+            ensure_plugin_allowed(&mut cfg, "tlon")?;
+        }
+        "synology-chat" => {
+            let token = form_string(form_obj, "token");
+            let incoming_url = form_string(form_obj, "incomingUrl");
+            if token.is_empty() {
+                return Err("Synology Chat Token 不能为空".into());
+            }
+            if incoming_url.is_empty() {
+                return Err("Synology Chat Incoming URL 不能为空".into());
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            put_string(&mut entry, "token", token);
+            put_string(&mut entry, "incomingUrl", incoming_url);
+            put_string(&mut entry, "nasHost", form_string(form_obj, "nasHost"));
+            put_string(
+                &mut entry,
+                "webhookPath",
+                form_string(form_obj, "webhookPath"),
+            );
+            put_string(&mut entry, "botName", form_string(form_obj, "botName"));
+            put_string(&mut entry, "dmPolicy", form_string(form_obj, "dmPolicy"));
+            put_array_from_form_value(&mut entry, "allowedUserIds", form_obj.get("allowedUserIds"));
+            if let Some(value) = form_obj.get("rateLimitPerMinute").and_then(|v| v.as_f64()) {
+                if let Some(number) = serde_json::Number::from_f64(value) {
+                    entry.insert("rateLimitPerMinute".into(), Value::Number(number));
+                }
+            } else {
+                put_number_from_form(
+                    &mut entry,
+                    "rateLimitPerMinute",
+                    &form_string(form_obj, "rateLimitPerMinute"),
+                );
+            }
+            put_bool_value_if_present(
+                &mut entry,
+                "dangerouslyAllowNameMatching",
+                form_obj.get("dangerouslyAllowNameMatching"),
+            );
+            put_bool_value_if_present(
+                &mut entry,
+                "dangerouslyAllowInheritedWebhookPath",
+                form_obj.get("dangerouslyAllowInheritedWebhookPath"),
+            );
+            put_bool_value_if_present(
+                &mut entry,
+                "allowInsecureSsl",
+                form_obj.get("allowInsecureSsl"),
+            );
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "synology-chat")?;
+        }
+        "googlechat" => {
+            let has_service_account =
+                has_configured_messaging_value(form_obj.get("serviceAccount"))
+                    || has_configured_messaging_value(form_obj.get("serviceAccountFile"))
+                    || has_configured_messaging_value(form_obj.get("serviceAccountRef"));
+            if !has_service_account {
+                return Err(
+                    "Google Chat 需要填写 Service Account JSON、Service Account File 或 SecretRef"
+                        .into(),
+                );
+            }
+
+            let mut entry = Map::new();
+            entry.insert("enabled".into(), Value::Bool(true));
+            for key in [
+                "serviceAccount",
+                "serviceAccountFile",
+                "serviceAccountRef",
+                "audienceType",
+                "audience",
+                "appPrincipal",
+                "webhookPath",
+                "webhookUrl",
+                "botUser",
+                "chunkMode",
+                "replyToMode",
+                "typingIndicator",
+                "responsePrefix",
+            ] {
+                put_string(&mut entry, key, form_string(form_obj, key));
+            }
+
+            let mut dm = current_saved
+                .get("dm")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            put_string(&mut dm, "policy", form_string(form_obj, "dmPolicy"));
+            let allow_from = json_array_from_csv_value(form_obj.get("allowFrom"));
+            if !allow_from.is_empty() {
+                dm.insert("allowFrom".into(), Value::Array(allow_from));
+            }
+            if !dm.is_empty() {
+                entry.insert("dm".into(), Value::Object(dm));
+            }
+
+            put_string(
+                &mut entry,
+                "groupPolicy",
+                form_string(form_obj, "groupPolicy"),
+            );
+            put_array_from_form_value(&mut entry, "groupAllowFrom", form_obj.get("groupAllowFrom"));
+            for key in [
+                "dangerouslyAllowNameMatching",
+                "requireMention",
+                "allowBots",
+                "blockStreaming",
+            ] {
+                put_bool_value_if_present(&mut entry, key, form_obj.get(key));
+            }
+            for key in [
+                "historyLimit",
+                "dmHistoryLimit",
+                "textChunkLimit",
+                "mediaMaxMb",
+            ] {
+                if let Some(value) = form_obj.get(key).and_then(|v| v.as_f64()) {
+                    if let Some(number) = serde_json::Number::from_f64(value) {
+                        entry.insert(key.into(), Value::Number(number));
+                    }
+                } else {
+                    put_number_from_form(&mut entry, key, &form_string(form_obj, key));
+                }
+            }
+
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
+            ensure_plugin_allowed(&mut cfg, "googlechat")?;
         }
         _ => {
             // 通用平台：直接保存表单字段
@@ -1040,7 +3712,13 @@ pub async fn save_messaging_platform(
                 entry.insert(k.clone(), v.clone());
             }
             entry.insert("enabled".into(), Value::Bool(true));
-            merge_channel_entry(channels_map, &storage_key, entry);
+            preserve_messaging_credential_refs(&mut entry, form_obj, &current_saved);
+            merge_channel_entry_for_account(
+                channels_map,
+                &storage_key,
+                account_id.as_deref(),
+                entry,
+            )?;
         }
     }
 
@@ -1166,12 +3844,45 @@ pub async fn verify_bot_token(platform: String, form: Value) -> Result<Value, St
         "feishu" => verify_feishu(&client, form_obj).await,
         "dingtalk" | "dingtalk-connector" => verify_dingtalk(&client, form_obj).await,
         "slack" => verify_slack(&client, form_obj).await,
+        "zalo" => verify_zalo(&client, form_obj).await,
+        "zalouser" => Ok(json!({
+            "valid": true,
+            "warnings": ["Zalo Personal 通过二维码登录维护本地会话；请使用 openclaw channels status --probe 检查登录状态"]
+        })),
         "matrix" => verify_matrix(&client, form_obj).await,
         "signal" => verify_signal(&client, form_obj).await,
         "msteams" => verify_msteams(&client, form_obj).await,
+        "imessage" => Ok(json!({
+            "valid": true,
+            "warnings": ["iMessage 使用本机或远端桥接运行，无需在线校验 Bot Token；请通过 Gateway 日志确认桥接进程状态"]
+        })),
         "whatsapp" => Ok(json!({
             "valid": true,
             "warnings": ["WhatsApp 使用扫码登录，无需在线校验凭证；请通过「启动扫码登录」完成配对"]
+        })),
+        "clickclack" => Ok(json!({
+            "valid": true,
+            "warnings": ["ClickClack 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
+        })),
+        "nextcloud-talk" => Ok(json!({
+            "valid": true,
+            "warnings": ["Nextcloud Talk 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
+        })),
+        "twitch" => Ok(json!({
+            "valid": true,
+            "warnings": ["Twitch 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
+        })),
+        "nostr" => Ok(json!({
+            "valid": true,
+            "warnings": ["Nostr 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
+        })),
+        "irc" => Ok(json!({
+            "valid": true,
+            "warnings": ["IRC 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
+        })),
+        "tlon" => Ok(json!({
+            "valid": true,
+            "warnings": ["Tlon 面板已完成基础字段校验；实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证"]
         })),
         _ => Ok(json!({
             "valid": true,
@@ -1674,18 +4385,25 @@ const OPENCLAW_QQBOT_EXTENSION_FOLDER: &str = "openclaw-qqbot";
 const QQBOT_DEFAULT_ACCOUNT_ID: &str = "default";
 
 fn qqbot_channel_has_credentials(val: &Value) -> bool {
-    val.get("appId")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.trim().is_empty())
+    val.get("appId").is_some_and(secret_like_value_present)
         || val
             .get("clientSecret")
             .or_else(|| val.get("appSecret"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty())
-        || val
-            .get("token")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty())
+            .is_some_and(secret_like_value_present)
+        || val.get("token").is_some_and(secret_like_value_present)
+}
+
+fn secret_like_value_present(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| !s.trim().is_empty()) || secret_ref_placeholder(value).is_some()
+}
+
+fn account_display_value(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|v| {
+        v.as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| secret_ref_placeholder(v))
+    })
 }
 
 // ── QQ 插件：扩展目录可能是 ~/.openclaw/extensions/openclaw-qqbot（官方包）或旧版 qqbot 目录 ──
@@ -1790,13 +4508,55 @@ pub async fn diagnose_channel(
     platform: String,
     account_id: Option<String>,
 ) -> Result<Value, String> {
-    match platform.as_str() {
-        "qqbot" => diagnose_qqbot_channel(account_id).await,
-        _ => Err(format!(
-            "暂不支持平台「{}」的深度诊断（当前仅实现 qqbot）",
-            platform
-        )),
+    let platform = platform.trim().to_string();
+    if platform.is_empty() {
+        return Err("platform 不能为空".into());
     }
+    if platform == "qqbot" {
+        return diagnose_qqbot_channel(account_id).await;
+    }
+
+    let cfg = super::config::load_openclaw_json().unwrap_or_else(|_| json!({}));
+    let storage_key = platform_storage_key(&platform);
+    let normalized_account_id = account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let channel_root = cfg.get("channels").and_then(|c| c.get(storage_key));
+    let channel_enabled = channel_root
+        .and_then(|node| node.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let saved =
+        read_platform_config(platform.clone(), normalized_account_id.map(str::to_string)).await?;
+    let config_exists = saved
+        .get("exists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let form = saved
+        .get("values")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let credentials_ready = channel_diagnosis_credentials_ready(&platform, &form);
+    let (verify_result, verify_error) = if config_exists && credentials_ready {
+        match verify_bot_token(platform.clone(), Value::Object(form.clone())).await {
+            Ok(result) => (Some(result), None),
+            Err(error) => (None, Some(error)),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(build_openclaw_channel_diagnosis(
+        &platform,
+        normalized_account_id,
+        config_exists,
+        channel_enabled,
+        &form,
+        verify_result,
+        verify_error,
+    ))
 }
 
 /// 一键修复 QQ 插件：未安装则安装官方包并重启 Gateway；已安装则补齐 plugins.allow / entries 并重载 Gateway。
@@ -2044,8 +4804,13 @@ pub async fn list_configured_platforms() -> Result<Value, String> {
             if let Some(accts) = val.get("accounts").and_then(|a| a.as_object()) {
                 for (acct_id, acct_val) in accts {
                     let mut entry = json!({ "accountId": acct_id });
-                    if let Some(app_id) = acct_val.get("appId").and_then(|v| v.as_str()) {
-                        entry["appId"] = Value::String(app_id.to_string());
+                    if let Some(display_id) = account_display_value(acct_val, "appId")
+                        .or_else(|| account_display_value(acct_val, "clientId"))
+                        .or_else(|| account_display_value(acct_val, "account"))
+                        .or_else(|| account_display_value(acct_val, "nick"))
+                        .or_else(|| account_display_value(acct_val, "ship"))
+                    {
+                        entry["appId"] = Value::String(display_id);
                     }
                     accounts.push(entry);
                 }
@@ -2490,8 +5255,18 @@ async fn verify_msteams(
     if app_id.is_empty() {
         return Ok(json!({ "valid": false, "errors": ["App ID 不能为空"] }));
     }
+    let missing_credentials = msteams_credential_missing_labels(form);
+    if !missing_credentials.is_empty() {
+        return Ok(
+            json!({ "valid": false, "errors": [format!("缺少 {}", missing_credentials.join(" / "))] }),
+        );
+    }
     if app_password.is_empty() {
-        return Ok(json!({ "valid": false, "errors": ["App Password 不能为空"] }));
+        return Ok(json!({
+            "valid": true,
+            "warnings": ["当前 Teams 认证模式不使用 Client Secret；面板已完成结构校验，实际连通性请通过 Gateway 启动日志或 openclaw channels status --probe 验证。"],
+            "details": [format!("App ID: {}", app_id)]
+        }));
     }
 
     let token_url = format!(
@@ -3482,21 +6257,14 @@ pub async fn save_agent_binding(
                 let has_account = ch
                     .get("accounts")
                     .and_then(|a| a.get(acct.as_str()))
-                    .map(|acct_val| {
-                        acct_val
-                            .get("appId")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .is_some()
-                    })
+                    .map(value_has_messaging_credential)
                     .unwrap_or(false);
 
                 if !has_account {
                     let has_root = ch
-                        .get("appId")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .is_some();
+                        .as_object()
+                        .map(channel_root_has_messaging_credential)
+                        .unwrap_or(false);
                     if has_root {
                         warnings.push(format!(
                             "账号「{}」在 channels.{}.accounts 下未找到对应配置，\
@@ -3508,7 +6276,7 @@ pub async fn save_agent_binding(
                         warnings.push(format!(
                             "账号「{}」在 channels.{}.accounts 下未找到对应配置，\
                          该绑定可能无法正常路由消息。\
-                         请先在渠道列表中为账号「{}」接入飞书应用。",
+                         请先在渠道列表中为账号「{}」接入对应渠道账号。",
                             acct, channel, acct
                         ));
                     }
@@ -3716,6 +6484,64 @@ async fn verify_telegram(
     }
 }
 
+// ── Zalo Bot 凭证校验 ─────────────────────────────────────
+
+async fn verify_zalo(client: &reqwest::Client, form: &Map<String, Value>) -> Result<Value, String> {
+    let bot_token = form
+        .get("botToken")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let token_file = form
+        .get("tokenFile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if bot_token.is_empty() {
+        if token_file.is_empty() {
+            return Ok(json!({ "valid": false, "errors": ["请填写 Bot Token 或 Token File"] }));
+        }
+        return Ok(json!({
+            "valid": true,
+            "warnings": ["已配置 Token File；桌面端不会读取外部文件做在线校验"]
+        }));
+    }
+
+    let resp = client
+        .post(format!(
+            "https://bot-api.zaloplatforms.com/bot{}/getMe",
+            bot_token
+        ))
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Zalo API 连接失败: {}", e))?;
+
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析响应失败: {}", e))?;
+
+    if body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(json!({
+            "valid": true,
+            "errors": [],
+            "details": ["Zalo Bot Token 已通过 getMe 校验"]
+        }))
+    } else {
+        let msg = body
+            .get("description")
+            .or_else(|| body.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Zalo Bot Token 无效");
+        Ok(json!({
+            "valid": false,
+            "errors": [msg]
+        }))
+    }
+}
+
 // ── 飞书凭证校验 ──────────────────────────────────────
 
 async fn verify_feishu(
@@ -3858,5 +6684,984 @@ async fn verify_dingtalk(
             "valid": false,
             "errors": [msg]
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_channel_form_adds_telegram_access_defaults() {
+        let form = json!({
+            "botToken": "123:token"
+        });
+        let normalized =
+            normalize_messaging_platform_form("telegram", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("botToken").and_then(|v| v.as_str()),
+            Some("123:token")
+        );
+        assert_eq!(
+            normalized.get("dmPolicy").and_then(|v| v.as_str()),
+            Some("pairing")
+        );
+        assert_eq!(
+            normalized.get("groupPolicy").and_then(|v| v.as_str()),
+            Some("allowlist")
+        );
+    }
+
+    #[test]
+    fn normalize_channel_form_converts_legacy_ui_policy_values() {
+        let form = json!({
+            "mode": "socket",
+            "botToken": "xoxb-token",
+            "appToken": "xapp-token",
+            "dmPolicy": "allow",
+            "groupPolicy": "mentioned"
+        });
+        let normalized =
+            normalize_messaging_platform_form("slack", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("dmPolicy").and_then(|v| v.as_str()),
+            Some("open")
+        );
+        assert_eq!(
+            normalized
+                .get("allowFrom")
+                .and_then(|v| v.as_array())
+                .cloned(),
+            Some(vec![Value::String("*".into())])
+        );
+        assert_eq!(
+            normalized.get("groupPolicy").and_then(|v| v.as_str()),
+            Some("open")
+        );
+        assert_eq!(
+            normalized.get("requireMention").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("webhookPath").and_then(|v| v.as_str()),
+            Some("/slack/events")
+        );
+        assert_eq!(
+            normalized
+                .get("userTokenReadOnly")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn normalize_channel_form_avoids_unsupported_top_level_require_mention() {
+        let form = json!({
+            "account": "+15551234567",
+            "dmPolicy": "deny",
+            "groupPolicy": "mentioned"
+        });
+        let normalized =
+            normalize_messaging_platform_form("signal", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("dmPolicy").and_then(|v| v.as_str()),
+            Some("disabled")
+        );
+        assert_eq!(
+            normalized.get("groupPolicy").and_then(|v| v.as_str()),
+            Some("open")
+        );
+        assert!(!normalized.contains_key("requireMention"));
+    }
+
+    #[test]
+    fn normalize_channel_form_adds_feishu_required_defaults() {
+        let form = json!({
+            "appId": "cli_a",
+            "appSecret": "secret",
+            "domain": ""
+        });
+        let normalized =
+            normalize_messaging_platform_form("feishu", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("domain").and_then(|v| v.as_str()),
+            Some("feishu")
+        );
+        assert_eq!(
+            normalized.get("connectionMode").and_then(|v| v.as_str()),
+            Some("websocket")
+        );
+        assert_eq!(
+            normalized.get("webhookPath").and_then(|v| v.as_str()),
+            Some("/feishu/events")
+        );
+        assert_eq!(
+            normalized.get("dmPolicy").and_then(|v| v.as_str()),
+            Some("pairing")
+        );
+        assert_eq!(
+            normalized.get("groupPolicy").and_then(|v| v.as_str()),
+            Some("allowlist")
+        );
+        assert_eq!(
+            normalized
+                .get("reactionNotifications")
+                .and_then(|v| v.as_str()),
+            Some("off")
+        );
+        assert_eq!(
+            normalized.get("typingIndicator").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("resolveSenderNames")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn normalize_imessage_form_preserves_bridge_runtime_fields() {
+        let form = json!({
+            "dmPolicy": "allowlist",
+            "allowFrom": "+15551234567, +15557654321",
+            "groupPolicy": "allowlist",
+            "groupAllowFrom": "chat-guid-1, chat-guid-2",
+            "probeTimeoutMs": "5000",
+            "attachmentRoots": "/Users/me/Downloads, /tmp/imessage",
+            "includeAttachments": "true",
+            "sendReadReceipts": "false"
+        });
+        let normalized =
+            normalize_messaging_platform_form("imessage", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("dmPolicy").and_then(|v| v.as_str()),
+            Some("allowlist")
+        );
+        assert_eq!(
+            normalized.get("probeTimeoutMs").and_then(|v| v.as_f64()),
+            Some(5000.0)
+        );
+        assert_eq!(
+            normalized
+                .get("includeAttachments")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("sendReadReceipts").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            normalized
+                .get("attachmentRoots")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready("imessage", &normalized));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("imessage", None, true, true, &normalized, None, None);
+        assert_eq!(
+            diagnosis
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|v| v.as_str()) == Some("credentials")))
+                .and_then(|item| item.get("title"))
+                .and_then(|v| v.as_str()),
+            Some("桥接运行配置")
+        );
+    }
+
+    #[test]
+    fn normalize_whatsapp_form_preserves_scan_runtime_fields() {
+        let form = json!({
+            "enabled": "true",
+            "configWrites": "true",
+            "sendReadReceipts": "false",
+            "selfChatMode": "true",
+            "dmPolicy": "allowlist",
+            "allowFrom": "+15551234567, +15557654321",
+            "groupPolicy": "allowlist",
+            "groupAllowFrom": "120363@g.us, 120364@g.us",
+            "debounceMs": "800",
+            "mediaMaxMb": "50",
+            "ackDirect": "true",
+            "ackGroup": "mentions"
+        });
+        let normalized =
+            normalize_messaging_platform_form("whatsapp", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("configWrites").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("sendReadReceipts").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            normalized.get("selfChatMode").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("debounceMs").and_then(|v| v.as_f64()),
+            Some(800.0)
+        );
+        assert_eq!(
+            normalized.get("mediaMaxMb").and_then(|v| v.as_f64()),
+            Some(50.0)
+        );
+        assert_eq!(
+            normalized.get("ackDirect").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("allowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("groupAllowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready("whatsapp", &normalized));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("whatsapp", None, true, true, &normalized, None, None);
+        assert_eq!(
+            diagnosis
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|v| v.as_str()) == Some("credentials")))
+                .and_then(|item| item.get("title"))
+                .and_then(|v| v.as_str()),
+            Some("扫码/会话配置")
+        );
+    }
+
+    #[test]
+    fn normalize_clickclack_form_preserves_workspace_runtime_fields() {
+        let form = json!({
+            "enabled": "true",
+            "baseUrl": "https://clickclack.example.com",
+            "token": "clickclack-token",
+            "workspace": "ops",
+            "replyMode": "model",
+            "timeoutSeconds": "120",
+            "toolsAllow": "shell, browser.search",
+            "senderIsOwner": "true",
+            "defaultTo": "channel:ops",
+            "allowFrom": "channel:ops, dm:alice",
+            "reconnectMs": "2500"
+        });
+        let normalized =
+            normalize_messaging_platform_form("clickclack", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("timeoutSeconds").and_then(|v| v.as_f64()),
+            Some(120.0)
+        );
+        assert_eq!(
+            normalized.get("reconnectMs").and_then(|v| v.as_f64()),
+            Some(2500.0)
+        );
+        assert_eq!(
+            normalized.get("senderIsOwner").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("toolsAllow")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("allowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready(
+            "clickclack",
+            &normalized
+        ));
+
+        let missing_workspace = json!({
+            "baseUrl": "https://clickclack.example.com",
+            "token": "clickclack-token"
+        });
+        let missing = normalize_messaging_platform_form(
+            "clickclack",
+            missing_workspace.as_object().expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready("clickclack", &missing));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("clickclack", None, true, true, &missing, None, None);
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Workspace"));
+    }
+
+    #[test]
+    fn normalize_nextcloud_talk_form_preserves_self_hosted_runtime_fields() {
+        let form = json!({
+            "enabled": "true",
+            "baseUrl": "https://cloud.example.com",
+            "botSecret": "bot-secret",
+            "apiUser": "openclaw-bot",
+            "apiPassword": "app-password",
+            "webhookPort": "8788",
+            "webhookHost": "0.0.0.0",
+            "webhookPath": "/nextcloud-talk-webhook",
+            "webhookPublicUrl": "https://panel.example.com/nextcloud-talk-webhook",
+            "dmPolicy": "allowlist",
+            "allowFrom": "alice, bob",
+            "groupPolicy": "mentioned",
+            "groupAllowFrom": "room-token-1, room-token-2",
+            "historyLimit": "80",
+            "dmHistoryLimit": "20",
+            "mediaMaxMb": "50",
+            "textChunkLimit": "4000",
+            "chunkMode": "newline",
+            "blockStreaming": "true",
+            "dangerouslyAllowPrivateNetwork": "true"
+        });
+        let normalized =
+            normalize_messaging_platform_form("nextcloud-talk", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("webhookPort").and_then(|v| v.as_f64()),
+            Some(8788.0)
+        );
+        assert_eq!(
+            normalized.get("historyLimit").and_then(|v| v.as_f64()),
+            Some(80.0)
+        );
+        assert_eq!(
+            normalized.get("blockStreaming").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("dangerouslyAllowPrivateNetwork")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("groupPolicy").and_then(|v| v.as_str()),
+            Some("open")
+        );
+        assert_eq!(
+            normalized.get("requireMention").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("allowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("groupAllowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready(
+            "nextcloud-talk",
+            &normalized
+        ));
+
+        let missing_secret = json!({
+            "baseUrl": "https://cloud.example.com"
+        });
+        let missing = normalize_messaging_platform_form(
+            "nextcloud-talk",
+            missing_secret.as_object().expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready(
+            "nextcloud-talk",
+            &missing
+        ));
+        let diagnosis = build_openclaw_channel_diagnosis(
+            "nextcloud-talk",
+            None,
+            true,
+            true,
+            &missing,
+            None,
+            None,
+        );
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Bot Secret 或 Secret File"));
+    }
+
+    #[test]
+    fn normalize_twitch_form_preserves_chat_runtime_fields() {
+        let form = json!({
+            "enabled": "true",
+            "username": "openclaw",
+            "accessToken": "oauth:abc123",
+            "clientId": "client-123",
+            "channel": "openclaw",
+            "allowFrom": "123456, 789012",
+            "allowedRoles": "moderator, vip",
+            "requireMention": "true",
+            "responsePrefix": "[AI]",
+            "clientSecret": "client-secret",
+            "refreshToken": "refresh-token",
+            "expiresIn": "3600",
+            "obtainmentTimestamp": "1779490000"
+        });
+        let normalized =
+            normalize_messaging_platform_form("twitch", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("allowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("allowedRoles")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized.get("requireMention").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("expiresIn").and_then(|v| v.as_f64()),
+            Some(3600.0)
+        );
+        assert_eq!(
+            normalized
+                .get("obtainmentTimestamp")
+                .and_then(|v| v.as_f64()),
+            Some(1779490000.0)
+        );
+        assert!(channel_diagnosis_credentials_ready("twitch", &normalized));
+
+        let missing = normalize_messaging_platform_form(
+            "twitch",
+            json!({
+                "username": "openclaw",
+                "clientId": "client-123",
+                "channel": "openclaw"
+            })
+            .as_object()
+            .expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready("twitch", &missing));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("twitch", None, true, true, &missing, None, None);
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Access Token"));
+    }
+
+    #[test]
+    fn normalize_nostr_form_preserves_relay_access_and_profile_fields() {
+        let form = json!({
+            "enabled": "true",
+            "name": "nostr-bot",
+            "defaultAccount": "default",
+            "privateKey": "nsec1example",
+            "relays": "wss://relay.damus.io, wss://nos.lol",
+            "dmPolicy": "allowlist",
+            "allowFrom": "npub1sender, 0123456789abcdef",
+            "profileName": "openclaw",
+            "profileDisplayName": "OpenClaw Bot",
+            "profileAbout": "Nostr DM assistant",
+            "profilePicture": "https://example.com/avatar.png",
+            "profileWebsite": "https://example.com",
+            "profileNip05": "openclaw@example.com",
+            "profileLud16": "openclaw@example.com"
+        });
+        let normalized =
+            normalize_messaging_platform_form("nostr", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("dmPolicy").and_then(|v| v.as_str()),
+            Some("allowlist")
+        );
+        assert_eq!(
+            normalized
+                .get("relays")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("allowFrom")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready("nostr", &normalized));
+
+        let missing = normalize_messaging_platform_form(
+            "nostr",
+            json!({
+                "relays": "wss://relay.damus.io"
+            })
+            .as_object()
+            .expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready("nostr", &missing));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("nostr", None, true, true, &missing, None, None);
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Private Key"));
+    }
+
+    #[test]
+    fn normalize_irc_form_preserves_server_nickserv_and_group_fields() {
+        let form = json!({
+            "enabled": "true",
+            "host": "irc.libera.chat",
+            "port": "6697",
+            "tls": "true",
+            "nick": "openclaw-bot",
+            "username": "openclaw",
+            "realname": "OpenClaw Bot",
+            "passwordFile": "/run/secrets/irc-password",
+            "nickservEnabled": "true",
+            "nickservService": "NickServ",
+            "nickservPasswordFile": "/run/secrets/irc-nickserv",
+            "nickservRegister": "false",
+            "channels": "#openclaw, #ops",
+            "dmPolicy": "allowlist",
+            "allowFrom": "alice!ident@example.org, bob",
+            "groupPolicy": "allowlist",
+            "groups": "#openclaw, #ops",
+            "groupAllowFrom": "alice!ident@example.org",
+            "requireMention": "false",
+            "mentionPatterns": "openclaw:, @openclaw",
+            "historyLimit": "80",
+            "dmHistoryLimit": "20",
+            "mediaMaxMb": "25",
+            "textChunkLimit": "350",
+            "blockStreaming": "true",
+            "dangerouslyAllowNameMatching": "true"
+        });
+        let normalized =
+            normalize_messaging_platform_form("irc", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("port").and_then(|v| v.as_f64()),
+            Some(6697.0)
+        );
+        assert_eq!(normalized.get("tls").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            normalized
+                .get("channels")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("groups")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized.get("requireMention").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            normalized.get("nickservEnabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized.get("nickservRegister").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            normalized
+                .get("mentionPatterns")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert!(channel_diagnosis_credentials_ready("irc", &normalized));
+
+        let groups = build_irc_groups_from_form(&normalized).expect("groups");
+        assert_eq!(
+            groups
+                .get("#openclaw")
+                .and_then(|group| group.get("requireMention"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let missing = normalize_messaging_platform_form(
+            "irc",
+            json!({
+                "host": "irc.libera.chat"
+            })
+            .as_object()
+            .expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready("irc", &missing));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("irc", None, true, true, &missing, None, None);
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Nick"));
+    }
+
+    #[test]
+    fn verify_irc_token_returns_probe_guidance_warning() {
+        let result = tauri::async_runtime::block_on(verify_bot_token(
+            "irc".to_string(),
+            json!({
+                "host": "irc.libera.chat",
+                "nick": "openclaw-bot"
+            }),
+        ))
+        .expect("verify result");
+
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(true));
+        assert!(result
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("IRC 面板已完成基础字段校验"));
+    }
+
+    #[test]
+    fn normalize_tlon_form_preserves_ship_login_and_invite_fields() {
+        let form = json!({
+            "enabled": "true",
+            "name": "Main Ship",
+            "ship": "~sampel-palnet",
+            "url": "https://urbit.example.com",
+            "code": "lidlut-tabwed-pillex-ridrup",
+            "dangerouslyAllowPrivateNetwork": "true",
+            "groupChannels": "chat/~host-ship/general, chat/~host-ship/support",
+            "dmAllowlist": "zod, ~nec",
+            "groupInviteAllowlist": "~bus",
+            "autoDiscoverChannels": "true",
+            "showModelSignature": "false",
+            "responsePrefix": "[Tlon]",
+            "autoAcceptDmInvites": "true",
+            "autoAcceptGroupInvites": "false",
+            "ownerShip": "~sampel-palnet",
+            "defaultAuthorizedShips": "~zod, ~nec"
+        });
+        let normalized =
+            normalize_messaging_platform_form("tlon", form.as_object().expect("object"));
+
+        assert_eq!(
+            normalized.get("enabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("dangerouslyAllowPrivateNetwork")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("groupChannels")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("dmAllowlist")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("groupInviteAllowlist")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(1)
+        );
+        assert_eq!(
+            normalized
+                .get("defaultAuthorizedShips")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            normalized
+                .get("autoDiscoverChannels")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("showModelSignature")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            normalized
+                .get("autoAcceptDmInvites")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            normalized
+                .get("autoAcceptGroupInvites")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(channel_diagnosis_credentials_ready("tlon", &normalized));
+
+        let missing = normalize_messaging_platform_form(
+            "tlon",
+            json!({
+                "ship": "~sampel-palnet",
+                "url": "https://urbit.example.com"
+            })
+            .as_object()
+            .expect("object"),
+        );
+        assert!(!channel_diagnosis_credentials_ready("tlon", &missing));
+        let diagnosis =
+            build_openclaw_channel_diagnosis("tlon", None, true, true, &missing, None, None);
+        assert!(diagnosis
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("id").and_then(|v| v.as_str()) == Some("credentials") }))
+            .and_then(|item| item.get("detail"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Code"));
+    }
+
+    #[test]
+    fn verify_tlon_token_returns_probe_guidance_warning() {
+        let result = tauri::async_runtime::block_on(verify_bot_token(
+            "tlon".to_string(),
+            json!({
+                "ship": "~sampel-palnet",
+                "url": "https://urbit.example.com",
+                "code": "lidlut-tabwed-pillex-ridrup"
+            }),
+        ))
+        .expect("verify result");
+
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(true));
+        assert!(result
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Tlon 面板已完成基础字段校验"));
+    }
+
+    #[test]
+    fn channel_form_readback_preserves_mention_policy_choice() {
+        let saved = json!({
+            "groupPolicy": "open",
+            "requireMention": true,
+            "allowFrom": ["U123"]
+        });
+        let mut form = Map::new();
+        insert_access_policy_form_values(&mut form, &saved, false, true);
+
+        assert_eq!(
+            form.get("groupPolicy").and_then(|v| v.as_str()),
+            Some("mentioned")
+        );
+        assert_eq!(form.get("allowFrom").and_then(|v| v.as_str()), Some("U123"));
+    }
+
+    #[test]
+    fn channel_form_readback_masks_secret_refs() {
+        let saved = json!({
+            "botToken": {
+                "source": "env",
+                "provider": "default",
+                "id": "TELEGRAM_BOT_TOKEN"
+            }
+        });
+        let mut form = Map::new();
+        insert_secret_aware_form_value(&mut form, &saved, "botToken");
+
+        assert_eq!(
+            form.get("botToken").and_then(|v| v.as_str()),
+            Some("SecretRef(env:default:TELEGRAM_BOT_TOKEN)")
+        );
+        assert_eq!(
+            form.get("__secretRefs")
+                .and_then(|v| v.get("botToken"))
+                .cloned(),
+            saved.get("botToken").cloned()
+        );
+    }
+
+    #[test]
+    fn channel_save_preserves_unchanged_secret_ref_placeholder() {
+        let current = json!({
+            "botToken": {
+                "source": "env",
+                "provider": "default",
+                "id": "SLACK_BOT_TOKEN"
+            }
+        });
+        let form = json!({
+            "botToken": "SecretRef(env:default:SLACK_BOT_TOKEN)"
+        });
+        let value = resolve_messaging_credential_value_for_save(
+            form.as_object().expect("object"),
+            &current,
+            "botToken",
+        );
+
+        assert_eq!(value, current.get("botToken").cloned());
+    }
+
+    #[test]
+    fn channel_save_replaces_secret_ref_when_user_enters_new_secret() {
+        let current = json!({
+            "token": {
+                "source": "env",
+                "provider": "default",
+                "id": "DISCORD_BOT_TOKEN"
+            }
+        });
+        let form = json!({
+            "token": "new-discord-token"
+        });
+        let value = resolve_messaging_credential_value_for_save(
+            form.as_object().expect("object"),
+            &current,
+            "token",
+        );
+
+        assert_eq!(value, Some(Value::String("new-discord-token".into())));
+    }
+
+    #[test]
+    fn messaging_credential_detection_accepts_non_app_id_channels() {
+        for account in [
+            json!({ "botToken": "telegram-token" }),
+            json!({ "token": "discord-token" }),
+            json!({ "botToken": "xoxb-token", "appToken": "xapp-token" }),
+            json!({ "clientId": "teams-client-id" }),
+        ] {
+            assert!(value_has_messaging_credential(&account));
+        }
+
+        assert!(!value_has_messaging_credential(&json!({
+            "enabled": true,
+            "dmPolicy": "pairing"
+        })));
+    }
+
+    #[test]
+    fn messaging_credential_detection_accepts_secret_refs() {
+        let account = json!({
+            "token": {
+                "source": "env",
+                "provider": "default",
+                "id": "DISCORD_BOT_TOKEN"
+            }
+        });
+
+        assert!(value_has_messaging_credential(&account));
     }
 }
