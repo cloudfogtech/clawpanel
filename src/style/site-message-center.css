@@ -213,6 +213,14 @@
   font-size: var(--font-size-sm);
   line-height: 1.55;
 }
+.site-message-dismissed-empty {
+  border-style: solid;
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg-card));
+}
+.site-message-dismissed-empty .btn {
+  margin-top: 4px;
+  min-height: 34px;
+}
 .site-message-section-head {
   display: flex;
   align-items: baseline;

@@ -271,6 +271,74 @@
 }
 [data-engine="xintian"] .xt-hero-meta-sep { opacity: 0.5; }
 
+[data-engine="xintian"] .xt-hero-proof {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 26px auto 0;
+  max-width: 760px;
+}
+
+[data-engine="xintian"] .xt-proof {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--xt-border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--xt-surface-1) 82%, transparent);
+  box-shadow: 0 10px 24px -18px rgba(27, 20, 16, 0.18);
+  text-align: left;
+}
+
+[data-engine="xintian"] .xt-proof-ico {
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 24px;
+  border-radius: 8px;
+  background: var(--xt-accent-soft);
+  color: var(--xt-accent);
+}
+
+[data-engine="xintian"] .xt-proof-ico svg {
+  width: 14px;
+  height: 14px;
+}
+
+[data-engine="xintian"] .xt-proof-copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+[data-engine="xintian"] .xt-proof-copy strong {
+  color: var(--xt-ink-primary);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+[data-engine="xintian"] .xt-proof-copy span {
+  color: var(--xt-ink-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+@media (max-width: 980px) {
+  [data-engine="xintian"] .xt-hero-proof {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-width: 520px;
+  }
+}
+
+@media (max-width: 520px) {
+  [data-engine="xintian"] .xt-hero-proof {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ==========================================================================
  * 4 · Buttons
  * ========================================================================== */

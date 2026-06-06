@@ -9,12 +9,16 @@ import { toast } from './toast.js'
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0'
 import { t, getLang, setLang, getAvailableLangs } from '../lib/i18n.js'
 import { isFeatureAvailable } from '../lib/feature-gates.js'
-import { getKernelSnapshot } from '../lib/kernel.js'
+import { getKernelSnapshot, recommendedIsNewer } from '../lib/kernel.js'
 import { triggerKernelUpgrade } from '../lib/kernel-upgrade.js'
 import { getActiveEngine, getActiveEngineId, listEngines, needsInitialEngineChoice, isEngineSetupDeferred, switchEngine, onEngineChange } from '../lib/engine-manager.js'
 
 // 当用户点 "暂时不升级" 时，本地会话内不再显示升级提示
 const SS_DISMISSED_KERNEL_UPGRADE = 'clawpanel_kernel_upgrade_dismissed'
+const KERNEL_POLICY_TTL = 5 * 60 * 1000
+let _kernelPolicyInfo = null
+let _kernelPolicyFetchedAt = 0
+let _kernelPolicyLoading = false
 
 function NAV_ITEMS_FULL() { return [
   {
@@ -282,6 +286,7 @@ export function renderSidebar(el) {
 
   el.innerHTML = html
   window.dispatchEvent(new CustomEvent('clawpanel:site-message-launcher-mounted'))
+  _ensureKernelPolicyInfo(el)
 
   // 应用折叠态（桌面端）
   _setDesktopSidebarCollapsed(collapsed)
@@ -422,6 +427,34 @@ export function renderSidebar(el) {
 
 function _escSidebar(s) { return String(s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;') }
 
+function _kernelPolicyTarget(snap) {
+  return _kernelPolicyInfo?.recommended || snap?.target || ''
+}
+
+function _isRunningGatewayBelowTarget(snap) {
+  if (!snap?.version) return false
+  const target = _kernelPolicyTarget(snap)
+  return target ? recommendedIsNewer(target, snap.version) : !snap.isLatest
+}
+
+function _ensureKernelPolicyInfo(el) {
+  const snap = getKernelSnapshot()
+  if (getActiveEngineId() !== 'openclaw' || !snap?.version) return
+  const now = Date.now()
+  if (_kernelPolicyLoading) return
+  if (_kernelPolicyInfo && now - _kernelPolicyFetchedAt < KERNEL_POLICY_TTL) return
+
+  _kernelPolicyLoading = true
+  api.getVersionInfo()
+    .then(info => {
+      _kernelPolicyInfo = info || null
+      _kernelPolicyFetchedAt = Date.now()
+      if (el?.isConnected) renderSidebar(el)
+    })
+    .catch(() => {})
+    .finally(() => { _kernelPolicyLoading = false })
+}
+
 /**
  * 渲染"内核可升级"卡片。
  *
@@ -429,7 +462,7 @@ function _escSidebar(s) { return String(s || '').replace(/</g, '&lt;').replace(/
  * - 当前引擎是 openclaw
  * - 已成功握手 Gateway（snapshot 有 version）
  * - 高于硬地板（< floor 由 floor-blocker 接管）
- * - 低于推荐目标（!isLatest）
+ * - 运行中的 Gateway 低于推荐目标
  * - 用户未在本会话中点击过 "暂不升级"
  *
  * 不满足任何一条返回空串。
@@ -441,13 +474,13 @@ function _renderKernelUpgradeHint() {
   const snap = getKernelSnapshot()
   if (!snap || !snap.version) return ''
   if (!snap.aboveFloor) return ''   // floor-blocker 处理
-  if (snap.isLatest) return ''       // 已经是推荐目标
+  if (!_isRunningGatewayBelowTarget(snap)) return '' // 运行中的 Gateway 已经达到推荐目标
 
   const arrowIcon = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>'
   const sparkIcon = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L13.5 8.5 20 10l-6.5 1.5L12 18l-1.5-6.5L4 10l6.5-1.5z"/></svg>'
 
   const fromLabel = snap.versionLabel || snap.version
-  const toLabel = snap.target || ''
+  const toLabel = _kernelPolicyTarget(snap)
 
   return `
     <div class="kernel-upgrade-hint" id="kernel-upgrade-hint" role="button" tabindex="0">

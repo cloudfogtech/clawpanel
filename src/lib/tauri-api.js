@@ -255,6 +255,7 @@ export async function checkBackendHealth() {
 let _reloadTimer = null
 function _debouncedReloadGateway() {
   clearTimeout(_reloadTimer)
+  if (!isTauriRuntime()) return
   _reloadTimer = setTimeout(() => { invoke('reload_gateway').catch(() => {}) }, 3000)
 }
 

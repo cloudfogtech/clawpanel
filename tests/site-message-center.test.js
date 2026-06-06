@@ -40,3 +40,37 @@ test('官网公告接口按 displayType 分流并过滤非客户端 surface', ()
   assert.equal(normalized.notifications[0].title, '客户端通知')
   assert.equal(normalized.announcements[0].title, '系统公告')
 })
+
+test('官网公告接口兼容 modal/notification 类型', () => {
+  const normalized = normalizeSiteMessagePayload({
+    announcements: [
+      {
+        id: 4,
+        type: 'modal',
+        displayType: 'modal',
+        targetSurface: 'client',
+        level: 'warning',
+        title: '客户端弹窗测试',
+        body: '客户端弹窗测试',
+        dismissKey: 'client-modal-202606',
+        updatedAt: '2026-06-06T07:25:40Z',
+      },
+      {
+        id: 3,
+        type: 'notification',
+        displayType: 'notification',
+        targetSurface: 'client',
+        level: 'info',
+        title: '客户端通知测试',
+        body: '客户端通知测试',
+        dismissKey: 'client-notification-202606',
+        updatedAt: '2026-06-06T07:25:28Z',
+      },
+    ],
+  })
+
+  assert.equal(normalized.notifications.length, 1)
+  assert.equal(normalized.announcements.length, 1)
+  assert.equal(normalized.notifications[0].title, '客户端通知测试')
+  assert.equal(normalized.announcements[0].title, '客户端弹窗测试')
+})

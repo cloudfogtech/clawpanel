@@ -96,7 +96,7 @@ async function loadXintianData(page) {
     </div>
     <div class="stat-card">
       <div class="stat-card-header"><span class="stat-card-label">心甜Claw</span></div>
-      <div class="stat-card-value" style="font-size:var(--font-size-md)">Windows</div>
+      <div class="stat-card-value" style="font-size:var(--font-size-md)">Windows / macOS / Linux</div>
       <div class="stat-card-meta" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <a class="btn btn-primary btn-sm" href="https://xtclaw.xtnet.cc/download" target="_blank" rel="noopener" style="padding:2px 8px;font-size:var(--font-size-xs)">${t('engine.xtCtaDownloadWin')}</a>
         <a class="btn btn-secondary btn-sm" href="https://xtclaw.xtnet.cc/" target="_blank" rel="noopener" style="padding:2px 8px;font-size:var(--font-size-xs)">${t('engine.xtCtaVisitSite')}</a>

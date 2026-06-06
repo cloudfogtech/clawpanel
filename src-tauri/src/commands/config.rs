@@ -2325,6 +2325,27 @@ fn detect_installed_source() -> String {
     }
 }
 
+fn detect_active_cli_install_mode() -> &'static str {
+    let Some(cli_path) = crate::utils::resolve_openclaw_cli_path() else {
+        return "unknown";
+    };
+    let resolved = std::fs::canonicalize(&cli_path)
+        .ok()
+        .unwrap_or_else(|| PathBuf::from(&cli_path));
+    let source = crate::utils::classify_cli_source(&resolved.to_string_lossy());
+    if source == "standalone" {
+        "standalone"
+    } else if source == "npm-zh" || source == "npm-official" || source == "npm-global" {
+        "npm"
+    } else {
+        "unknown"
+    }
+}
+
+fn should_fallback_standalone_to_npm(current_install_mode: &str, method: &str) -> bool {
+    method == "auto" && current_install_mode != "standalone"
+}
+
 #[tauri::command]
 pub async fn get_version_info() -> Result<VersionInfo, String> {
     let current = get_local_version().await;
@@ -3680,6 +3701,7 @@ async fn upgrade_openclaw_inner(
     let _guardian_pause = GuardianPause::new("upgrade");
 
     let current_source = detect_installed_source();
+    let current_install_mode = detect_active_cli_install_mode();
     let pkg_name = npm_package_name(&source);
     let requested_version = version.clone();
     let recommended_version = recommended_version_for(&source);
@@ -3744,12 +3766,16 @@ async fn upgrade_openclaw_inner(
                             return Ok(msg);
                         }
                         Err(gh_reason) => {
-                            if method == "auto" {
+                            if should_fallback_standalone_to_npm(current_install_mode, &method) {
                                 let _ = app.emit(
                                     "upgrade-log",
                                     format!("standalone 不可用（GitHub: {gh_reason}），降级到 npm 安装..."),
                                 );
                                 let _ = app.emit("upgrade-progress", 5);
+                            } else if method == "auto" {
+                                return Err(format!(
+                                    "当前 OpenClaw 使用 standalone 独立包模式，已阻止自动降级到 npm 全局安装。请稍后重试独立包升级，或在升级方式中手动选择 npm。standalone 安装失败: CDN={cdn_reason}, GitHub={gh_reason}"
+                                ));
                             } else {
                                 return Err(format!(
                                     "standalone 安装失败: CDN={cdn_reason}, GitHub={gh_reason}"
@@ -6463,77 +6489,12 @@ pub fn patch_model_vision() -> Result<bool, String> {
     Ok(changed)
 }
 
-/// 检查 ClawPanel 自身是否有新版本（官网 → GitHub → Gitee 自动降级）
+/// 检查 ClawPanel 自身是否有新版本（官网唯一发现源）
 #[tauri::command]
 pub async fn check_panel_update() -> Result<Value, String> {
-    if let Ok(site) = super::site_api::site_latest_for_panel_update().await {
-        return Ok(site);
-    }
-
-    let client =
-        crate::commands::build_http_client(std::time::Duration::from_secs(8), Some("ClawPanel"))
-            .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-
-    // 先尝试 GitHub，失败后降级 Gitee
-    let sources = [
-        (
-            "https://api.github.com/repos/qingchencloud/clawpanel/releases/latest",
-            "https://github.com/qingchencloud/clawpanel/releases",
-            "github",
-        ),
-        (
-            "https://gitee.com/api/v5/repos/QtCodeCreators/clawpanel/releases/latest",
-            "https://gitee.com/QtCodeCreators/clawpanel/releases",
-            "gitee",
-        ),
-    ];
-
-    let mut last_err = String::new();
-    for (api_url, releases_url, source) in &sources {
-        match client.get(*api_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let json: Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("解析响应失败: {e}"))?;
-
-                let tag = json
-                    .get("tag_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim_start_matches('v')
-                    .to_string();
-
-                if tag.is_empty() {
-                    last_err = format!("{source}: 未找到版本号");
-                    continue;
-                }
-
-                let mut result = serde_json::Map::new();
-                result.insert("latest".into(), Value::String(tag));
-                result.insert(
-                    "url".into(),
-                    json.get("html_url")
-                        .cloned()
-                        .unwrap_or(Value::String(releases_url.to_string())),
-                );
-                result.insert("source".into(), Value::String(source.to_string()));
-                result.insert(
-                    "downloadUrl".into(),
-                    Value::String("https://claw.qt.cool".into()),
-                );
-                return Ok(Value::Object(result));
-            }
-            Ok(resp) => {
-                last_err = format!("{source}: HTTP {}", resp.status());
-            }
-            Err(e) => {
-                last_err = format!("{source}: {e}");
-            }
-        }
-    }
-
-    Err(last_err)
+    super::site_api::site_latest_for_panel_update()
+        .await
+        .map_err(|e| format!("官网版本接口不可用: {e}"))
 }
 
 // === 面板配置 (clawpanel.json) ===

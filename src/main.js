@@ -443,6 +443,7 @@ function _genCaptcha() {
 function renderLoginLanguageSwitch() {
   const langs = getAvailableLangs()
   const current = getLang()
+  const currentLang = langs.find(lang => lang.code === current) || langs[0]
   const options = langs.map(lang => `
     <option value="${escapeHtml(lang.code)}" ${lang.code === current ? 'selected' : ''}>
       ${escapeHtml(lang.label)} · ${escapeHtml(lang.code)}
@@ -450,10 +451,11 @@ function renderLoginLanguageSwitch() {
   `).join('')
   return `
     <label class="login-lang-switch">
-      <span>Language</span>
+      <span class="login-lang-label">Language</span>
       <select id="login-lang-select" aria-label="Language">
         ${options}
       </select>
+      <span class="login-lang-current">${escapeHtml(currentLang?.code || current)}</span>
     </label>
   `
 }
@@ -464,37 +466,49 @@ function showLoginOverlay(defaultPw) {
   overlay.id = 'login-overlay'
   let _captcha = _loginFailCount >= CAPTCHA_THRESHOLD ? _genCaptcha() : null
   const securityLabel = t('sidebar.security')
-  const accessPasswordField = '<code style="background:rgba(99,102,241,.1);padding:1px 5px;border-radius:3px;font-size:10px">accessPassword</code>'
-  const resetPath = '<code style="background:rgba(99,102,241,.1);padding:2px 6px;border-radius:3px;font-size:10px;word-break:break-all">~/.openclaw/clawpanel.json</code>'
+  const accessPasswordField = '<code>accessPassword</code>'
+  const resetPath = '<code>~/.openclaw/clawpanel.json</code>'
   overlay.innerHTML = `
     <div class="login-card">
-      ${renderLoginLanguageSwitch()}
-      ${_logoSvg}
-      <div class="login-title">ClawPanel</div>
-      <div class="login-desc">${hasDefault
-        ? `${t('security.firstLoginHint')}<br><span style="font-size:12px;color:#6366f1;font-weight:600">${t('security.firstLoginChangeHint', { security: securityLabel })}</span>`
-        : (isTauri ? t('security.appLocked') : t('security.loginPrompt'))}</div>
+      <div class="login-topbar">
+        <div class="login-brand">
+          <span class="login-brand-mark"><img src="/images/logo.png" alt="" aria-hidden="true"></span>
+          <div class="login-brand-copy">
+            <span class="login-brand-kicker">claw.qt.cool</span>
+            <span class="login-title">ClawPanel</span>
+          </div>
+        </div>
+        ${renderLoginLanguageSwitch()}
+      </div>
+      <div class="login-copy">
+        <div class="login-heading">${hasDefault ? t('security.firstLoginHint') : (isTauri ? t('security.appLocked') : t('security.loginPrompt'))}</div>
+        ${hasDefault
+          ? `<div class="login-security-note">${statusIcon('warn', 14)}<span>${t('security.firstLoginChangeHint', { security: securityLabel })}</span></div>`
+          : `<div class="login-desc">${t('security.accessPasswordPlaceholder')}</div>`}
+      </div>
       <form id="login-form">
-        <input class="login-input" type="${hasDefault ? 'text' : 'password'}" id="login-pw" placeholder="${t('security.accessPasswordPlaceholder')}" autocomplete="current-password" autofocus value="${hasDefault ? defaultPw : ''}" />
-        <div id="login-captcha" style="display:${_captcha ? 'block' : 'none'};margin-bottom:10px">
-          <div style="font-size:12px;color:#888;margin-bottom:6px">${t('security.captchaPrompt')}<strong id="captcha-q" style="color:var(--text-primary,#333)">${_captcha ? _captcha.q : ''}</strong></div>
-          <input class="login-input" type="number" id="login-captcha-input" placeholder="${t('security.captchaPlaceholder')}" style="text-align:center" />
+        <div class="login-field">
+          <input class="login-input" type="${hasDefault ? 'text' : 'password'}" id="login-pw" placeholder="${t('security.accessPasswordPlaceholder')}" autocomplete="current-password" autofocus value="${hasDefault ? defaultPw : ''}" />
+        </div>
+        <div id="login-captcha" class="login-captcha" style="display:${_captcha ? 'block' : 'none'}">
+          <div class="login-captcha-label">${t('security.captchaPrompt')}<strong id="captcha-q">${_captcha ? _captcha.q : ''}</strong></div>
+          <input class="login-input login-captcha-input" type="number" id="login-captcha-input" placeholder="${t('security.captchaPlaceholder')}" />
         </div>
         <button class="login-btn" type="submit">${t('security.loginAction')}</button>
         <div class="login-error" id="login-error"></div>
       </form>
-      ${!hasDefault ? `<details class="login-forgot" style="margin-top:16px;text-align:center">
-        <summary style="font-size:11px;color:#aaa;cursor:pointer;list-style:none;user-select:none">${t('security.forgotPassword')}</summary>
-        <div style="margin-top:8px;font-size:11px;color:#888;line-height:1.8;text-align:left;background:rgba(0,0,0,.03);border-radius:8px;padding:10px 14px">
+      ${!hasDefault ? `<details class="login-forgot">
+        <summary>${t('security.forgotPassword')}</summary>
+        <div class="login-forgot-body">
           ${isTauri
             ? `${t('security.resetPasswordLocal', { field: accessPasswordField })}<br>${resetPath}`
             : `${t('security.resetPasswordRemote', { field: accessPasswordField })}<br>${resetPath}`
           }
         </div>
       </details>` : ''}
-      <div style="margin-top:${hasDefault ? '20' : '12'}px;font-size:11px;color:#aaa;text-align:center">
-        <a href="https://claw.qt.cool" target="_blank" rel="noopener" style="color:#aaa;text-decoration:none">claw.qt.cool</a>
-        <span style="margin:0 6px">·</span>v${APP_VERSION}
+      <div class="login-footer">
+        <a href="https://claw.qt.cool" target="_blank" rel="noopener">claw.qt.cool</a>
+        <span>v${APP_VERSION}</span>
       </div>
     </div>
   `
@@ -904,13 +918,15 @@ async function autoConnectWebSocket() {
     }
 
     // 统一 reload Gateway（配对 origins + vision patch 合并为一次 reload）
-    if (needReload) {
+    if (needReload && isTauriRuntime()) {
       try {
         await api.reloadGateway()
         console.log('[main] Gateway 已重载')
       } catch (reloadErr) {
         console.warn('[main] reloadGateway 失败（非致命）:', reloadErr)
       }
+    } else if (needReload) {
+      console.log('[main] Web/headless 模式跳过自动 reload Gateway')
     }
 
     // TCP 端口就绪探测：等待 Gateway 端口可达后再发起 WS 连接（仅 Tauri 桌面端）

@@ -2132,8 +2132,8 @@
       "failurePrefix": "カーネルのアップグレードに失敗:"
     },
     "upgradeHint": {
-      "title": "新しいカーネルが利用可能",
-      "subtitle": "{from} → {to}、クリックでアップグレード",
+      "title": "実行中の Gateway をアップグレードできます",
+      "subtitle": "Gateway {from} → 推奨 {to}",
       "dismissTooltip": "このセッションでは再表示しない"
     }
   },

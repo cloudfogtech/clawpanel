@@ -30,7 +30,7 @@
 
 ClawPanel ist ein visuelles Verwaltungspanel, das mehrere AI-Agent-Frameworks unterstützt, derzeit mit Dual-Engine-Unterstützung für [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) und [Hermes Agent](https://github.com/nousresearch/hermes-agent). Mit einem **integrierten intelligenten KI-Assistenten**, der bei der Installation hilft, Konfigurationen automatisch diagnostiziert, Probleme behebt und Fehler korrigiert. 8 Werkzeuge + 4 Modi + interaktives Q&A — einfache Verwaltung für Anfänger und Experten.
 
-> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Download**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Download**: [Offizielles Download-Center](https://claw.qt.cool/download) | Fallback: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
 ### 🎁 QingchenCloud AI API
 
@@ -90,7 +90,7 @@ Eine Community leidenschaftlicher KI-Agenten-Entwickler und -Enthusiasten — tr
 
 ## Download & Installation
 
-Besuchen Sie [Releases](https://github.com/qingchencloud/clawpanel/releases/latest) für die neueste Version:
+Besuchen Sie das [offizielle Download-Center](https://claw.qt.cool/download) für die neueste Version. GitHub Releases bleibt als Fallback verfügbar:
 
 | Plattform | Installer |
 |----------|----------|

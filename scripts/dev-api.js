@@ -31,7 +31,7 @@ const HERMES_PROVIDER_REGISTRY = [
   hermesProvider('gemini', 'Google AI Studio', 'api_key', 'https://generativelanguage.googleapis.com/v1beta/openai', 'GEMINI_BASE_URL', ['GOOGLE_API_KEY', 'GEMINI_API_KEY'], 'openai_chat', 'openai', ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemma-4-31b-it', 'gemma-4-26b-it']),
   hermesProvider('deepseek', 'DeepSeek', 'api_key', 'https://api.deepseek.com', 'DEEPSEEK_BASE_URL', ['DEEPSEEK_API_KEY'], 'openai_chat', 'openai', ['deepseek-chat', 'deepseek-reasoner']),
   hermesProvider('xai', 'xAI', 'api_key', 'https://api.x.ai/v1', 'XAI_BASE_URL', ['XAI_API_KEY'], 'openai_chat', 'openai', ['grok-4.20-reasoning', 'grok-4-1-fast-reasoning']),
-  hermesProvider('minimax', 'MiniMax (International)', 'api_key', 'https://api.minimax.io/anthropic/v1', 'MINIMAX_BASE_URL', ['MINIMAX_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2', 'MiniMax-M2-highspeed']),
+  hermesProvider('minimax', 'MiniMax (International)', 'api_key', 'https://api.minimax.io/anthropic/v1', 'MINIMAX_BASE_URL', ['MINIMAX_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed']),
   hermesProvider('huggingface', 'Hugging Face', 'api_key', 'https://router.huggingface.co/v1', 'HF_BASE_URL', ['HF_TOKEN'], 'openai_chat', 'openai', ['Qwen/Qwen3.5-397B-A17B', 'Qwen/Qwen3.5-35B-A3B', 'deepseek-ai/DeepSeek-V3.2', 'moonshotai/Kimi-K2.5', 'MiniMaxAI/MiniMax-M2.5', 'zai-org/GLM-5', 'XiaomiMiMo/MiMo-V2-Flash', 'moonshotai/Kimi-K2-Thinking'], true),
   hermesProvider('arcee', 'Arcee AI', 'api_key', 'https://api.arcee.ai/api/v1', 'ARCEE_BASE_URL', ['ARCEEAI_API_KEY'], 'openai_chat', 'openai', []),
   hermesProvider('azure-foundry', 'Azure Foundry', 'api_key', '', 'AZURE_FOUNDRY_BASE_URL', ['AZURE_FOUNDRY_API_KEY'], 'openai_chat', 'openai', [], true),
@@ -45,7 +45,7 @@ const HERMES_PROVIDER_REGISTRY = [
   hermesProvider('kimi-coding-cn', 'Kimi / Moonshot (China)', 'api_key', 'https://api.moonshot.cn/v1', '', ['KIMI_CN_API_KEY'], 'openai_chat', 'openai', ['kimi-for-coding', 'kimi-k2.6', 'kimi-k2.5', 'kimi-k2-thinking', 'kimi-k2-turbo-preview']),
   hermesProvider('alibaba', 'Alibaba Cloud (DashScope)', 'api_key', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', 'DASHSCOPE_BASE_URL', ['DASHSCOPE_API_KEY'], 'openai_chat', 'openai', ['qwen3.5-plus', 'qwen3-coder-plus', 'qwen3-coder-next', 'glm-5', 'glm-4.7', 'kimi-k2.5', 'MiniMax-M2.5']),
   hermesProvider('alibaba-coding-plan', 'Alibaba Cloud (Coding Plan)', 'api_key', 'https://coding-intl.dashscope.aliyuncs.com/v1', 'ALIBABA_CODING_PLAN_BASE_URL', ['ALIBABA_CODING_PLAN_API_KEY', 'DASHSCOPE_API_KEY'], 'openai_chat', 'openai', ['qwen3-coder-plus', 'qwen3-coder-next', 'qwen3.5-plus', 'qwen3.5-coder']),
-  hermesProvider('minimax-cn', 'MiniMax (China)', 'api_key', 'https://api.minimaxi.com/v1', 'MINIMAX_CN_BASE_URL', ['MINIMAX_CN_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2', 'MiniMax-M2-highspeed']),
+  hermesProvider('minimax-cn', 'MiniMax (China)', 'api_key', 'https://api.minimaxi.com/v1', 'MINIMAX_CN_BASE_URL', ['MINIMAX_CN_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed']),
   hermesProvider('xiaomi', 'Xiaomi MiMo', 'api_key', 'https://api.xiaomimimo.com/v1', 'XIAOMI_BASE_URL', ['XIAOMI_API_KEY'], 'openai_chat', 'openai', ['mimo-v2-pro', 'mimo-v2-omni', 'mimo-v2-flash']),
   hermesProvider('bedrock', 'AWS Bedrock', 'aws_sdk', 'https://bedrock-runtime.us-east-1.amazonaws.com', 'BEDROCK_BASE_URL', [], 'anthropic_messages', 'none', []),
   hermesProvider('openrouter', 'OpenRouter', 'api_key', 'https://openrouter.ai/api/v1', 'OPENAI_BASE_URL', ['OPENROUTER_API_KEY'], 'openai_chat', 'openai', [], true),
@@ -57,7 +57,7 @@ const HERMES_PROVIDER_REGISTRY = [
   hermesProvider('openai-codex', 'OpenAI Codex', 'oauth_external', 'https://chatgpt.com/backend-api/codex', '', [], 'codex_responses', 'none', ['gpt-5.5', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.2-codex', 'gpt-5.1-codex-max', 'gpt-5.1-codex-mini'], false, 'hermes auth login openai-codex'),
   hermesProvider('qwen-oauth', 'Qwen OAuth', 'oauth_external', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', '', [], 'openai_chat', 'none', ['qwen3.5-plus', 'qwen3-coder-plus', 'qwen3-coder-next'], false, 'hermes auth login qwen-oauth'),
   hermesProvider('google-gemini-cli', 'Google Gemini (OAuth)', 'oauth_external', 'https://generativelanguage.googleapis.com/v1beta/openai', '', [], 'openai_chat', 'none', ['gemini-2.5-pro', 'gemini-2.5-flash'], false, 'hermes auth login google-gemini-cli'),
-  hermesProvider('minimax-oauth', 'MiniMax (OAuth)', 'oauth_minimax', 'https://api.minimax.io/anthropic', '', [], 'anthropic_messages', 'none', ['MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2', 'MiniMax-M2-highspeed'], false, 'hermes auth login minimax-oauth'),
+  hermesProvider('minimax-oauth', 'MiniMax (OAuth)', 'oauth_minimax', 'https://api.minimax.io/anthropic', '', [], 'anthropic_messages', 'none', ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed'], false, 'hermes auth login minimax-oauth'),
   hermesProvider('copilot-acp', 'GitHub Copilot ACP', 'external_process', 'http://127.0.0.1:0', 'COPILOT_ACP_BASE_URL', [], 'openai_chat', 'none', ['gpt-4o', 'gpt-4.1', 'claude-3.5-sonnet', 'claude-3.7-sonnet'], false, 'hermes auth login copilot-acp'),
   hermesProvider('custom', 'Custom OpenAI-Compatible', 'api_key', '', 'OPENAI_BASE_URL', ['OPENAI_API_KEY', 'CUSTOM_API_KEY'], 'openai_chat', 'openai', [], true),
 ]
@@ -665,12 +665,12 @@ function resolveOpenclawCliPath() {
 }
 
 function scanAllOpenclawInstallations(activePath = resolveOpenclawCliPath()) {
-  const activeIdentity = scanCliIdentity(activePath)
+  const activeIdentity = cliIdentityKey(activePath)
   return collectAllCliCandidates().map(candidate => ({
     path: candidate,
     source: classifyCliSource(candidate) || 'unknown',
     version: readVersionFromInstallation(candidate),
-    active: !!activeIdentity && scanCliIdentity(candidate) === activeIdentity,
+    active: !!activeIdentity && cliIdentityKey(candidate) === activeIdentity,
   })).sort((a, b) => {
     if (a.active !== b.active) return a.active ? -1 : 1
     const sourceCmp = String(a.source || '').localeCompare(String(b.source || ''))
@@ -702,6 +702,11 @@ function canonicalLowerPathForConflict(rawPath) {
   return text
 }
 
+function cliIdentityKey(rawPath) {
+  const identity = scanCliIdentity(rawPath)
+  return identity ? canonicalLowerPathForConflict(identity) : ''
+}
+
 function standaloneConflictDirs() {
   const dirs = []
   try { dirs.push(standaloneInstallDir()) } catch {}
@@ -716,12 +721,46 @@ function isStandaloneConflictPath(cliPath, source = '') {
   return standaloneConflictDirs().some(dir => canon === dir || canon.startsWith(`${dir}/`))
 }
 
+function gatewayOwnerProtectedCliPath() {
+  const owner = readGatewayOwner()
+  if (!owner) return null
+  const startedBy = owner.startedBy || owner.started_by
+  if (startedBy && startedBy !== 'clawpanel') return null
+  const ownerDir = owner.openclawDir || owner.openclaw_dir
+  if (ownerDir && path.resolve(ownerDir) !== path.resolve(OPENCLAW_DIR)) return null
+  const ownerPort = Number(owner.port || 0)
+  if (ownerPort && ownerPort !== readGatewayPort()) return null
+  return owner.cliPath || owner.cli_path || null
+}
+
+function activeOpenclawCliIdentityKeys(options = {}) {
+  const identities = new Set()
+  const add = rawPath => {
+    const key = cliIdentityKey(rawPath)
+    if (key) identities.add(key)
+  }
+  add(resolveOpenclawCliPath())
+  add(gatewayOwnerProtectedCliPath())
+  for (const rawPath of Array.isArray(options.activeCliPaths) ? options.activeCliPaths : []) {
+    add(rawPath)
+  }
+  return identities
+}
+
+function isActiveOpenclawCliPath(cliPath, options = {}) {
+  const key = cliIdentityKey(cliPath)
+  return !!key && activeOpenclawCliIdentityKeys(options).has(key)
+}
+
 export function buildOpenclawPathConflictRecords(installations = scanAllOpenclawInstallations()) {
   const seen = new Set()
   const records = []
+  const activeIdentities = activeOpenclawCliIdentityKeys()
   for (const item of Array.isArray(installations) ? installations : []) {
     const cliPath = item?.path
     if (!cliPath || isStandaloneConflictPath(cliPath, item.source)) continue
+    const cliIdentity = cliIdentityKey(cliPath)
+    if (item.active || (cliIdentity && activeIdentities.has(cliIdentity))) continue
     const key = canonicalLowerPathForConflict(cliPath) || String(cliPath)
     if (seen.has(key)) continue
     seen.add(key)
@@ -751,6 +790,9 @@ export function quarantineOpenclawPathForWeb(rawPath, options = {}) {
   if (!stat.isFile()) throw new Error(`不是文件: ${rawPath}`)
   if (isStandaloneConflictPath(original, classifyCliSource(original))) {
     throw new Error('拒绝隔离 standalone 安装目录下的 OpenClaw（这是当前运行版本）')
+  }
+  if (isActiveOpenclawCliPath(original, options)) {
+    throw new Error('拒绝隔离正在被 Gateway 使用的 OpenClaw（请先停止 Gateway 或切换 CLI 路径）')
   }
   const fileName = path.basename(original)
   if (!fileName.toLowerCase().startsWith('openclaw')) {
@@ -1610,6 +1652,18 @@ function detectInstalledSource() {
     if (out.includes('openclaw-zh@')) return 'chinese'
   } catch {}
   return 'official'
+}
+
+function detectActiveCliInstallMode() {
+  const activeCliPath = resolveOpenclawCliPath()
+  const activeCliSource = classifyCliSource(activeCliPath)
+  if (activeCliSource === 'standalone') return 'standalone'
+  if (['npm-zh', 'npm-official', 'npm-global'].includes(activeCliSource)) return 'npm'
+  return 'unknown'
+}
+
+export function shouldFallbackStandaloneToNpm({ currentInstallMode = 'unknown', method = 'auto' } = {}) {
+  return method === 'auto' && currentInstallMode !== 'standalone'
 }
 
 function getLocalOpenclawVersion() {
@@ -11379,6 +11433,7 @@ const handlers = {
 
   async upgrade_openclaw({ source = 'chinese', version, method = 'auto' } = {}) {
     const currentSource = detectInstalledSource()
+    const currentInstallMode = detectActiveCliInstallMode()
     const pkg = npmPackageName(source)
     const recommended = recommendedVersionFor(source)
     const ver = version || recommended || 'latest'
@@ -11425,8 +11480,10 @@ const handlers = {
               return logs.join('\n')
             }
           } catch (e) {
-            if (method === 'auto') {
+            if (shouldFallbackStandaloneToNpm({ currentInstallMode, method })) {
               logs.push(`standalone 不可用（GitHub: ${e.message}），降级到 npm 安装...`)
+            } else if (method === 'auto') {
+              throw new Error(`当前 OpenClaw 使用 standalone 独立包模式，已阻止自动降级到 npm 全局安装。请稍后重试独立包升级，或在升级方式中手动选择 npm。standalone 安装失败: CDN=${cdnErr}, GitHub=${e.message}`)
             } else {
               throw new Error(`standalone 安装失败: CDN=${cdnErr}, GitHub=${e.message}`)
             }
@@ -12166,31 +12223,17 @@ const handlers = {
   },
 
   async check_panel_update() {
-    let lastErr = ''
     try {
       return await getSitePanelUpdate()
     } catch (e) {
-      lastErr = `site: ${e.message || e}`
+      return {
+        latest: null,
+        url: SITE_BASE_URL,
+        source: 'site',
+        downloadUrl: SITE_BASE_URL,
+        error: `site: ${e.message || e}`,
+      }
     }
-
-    const sources = [
-      { api: 'https://api.github.com/repos/qingchencloud/clawpanel/releases/latest', releases: 'https://github.com/qingchencloud/clawpanel/releases', name: 'github' },
-      { api: 'https://gitee.com/api/v5/repos/QtCodeCreators/clawpanel/releases/latest', releases: 'https://gitee.com/QtCodeCreators/clawpanel/releases', name: 'gitee' },
-    ]
-    for (const src of sources) {
-      try {
-        const resp = await globalThis.fetch(src.api, {
-          signal: AbortSignal.timeout(8000),
-          headers: { 'User-Agent': 'ClawPanel' },
-        })
-        if (!resp.ok) { lastErr = `${src.name}: HTTP ${resp.status}`; continue }
-        const json = await resp.json()
-        const tag = (json.tag_name || '').replace(/^v/, '').trim()
-        if (!tag) { lastErr = `${src.name}: 未找到版本号`; continue }
-        return { latest: tag, url: json.html_url || src.releases, source: src.name, downloadUrl: 'https://claw.qt.cool' }
-      } catch (e) { lastErr = `${src.name}: ${e.message}`; continue }
-    }
-    return { latest: null, url: 'https://github.com/qingchencloud/clawpanel/releases', error: lastErr }
   },
 
   async check_site_announcements({ locale } = {}) {
@@ -14934,7 +14977,7 @@ const handlers = {
   download_frontend_update() { throw new Error('Web 模式无需前端热更新，刷新浏览器即可') },
   rollback_frontend_update() { throw new Error('Web 模式不支持前端热更新回滚') },
   get_update_status() { return { status: 'idle', mode: 'web' } },
-  // 注意：check_panel_update 的真实实现在前面 —— 走官网 API，失败后再回退 GitHub/Gitee。
+  // 注意：check_panel_update 的真实实现在前面 —— 只走官网 API。
   // 这里不能再 stub，否则 object literal 的后定义会覆盖前者，导致 Web 模式永远看不到新版。
 
   // —— 应用重启（Web 端由 tauri-api.js 包装层直接调 location.reload，到这里说明绕过了包装）——

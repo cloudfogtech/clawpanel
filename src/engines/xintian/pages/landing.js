@@ -1,7 +1,7 @@
 /**
  * 心甜Claw · 产品落地页
  * ------------------------------------------------------------------
- * 面向 Windows 桌面客户端的产品宣传 + 下载引导页。
+ * 面向 Windows / macOS / Linux 桌面客户端的产品宣传 + 下载引导页。
  * 所有可见文本走 i18n（engine.xt*），对外链接统一经过 openExternal()
  * 在 Tauri 桌面端走 @tauri-apps/plugin-shell，Web 端回退到 window.open。
  */
@@ -27,6 +27,10 @@ const ICON = {
   channels: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>`,
   shield: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
   windows: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.47 10.5 4.45v7.02H3V5.47zM10.5 12.53v7.02L3 18.53v-6zm1.12-8.24L22 3v8.47H11.62V4.29zM22 12.53V21l-10.38-1.3v-7.17H22z"/></svg>`,
+  monitor: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/><path d="M12 16v4"/></svg>`,
+  token: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v8"/><path d="M8 12h8"/></svg>`,
+  layers: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m19 12 2 1.1-9 5-9-5L5 12"/><path d="m19 16 2 1.1-9 5-9-5L5 16"/></svg>`,
+  model: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/><path d="M8 9h8"/><path d="M8 13h5"/><path d="M15.5 15.5 17 17"/><circle cx="14" cy="14" r="2"/></svg>`,
   download: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
   external: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`,
   check: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
@@ -55,9 +59,9 @@ function getFeatures() {
     { icon: ICON.brain,    title: t('engine.xtFeatMemoryTitle'), desc: t('engine.xtFeatMemoryDesc') },
     { icon: ICON.book,     title: t('engine.xtFeatRagTitle'), desc: t('engine.xtFeatRagDesc') },
     { icon: ICON.clock,    title: t('engine.xtFeatCronTitle'), desc: t('engine.xtFeatCronDesc') },
-    { icon: ICON.skills,   title: t('engine.xtFeatSkillsTitle'), desc: t('engine.xtFeatSkillsDesc') },
+    { icon: ICON.model,    title: t('engine.xtFeatSkillsTitle'), desc: t('engine.xtFeatSkillsDesc') },
     { icon: ICON.channels, title: t('engine.xtFeatChannelTitle'), desc: t('engine.xtFeatChannelDesc') },
-    { icon: ICON.shield,   title: t('engine.xtFeatOfflineTitle'), desc: t('engine.xtFeatOfflineDesc') },
+    { icon: ICON.token,    title: t('engine.xtFeatOfflineTitle'), desc: t('engine.xtFeatOfflineDesc') },
   ]
 }
 
@@ -86,6 +90,15 @@ function getCompareCards() {
       tag: t('engine.xtCompareCForWho'),
       highlight: true,
     },
+  ]
+}
+
+function getHeroProofs() {
+  return [
+    { icon: ICON.monitor, title: t('engine.xtProofPlatformTitle'), desc: t('engine.xtProofPlatformDesc') },
+    { icon: ICON.token, title: t('engine.xtProofTokenTitle'), desc: t('engine.xtProofTokenDesc') },
+    { icon: ICON.layers, title: t('engine.xtProofPlanTitle'), desc: t('engine.xtProofPlanDesc') },
+    { icon: ICON.model, title: t('engine.xtProofModelTitle'), desc: t('engine.xtProofModelDesc') },
   ]
 }
 
@@ -135,6 +148,17 @@ export async function render() {
   const bullets = getChecklist()
     .map(b => `<li class="xt-bullet">${ICON.check}<span>${esc(b)}</span></li>`).join('')
 
+  const heroProofs = getHeroProofs()
+    .map(p => `
+      <div class="xt-proof">
+        <span class="xt-proof-ico">${p.icon}</span>
+        <span class="xt-proof-copy">
+          <strong>${esc(p.title)}</strong>
+          <span>${esc(p.desc)}</span>
+        </span>
+      </div>
+    `).join('')
+
   root.innerHTML = `
     <div class="xt-stage">
       <!-- Decorative aurora background -->
@@ -158,7 +182,7 @@ export async function render() {
         <p class="xt-hero-sub">${esc(t('engine.xtHeroSub'))}</p>
         <div class="xt-hero-actions">
           <button class="xt-btn xt-btn--primary" data-xt-action="download">
-            ${ICON.windows}
+            ${ICON.download}
             <span>${esc(t('engine.xtCtaDownloadWin'))}</span>
           </button>
           <button class="xt-btn xt-btn--ghost" data-xt-action="website">
@@ -173,6 +197,7 @@ export async function render() {
           <span class="xt-hero-meta-sep">·</span>
           <span class="xt-hero-meta-item">${esc(t('engine.xtHeroFreeTrial'))}</span>
         </div>
+        <div class="xt-hero-proof">${heroProofs}</div>
       </section>
 
       <!-- 2 · Features -->

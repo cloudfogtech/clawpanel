@@ -136,7 +136,7 @@ clawpanel/
 │   ├── linux-deploy.sh         #   Linux 服务器一键部署
 │   └── sync-version.js         #   版本号同步脚本
 ├── docs/                       # 文档、截图与更新清单
-│   ├── update/latest.json      #   旧版前端热更新清单
+│   ├── update/latest.json      #   旧版前端热更新兼容清单（新客户端不作为主更新入口）
 │   ├── linux-deploy.md         #   Linux 部署指南
 │   └── docker-deploy.md        #   Docker 部署指南
 ├── public/                     # 静态资源（图标、Logo）
@@ -451,7 +451,7 @@ ClawPanel 支持访问密码保护，**Web 模式和 Tauri 桌面端均可启用
 
 ### 1. 桌面应用（Tauri）
 
-面向 macOS / Windows / Linux 桌面用户，从 [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases) 下载安装包。
+面向 macOS / Windows / Linux 桌面用户，优先从 [官网下载中心](https://claw.qt.cool/download) 下载安装包；[GitHub Releases](https://github.com/qingchencloud/clawpanel/releases) 保留为备用入口。
 
 ### 2. Linux 服务器（Web 版）
 

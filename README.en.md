@@ -33,7 +33,7 @@
 
 ClawPanel is a visual management panel supporting multiple AI Agent frameworks, currently with [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) and [Hermes Agent](https://github.com/nousresearch/hermes-agent) dual-engine support. It features a **built-in intelligent AI assistant** that helps you install, auto-diagnose configurations, troubleshoot issues, and fix errors. 8 tools + 4 modes + interactive Q&A — easy to manage for beginners and experts alike.
 
-> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Download**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Download**: [Official Download Center](https://claw.qt.cool/download) | Fallback: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
 ### 🎁 QingchenCloud AI API
 
@@ -97,7 +97,7 @@ A community of passionate AI Agent developers and enthusiasts — join us!
 
 ## Download & Install
 
-Go to [Releases](https://github.com/qingchencloud/clawpanel/releases/latest) for the latest version:
+Go to the [official download center](https://claw.qt.cool/download) for the latest version. It auto-detects your OS and also lets you pick Windows, macOS, or Linux packages manually. GitHub Releases remain available as a fallback.
 
 ### macOS
 
@@ -203,16 +203,16 @@ npm run build && npm run serve  # Production
 
 ## FAQ
 
-### Hot Update Caused UI Issues / Rolling Back to Built-in Version
+### Legacy Frontend Hot Update Files / Rolling Back to Built-in Version
 
-ClawPanel desktop supports frontend hot updates. Update files are stored at:
+Current ClawPanel desktop updates use full installers downloaded from the official site. The frontend hot update directory is kept only for compatibility with old installations and rollback handling. If you used the old hot update path, files are stored at:
 
 | OS | Path |
 |----|------|
 | Windows | `%USERPROFILE%\.openclaw\clawpanel\web-update\` |
 | macOS / Linux | `~/.openclaw/clawpanel/web-update/` |
 
-If the UI looks broken after a hot update or you want to revert to the version bundled with the installer, simply delete that directory and restart:
+If the UI looks broken or you want to revert to the frontend bundled with the installer, delete that directory and restart:
 
 ```bash
 # macOS / Linux

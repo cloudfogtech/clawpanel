@@ -65,7 +65,7 @@ export function normalizeSiteMessagePayload(payload = {}) {
 export function openSiteMessageCenter({ force = false, tab = null } = {}) {
   const visible = getVisibleMessages()
   if (!force && !visible.notifications.length && !visible.announcements.length) return
-  _activeTab = tab || (visible.notifications.length ? 'notifications' : 'announcements')
+  _activeTab = tab || getPreferredTab()
   renderModal()
 }
 
@@ -81,9 +81,11 @@ function bindLaunchers() {
 }
 
 function updateLauncherBadge() {
-  const count = getVisibleMessages().notifications.length + getVisibleMessages().announcements.length
+  const visible = getVisibleMessages()
+  const count = isClosedToday() ? 0 : visible.notifications.length + visible.announcements.length
   document.querySelectorAll(LAUNCHER_SELECTOR).forEach((launcher) => {
     launcher.classList.toggle('has-unread', count > 0)
+    launcher.classList.toggle('is-muted-today', isClosedToday())
     const badge = launcher.querySelector('.site-message-tool-badge, .site-message-fab-badge')
     if (badge) badge.textContent = count > 9 ? '9+' : String(count || '')
   })
@@ -94,6 +96,12 @@ function renderModal() {
   if (old) old.remove()
 
   const visible = getVisibleMessages()
+  const dismissed = getDismissedMessages()
+  const displayCounts = {
+    notifications: visible.notifications.length + dismissed.notifications.length,
+    announcements: visible.announcements.length + dismissed.announcements.length,
+  }
+  const activeVisibleCount = visible[_activeTab]?.length || 0
 
   const overlay = document.createElement('div')
   overlay.id = 'site-message-overlay'
@@ -107,21 +115,25 @@ function renderModal() {
           <span class="site-message-title-icon" aria-hidden="true">${ICON_BELL}</span>
           <div>
             <h2>${t('siteMessages.title')}</h2>
-            <p>${formatSummary(visible)}</p>
+            <p>${formatSummary(displayCounts)}</p>
           </div>
         </div>
         <div class="site-message-tabs" role="tablist">
-          ${renderTab('notifications', t('siteMessages.notifications'), ICON_BELL, visible.notifications.length)}
-          ${renderTab('announcements', t('siteMessages.announcements'), ICON_SEND, visible.announcements.length)}
+          ${renderTab('notifications', t('siteMessages.notifications'), ICON_BELL, displayCounts.notifications)}
+          ${renderTab('announcements', t('siteMessages.announcements'), ICON_SEND, displayCounts.announcements)}
         </div>
         <button class="site-message-close" type="button" title="${t('common.close')}">${ICON_X}</button>
       </header>
       <div class="site-message-body">
-        ${_activeTab === 'notifications' ? renderNotifications(visible.notifications) : renderAnnouncements(visible.announcements)}
+        ${_activeTab === 'notifications'
+          ? renderNotifications(visible.notifications, dismissed.notifications)
+          : renderAnnouncements(visible.announcements, dismissed.announcements)}
       </div>
       <footer class="site-message-footer">
         <button class="btn btn-secondary btn-sm" type="button" data-site-message-today>${t('siteMessages.closeToday')}</button>
-        <button class="btn btn-primary btn-sm" type="button" data-site-message-dismiss>${t('siteMessages.closeCurrent')}</button>
+        ${activeVisibleCount
+          ? `<button class="btn btn-primary btn-sm" type="button" data-site-message-dismiss>${getDismissButtonLabel()}</button>`
+          : `<button class="btn btn-primary btn-sm" type="button" data-site-message-close-current>${t('common.close')}</button>`}
       </footer>
     </section>
   `
@@ -142,8 +154,9 @@ function renderTab(tab, label, icon, count) {
   `
 }
 
-function renderNotifications(items) {
+function renderNotifications(items, dismissedItems = []) {
   if (!items.length) {
+    if (dismissedItems.length) return renderDismissedState('notifications', dismissedItems.length)
     return `
       <div class="site-message-empty">
         <span class="site-message-empty-icon" aria-hidden="true">${ICON_BELL}</span>
@@ -177,8 +190,9 @@ function renderNotifications(items) {
   `
 }
 
-function renderAnnouncements(items) {
+function renderAnnouncements(items, dismissedItems = []) {
   if (!items.length) {
+    if (dismissedItems.length) return renderDismissedState('announcements', dismissedItems.length)
     return `
       <div class="site-message-empty">
         <span class="site-message-empty-icon" aria-hidden="true">${ICON_SEND}</span>
@@ -213,6 +227,18 @@ function renderAnnouncements(items) {
   `
 }
 
+function renderDismissedState(tab, count) {
+  const icon = tab === 'notifications' ? ICON_BELL : ICON_SEND
+  return `
+    <div class="site-message-empty site-message-dismissed-empty">
+      <span class="site-message-empty-icon" aria-hidden="true">${icon}</span>
+      <strong>${t('siteMessages.dismissedTitle')}</strong>
+      <p>${t('siteMessages.dismissedHint', { count })}</p>
+      <button class="btn btn-secondary btn-sm" type="button" data-site-message-restore>${t('siteMessages.restoreDismissed')}</button>
+    </div>
+  `
+}
+
 function renderMessageCta(item, prominent = false) {
   if (!item.ctaText || !item.ctaUrl) return ''
   return `<a class="${prominent ? 'site-message-card-cta' : 'site-message-inline-cta'}" href="${escapeAttr(item.ctaUrl)}" target="_blank" rel="noopener">${escapeHtml(item.ctaText)}</a>`
@@ -223,10 +249,17 @@ function bindModalEvents(overlay) {
   overlay.querySelector('[data-site-message-today]')?.addEventListener('click', () => {
     localStorage.setItem(TODAY_CLOSE_KEY, todayKey())
     closeModal()
+    updateLauncherBadge()
   })
   overlay.querySelector('[data-site-message-dismiss]')?.addEventListener('click', () => {
     dismissItems(getVisibleMessages()[_activeTab])
     closeModal()
+    updateLauncherBadge()
+  })
+  overlay.querySelector('[data-site-message-close-current]')?.addEventListener('click', closeModal)
+  overlay.querySelector('[data-site-message-restore]')?.addEventListener('click', () => {
+    restoreItems(_messages[_activeTab])
+    renderModal()
     updateLauncherBadge()
   })
   overlay.querySelectorAll('[data-site-message-tab]').forEach((btn) => {
@@ -255,10 +288,21 @@ function dismissItems(items) {
   }
 }
 
+function restoreItems(items) {
+  for (const item of items || []) {
+    const key = dismissStorageKey(item)
+    if (key) localStorage.removeItem(key)
+  }
+}
+
 function shouldAutoOpen() {
-  if (localStorage.getItem(TODAY_CLOSE_KEY) === todayKey()) return false
+  if (isClosedToday()) return false
   const visible = getVisibleMessages()
   return visible.notifications.length > 0 || visible.announcements.length > 0
+}
+
+function isClosedToday() {
+  return localStorage.getItem(TODAY_CLOSE_KEY) === todayKey()
 }
 
 function getVisibleMessages() {
@@ -266,6 +310,27 @@ function getVisibleMessages() {
     notifications: _messages.notifications.filter(item => !isDismissed(item)),
     announcements: _messages.announcements.filter(item => !isDismissed(item)),
   }
+}
+
+function getDismissedMessages() {
+  return {
+    notifications: _messages.notifications.filter(isDismissed),
+    announcements: _messages.announcements.filter(isDismissed),
+  }
+}
+
+function getPreferredTab() {
+  const visible = getVisibleMessages()
+  if (visible.notifications.length) return 'notifications'
+  if (visible.announcements.length) return 'announcements'
+  const dismissed = getDismissedMessages()
+  if (dismissed.notifications.length) return 'notifications'
+  return 'announcements'
+}
+
+function getDismissButtonLabel() {
+  if (_activeTab === 'notifications') return t('siteMessages.dismissCurrentNotifications')
+  return t('siteMessages.dismissCurrentAnnouncements')
 }
 
 function normalizePayload(payload = {}) {

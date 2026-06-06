@@ -30,7 +30,7 @@
 
 ClawPanel은 여러 AI Agent 프레임워크를 지원하는 시각적 관리 패널으로, 현재 [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) 및 [Hermes Agent](https://github.com/nousresearch/hermes-agent) 듀얼 엔진을 지원합니다. **지능형 AI 어시스턴트를 내장**하여 원클릭 설치, 자동 설정 진단, 문제 해결 및 오류 수정을 지원합니다. 8개 도구 + 4가지 모드 + 대화형 Q&A로 초보자부터 전문가까지 쉽게 관리할 수 있습니다.
 
-> 🌐 **웹사이트**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **다운로드**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **웹사이트**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **다운로드**: [공식 다운로드 센터](https://claw.qt.cool/download) | 예비: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
 ### 🎁 칭천클라우드 AI API
 
@@ -90,7 +90,7 @@ AI Agent에 열정적인 개발자와 사용자 커뮤니티 — 함께하세요
 
 ## 다운로드 및 설치
 
-[Releases](https://github.com/qingchencloud/clawpanel/releases/latest)에서 최신 버전 다운로드:
+[공식 다운로드 센터](https://claw.qt.cool/download)에서 최신 버전을 받으세요. GitHub Releases는 예비 다운로드 경로입니다:
 
 | 플랫폼 | 설치 파일 |
 |--------|----------|

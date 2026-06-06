@@ -30,7 +30,7 @@
 
 ClawPanel là bảng quản lý trực quan hỗ trợ nhiều AI Agent framework, hiện tại hỗ trợ [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) và [Hermes Agent](https://github.com/nousresearch/hermes-agent) động cơ kép. Tích hợp **trợ lý AI thông minh**, giúp bạn cài đặt, tự động chẩn đoán cấu hình, xử lý sự cố và sửa lỗi. 8 công cụ + 4 chế độ + hỏi đáp tương tác — dễ dàng quản lý cho cả người mới và chuyên gia.
 
-> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Tải xuống**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Tải xuống**: [Trung tâm tải xuống chính thức](https://claw.qt.cool/download) | Dự phòng: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
 ### 🎁 QingchenCloud AI API
 
@@ -90,7 +90,7 @@ Cộng đồng các nhà phát triển và người dùng đam mê AI Agent — 
 
 ## Tải xuống & Cài đặt
 
-Truy cập [Releases](https://github.com/qingchencloud/clawpanel/releases/latest) để tải phiên bản mới nhất:
+Truy cập [trung tâm tải xuống chính thức](https://claw.qt.cool/download) để tải phiên bản mới nhất. GitHub Releases vẫn là đường dẫn dự phòng:
 
 | Nền tảng | Trình cài đặt |
 |----------|--------------|

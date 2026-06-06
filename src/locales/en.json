@@ -2275,8 +2275,8 @@
       "failurePrefix": "Kernel upgrade failed:"
     },
     "upgradeHint": {
-      "title": "New kernel available",
-      "subtitle": "{from} → {to}, click to upgrade",
+      "title": "Running Gateway can be upgraded",
+      "subtitle": "Gateway {from} → recommended {to}",
       "dismissTooltip": "Don't remind me this session"
     },
     "tooOldForProtocol": "Gateway kernel is too old and does not support the handshake protocol used by this ClawPanel. Please upgrade the OpenClaw kernel to the recommended version ({recommended}) and retry. You can upgrade from \"Services → OpenClaw → Upgrade\"."

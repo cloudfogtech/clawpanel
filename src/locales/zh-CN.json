@@ -2358,8 +2358,8 @@
       "failurePrefix": "内核升级失败:"
     },
     "upgradeHint": {
-      "title": "有新内核可用",
-      "subtitle": "{from} → {to}，点此一键升级",
+      "title": "运行中 Gateway 可升级",
+      "subtitle": "Gateway {from} → 推荐 {to}",
       "dismissTooltip": "本次会话不再提醒"
     },
     "tooOldForProtocol": "Gateway 内核版本过旧，不兼容当前 ClawPanel 使用的握手协议。请把 OpenClaw 内核升级到推荐版本（{recommended}）后重试。可在「服务管理 → OpenClaw → 一键升级」中完成升级。"

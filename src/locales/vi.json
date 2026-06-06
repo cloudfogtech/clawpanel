@@ -2132,8 +2132,8 @@
       "failurePrefix": "Nâng cấp kernel thất bại:"
     },
     "upgradeHint": {
-      "title": "Có kernel mới",
-      "subtitle": "{from} → {to}, nhấn để nâng cấp",
+      "title": "Running Gateway can be upgraded",
+      "subtitle": "Gateway {from} → recommended {to}",
       "dismissTooltip": "Không nhắc trong phiên này"
     }
   },

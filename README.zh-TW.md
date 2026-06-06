@@ -30,7 +30,7 @@
 
 ClawPanel 是支援多 AI Agent 框架的視覺化管理面板，目前支援 [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) 和 [Hermes Agent](https://github.com/nousresearch/hermes-agent) 雙引擎。**內建智慧 AI 助手**，幫你一鍵安裝、自動診斷設定、排查問題、修復錯誤。8 大工具 + 4 種模式 + 互動式問答，從新手到老手都能輕鬆管理。
 
-> 🌐 **官網**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **下載**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **官網**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **下載**: [官網下載中心](https://claw.qt.cool/download) | 備用: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
 ### 🎁 晴辰雲 AI 介面
 
@@ -90,7 +90,7 @@ ClawPanel 是支援多 AI Agent 框架的視覺化管理面板，目前支援 [O
 
 ## 下載安裝
 
-前往 [Releases](https://github.com/qingchencloud/clawpanel/releases/latest) 下載最新版本：
+前往 [官網下載中心](https://claw.qt.cool/download) 下載最新版本；GitHub Releases 保留為備用下載入口：
 
 | 平台 | 安裝檔 |
 |------|--------|

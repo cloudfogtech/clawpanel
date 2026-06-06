@@ -2,10 +2,9 @@
 ///
 /// 检测策略（跨平台统一）：
 ///   1. TCP 连 127.0.0.1:{port}，超时 1.5s
-///   2. 连通 → 认为 Gateway 在运行
+///   2. 连通 → 认为 Gateway 在运行，并尽量解析监听 PID
 ///
-/// 不依赖任何系统命令（无 netstat / PowerShell / launchctl / openclaw health），
-/// 无权限问题，逻辑一致。
+/// 系统命令仅作为 PID 增强信息来源；命令不可用时不影响运行状态判断。
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -120,6 +119,54 @@ fn matches_current_gateway_owner_signature(owner: &GatewayOwnerRecord) -> bool {
 fn gateway_owner_pid_needs_refresh(owner: &GatewayOwnerRecord, pid: Option<u32>) -> bool {
     matches_current_gateway_owner_signature(owner)
         && matches!(pid, Some(current_pid) if owner.pid != Some(current_pid))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_ss_listen_pid_output(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        let Some(idx) = line.find("pid=") else {
+            continue;
+        };
+        let digits: String = line[idx + 4..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(pid) = digits.parse::<u32>() {
+            if pid > 0 {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn parse_lsof_pid_output(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        line.split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+    })
+}
+
+#[cfg(test)]
+mod gateway_pid_parse_tests {
+    use super::{parse_lsof_pid_output, parse_ss_listen_pid_output};
+
+    #[test]
+    fn parses_linux_ss_listener_pid() {
+        let output = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n\
+LISTEN 0      511        127.0.0.1:18789      0.0.0.0:*    users:((\"node\",pid=4242,fd=23))";
+
+        assert_eq!(parse_ss_listen_pid_output(output), Some(4242));
+    }
+
+    #[test]
+    fn parses_lsof_listener_pid() {
+        assert_eq!(parse_lsof_pid_output("4242\n"), Some(4242));
+        assert_eq!(parse_lsof_pid_output("not-a-pid\n4242\n"), Some(4242));
+    }
 }
 
 fn read_gateway_owner() -> Option<GatewayOwnerRecord> {
@@ -933,7 +980,7 @@ mod platform {
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
-        text.lines().next()?.trim().parse::<u32>().ok()
+        super::parse_lsof_pid_output(&text)
     }
 
     /// launchctl 失败时的回退：直接通过 CLI spawn Gateway 进程
@@ -1895,6 +1942,31 @@ mod platform {
         vec!["ai.openclaw.gateway".to_string()]
     }
 
+    fn get_pid_by_port(port: u16) -> Option<u32> {
+        let filter = format!("sport = :{port}");
+        if let Ok(output) = std::process::Command::new("ss")
+            .args(["-ltnp", &filter])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(pid) = super::parse_ss_listen_pid_output(&text) {
+                return Some(pid);
+            }
+        }
+
+        if let Ok(output) = std::process::Command::new("lsof")
+            .args(["-i", &format!("TCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(pid) = super::parse_lsof_pid_output(&text) {
+                return Some(pid);
+            }
+        }
+
+        None
+    }
+
     /// 跨平台统一检测：TCP 连端口
     #[allow(dead_code)]
     pub async fn check_service_status(_uid: u32, _label: &str) -> (bool, Option<u32>) {
@@ -1912,7 +1984,7 @@ mod platform {
         .await
         .unwrap_or(false);
         if result {
-            (true, None)
+            (true, get_pid_by_port(port))
         } else {
             (false, None)
         }
