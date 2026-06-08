@@ -52,7 +52,7 @@ ClawPanel là bảng quản lý trực quan hỗ trợ nhiều AI Agent framewor
 - **Orange Pi / Raspberry Pi / RK3588** — `npm run serve` để chạy
 - **Docker ARM64** — `docker run ghcr.io/qingchencloud/openclaw:latest`
 - **Armbian / Debian / Ubuntu Server** — Tự động phát hiện kiến trúc
-- Không cần Rust / Tauri / GUI — **chỉ cần Node.js 18+**
+- Không cần Rust / Tauri / GUI. ClawPanel Web cần **Node.js 18+**; OpenClaw Gateway được kiểm tra theo `engines.node` của bản OpenClaw đã cài, khuyến nghị **Node.js 22.19.0+**.
 
 ## Cộng đồng
 

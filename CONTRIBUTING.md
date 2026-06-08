@@ -31,7 +31,7 @@
 
 | 依赖 | 最低版本 | 说明 |
 |------|----------|------|
-| Node.js | 18+ | 前端构建（推荐 22 LTS） |
+| Node.js | 18+ | 前端构建与 Web 后端（推荐 22 LTS）；运行 OpenClaw Gateway 时按当前 OpenClaw 的 `engines.node` 检测 |
 | Rust | stable | Tauri 后端编译 |
 | Tauri CLI | v2 | `cargo install tauri-cli --version "^2"` |
 

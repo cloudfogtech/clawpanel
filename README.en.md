@@ -57,7 +57,7 @@ ClawPanel provides a **pure Web deployment mode** (zero GUI dependency), nativel
 - **Orange Pi / Raspberry Pi / RK3588** — `npm run serve` to run
 - **Docker ARM64** — `docker run ghcr.io/qingchencloud/openclaw:latest`
 - **Armbian / Debian / Ubuntu Server** — Auto-detect architecture
-- No Rust / Tauri / GUI needed — **only Node.js 18+ required**
+- No Rust / Tauri / GUI needed. ClawPanel Web requires **Node.js 18+**; OpenClaw Gateway is checked against the installed OpenClaw `engines.node` requirement, with **Node.js 22.19.0+** recommended.
 
 > 📖 See [Armbian Deployment Guide](docs/armbian-deploy.md) | [Web Dev Mode](#web-version-no-rusttauri-required)
 

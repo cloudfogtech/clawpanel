@@ -52,7 +52,7 @@ ClawPanel 是支援多 AI Agent 框架的視覺化管理面板，目前支援 [O
 - **Orange Pi / 樹莓派 / RK3588** — `npm run serve` 即可執行
 - **Docker ARM64** — `docker run ghcr.io/qingchencloud/openclaw:latest`
 - **Armbian / Debian / Ubuntu Server** — 自動偵測架構
-- 無需 Rust / Tauri / GUI — **只要有 Node.js 18+ 就能跑**
+- 無需 Rust / Tauri / GUI；ClawPanel Web 後端需要 **Node.js 18+**，執行 OpenClaw Gateway 時會按目前 OpenClaw 的 `engines.node` 自動檢測，建議 **Node.js 22.19.0+**
 
 ## 社群
 

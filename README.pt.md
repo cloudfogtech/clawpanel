@@ -52,7 +52,7 @@ ClawPanel é um painel de gestão visual que suporta múltiplos frameworks de AI
 - **Orange Pi / Raspberry Pi / RK3588** — `npm run serve` para executar
 - **Docker ARM64** — `docker run ghcr.io/qingchencloud/openclaw:latest`
 - **Armbian / Debian / Ubuntu Server** — Detecção automática de arquitetura
-- Sem necessidade de Rust / Tauri / GUI — **apenas Node.js 18+**
+- Sem necessidade de Rust / Tauri / GUI. O ClawPanel Web requer **Node.js 18+**; o OpenClaw Gateway é validado conforme o `engines.node` do OpenClaw instalado, com **Node.js 22.19.0+** recomendado.
 
 ## Comunidade
 

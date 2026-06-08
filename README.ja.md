@@ -52,7 +52,7 @@ ClawPanel は複数の AI Agent フレームワークをサポートするビジ
 - **Orange Pi / Raspberry Pi / RK3588** — `npm run serve` で実行
 - **Docker ARM64** — `docker run ghcr.io/qingchencloud/openclaw:latest`
 - **Armbian / Debian / Ubuntu Server** — アーキテクチャ自動検出
-- Rust / Tauri / GUI 不要 — **Node.js 18+ のみで動作**
+- Rust / Tauri / GUI 不要。ClawPanel Web は **Node.js 18+** が必要です。OpenClaw Gateway はインストール済み OpenClaw の `engines.node` 要件に従って検出され、**Node.js 22.19.0+** を推奨します。
 
 ## コミュニティ
 

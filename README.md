@@ -110,7 +110,7 @@ ClawPanel 提供**纯 Web 版部署模式**（零 GUI 依赖），天然兼容 A
 - **Orange Pi / 树莓派 / RK3588** 等 ARM64 板子 — `npm run serve` 即可运行
 - **Docker ARM64 镜像** — `docker run ghcr.io/qingchencloud/openclaw:latest` 开箱即用
 - **Armbian / Debian / Ubuntu Server** — 一键部署脚本自动检测架构
-- 无需 Rust / Tauri / 图形界面，**只要有 Node.js 18+ 就能跑**
+- 无需 Rust / Tauri / 图形界面；ClawPanel Web 后端需要 **Node.js 18+**，运行 OpenClaw Gateway 时会按当前 OpenClaw 的 `engines.node` 自动检测，建议 **Node.js 22.19.0+**
 
 > 📖 详见 [Armbian 部署指南](docs/armbian-deploy.md) | [Web 版开发说明](#web-开发版无需-rusttauri)
 
@@ -617,7 +617,7 @@ clawpanel/
 
 ### 前置条件
 
-- [Node.js](https://nodejs.org/) >= 18
+- [Node.js](https://nodejs.org/) >= 18（从源码构建 ClawPanel；运行 OpenClaw Gateway 建议 22.19.0+）
 - [Rust](https://www.rust-lang.org/tools/install) (stable)
 - Tauri v2 系统依赖（参考 [Tauri 官方文档](https://v2.tauri.app/start/prerequisites/)）
 
@@ -751,7 +751,7 @@ Web 版适用于 Linux 服务器（无桌面环境），通过浏览器远程管
 
 ### 环境要求
 
-- **Node.js** >= 18（推荐 22 LTS）
+- **Node.js** >= 18（ClawPanel Web 后端）；运行 OpenClaw Gateway 建议 **22.19.0+**，面板会按当前 OpenClaw 要求自动检测
 - **Git**（用于 OpenClaw 依赖安装）
 - **端口** 1420（ClawPanel）+ 18789（Gateway）
 
@@ -900,9 +900,9 @@ npm install -g @qingchencloud/openclaw-zh --registry https://registry.npmmirror.
 
 ### 安装后 Node.js 检测不到（Windows）
 
-安装 Node.js 后需要**重启 ClawPanel**，新的 PATH 环境变量才能生效。
+安装 Node.js 后点击「重新检测」即可；如果仍显示旧版本，再重启 ClawPanel 或检查 PATH 优先级。
 
-如果安装在非默认路径（如 `D:\nodejs`、`F:\AI\Node`），请确认该目录已加入系统 PATH 环境变量。**v0.4.2+ 已自动扫描常见安装路径。**
+如果安装在非默认路径（如 `D:\nodejs`、`F:\AI\Node`），可以在设置向导中使用「自动扫描」或手动填写 Node.js 安装目录。面板会校验该 Node.js 是否满足当前 OpenClaw 要求，版本过低的路径不会保存。
 
 ### Gateway 启动失败
 

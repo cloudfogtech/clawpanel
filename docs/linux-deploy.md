@@ -49,7 +49,7 @@
 
 | 依赖 | 最低版本 | 说明 |
 |------|----------|------|
-| Node.js | 18+ | 推荐 22 LTS |
+| Node.js | 18+ | ClawPanel Web 后端；运行 OpenClaw Gateway 建议 22.19.0+，实际要求按当前 OpenClaw `engines.node` 检测 |
 | npm | 随 Node.js | 包管理器 |
 | Git | 任意 | 克隆仓库 |
 | OpenClaw | 最新 | ClawPanel 管理的对象 |

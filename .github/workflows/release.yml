@@ -374,7 +374,7 @@ jobs:
             echo "3. 如未安装 OpenClaw，按提示一键安装即可"
             echo "4. 安装完成后自动跳转仪表盘，开始使用"
             echo ""
-            echo '> **系统要求**：Node.js 18+（推荐 22 LTS）'
+            echo '> **系统要求**：ClawPanel Web 后端需要 Node.js 18+；运行 OpenClaw Gateway 会按当前 OpenClaw 的 engines.node 自动检测，建议 Node.js 22.19.0+。'
             echo ""
             echo "---"
             echo ""
@@ -382,7 +382,7 @@ jobs:
             echo "${CHANGELOG_BODY}"
             echo "---"
             echo ""
-            echo "📖 [项目主页](https://github.com/${REPO}) · 💬 [反馈问题](https://github.com/${REPO}/issues) · 📣 [QQ 群](https://qt.cool/c/OpenClaw)"
+            echo "📖 [项目主页](https://github.com/${REPO}) · 💬 [反馈问题](https://github.com/${REPO}/issues) · 📣 [QQ 群](https://qt.cool/c/OpenClaw) · Telegram: https://t.me/clawpanel"
           } > release_body.md
 
           gh release edit "$TAG_NAME" --notes-file release_body.md
