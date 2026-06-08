@@ -1677,7 +1677,7 @@ mod platform {
         fs::create_dir_all(openclaw_dir).map_err(|e| format!("创建 OpenClaw 目录失败: {e}"))?;
         let runner_path = openclaw_dir.join("clawpanel-gateway.cmd");
         let content = format!(
-            "@echo off\r\ntitle {GATEWAY_WINDOW_TITLE}\r\necho OpenClaw Gateway is running. Keep this window open.\r\necho Close this window to stop Gateway.\r\necho.\r\n{}\r\necho.\r\necho Gateway exited. You can close this window.\r\n",
+            "@echo off\r\ntitle {GATEWAY_WINDOW_TITLE}\r\necho Starting OpenClaw Gateway. Keep this window open after it starts.\r\necho Close this window to stop Gateway.\r\necho.\r\n{}\r\necho.\r\necho Gateway exited. You can close this window.\r\n",
             gateway_terminal_command(cli)
         );
         fs::write(&runner_path, content).map_err(|e| format!("写入 Gateway 启动脚本失败: {e}"))?;
@@ -1699,6 +1699,7 @@ mod platform {
                     .into(),
             );
         }
+        crate::commands::config::ensure_node_runtime_compatible()?;
 
         let (running, pid) = check_service_status(0, "");
         if running {
@@ -2081,6 +2082,7 @@ mod platform {
                     .into(),
             );
         }
+        crate::commands::config::ensure_node_runtime_compatible()?;
 
         // 启动前检查端口是否已被占用，防止重复拉起导致端口冲突和内存浪费
         let port = crate::commands::gateway_listen_port();

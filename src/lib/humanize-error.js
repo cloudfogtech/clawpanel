@@ -23,6 +23,11 @@
 import { t } from './i18n.js'
 
 const PATTERNS = [
+  // Node.js 版本不满足当前 OpenClaw 要求
+  {
+    key: 'nodeVersion',
+    re: /(node\.?js.*(版本过低|too old)|requires node|要求\s*[><=^~]*\d|node.*version.*(too old|unsupported))/i,
+  },
   // 网络
   {
     key: 'network',
@@ -90,6 +95,7 @@ function toRawString(e) {
 
 // 不同错误类型默认对应的行动按钮（label 走 i18n，route 直接跳转）
 const DEFAULT_ACTIONS = {
+  nodeVersion: { labelKey: 'common.errorAction.checkNode', route: '/setup' },
   gatewayDown: { labelKey: 'common.errorAction.startGateway', route: '/services' },
   cmdMissing: { labelKey: 'common.errorAction.openSettings', route: '/settings' },
   permission: { labelKey: 'common.errorAction.openSettings', route: '/settings' },

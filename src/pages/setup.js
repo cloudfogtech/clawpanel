@@ -2,7 +2,7 @@
  * 初始设置页面 — openclaw 未安装时的引导
  * 自动检测环境 → 版本选择 → 一键安装 → 自动跳转
  */
-import { api, invalidate } from '../lib/tauri-api.js'
+import { api, invalidate, isTauriRuntime, safeTauriListen } from '../lib/tauri-api.js'
 import { showConfirm, showUpgradeModal } from '../components/modal.js'
 import { toast } from '../components/toast.js'
 import { setUpgrading, isMacPlatform } from '../lib/app-state.js'
@@ -48,6 +48,14 @@ function buildStatusMeta(...parts) {
     .map(part => String(part || '').trim())
     .filter(Boolean)
     .join(' · ')
+}
+
+function isWindowsPlatform() {
+  return navigator.platform?.startsWith('Win') || navigator.userAgent?.includes('Windows')
+}
+
+function canAutoUpgradeNode() {
+  return isTauriRuntime() && isWindowsPlatform()
 }
 
 function renderDetectionHint(pathValue, sourceLabel = '') {
@@ -215,7 +223,7 @@ async function runDetect(page) {
     api.configureGitHttps().catch(() => {})
   }
 
-  const nodeOk = node.installed
+  const nodeOk = node.installed && node.compatible !== false
   const allOk = nodeOk && cliOk && config.installed
 
   // 全部通过 → 自动跳转到仪表盘
@@ -236,10 +244,12 @@ function stepIcon(ok) {
 
 function renderSteps(page, { node, git, cliOk, config, version }) {
   const stepsEl = page.querySelector('#setup-steps')
-  const nodeOk = node.installed
+  const nodeOk = node.installed && node.compatible !== false
   const gitOk = git?.installed || false
   const allOk = nodeOk && cliOk && config.installed
-  const nodeStatusMeta = nodeOk
+  const nodeStatusMeta = node.installed && node.compatible === false
+    ? t('setup.nodeVersionUnsupported', { version: node.version || t('common.unknown'), required: node.requiredVersion || t('common.unknown') })
+    : nodeOk
     ? buildStatusMeta(node.version || t('setup.statusReady'), node.path)
     : t('setup.statusActionNeeded')
   const gitStatusMeta = gitOk
@@ -270,22 +280,26 @@ function renderSteps(page, { node, git, cliOk, config, version }) {
 
   // 第一步：Node.js
   if (!nodeOk) {
+    const nodeTooOld = node.installed && node.compatible === false
     html += `
       <div class="config-section" style="text-align:left">
         <div class="config-section-title" style="display:flex;align-items:center;gap:4px">
           ${stepIcon(nodeOk)} ${t('setup.stepNode')}
         </div>
         <p style="color:var(--text-secondary);font-size:var(--font-size-sm);margin-bottom:var(--space-sm)">
-          ${t('setup.stepNodeHint')}
+          ${nodeTooOld ? t('setup.nodeUpgradeHint', { version: node.version || t('common.unknown'), required: node.requiredVersion || t('common.unknown') }) : t('setup.stepNodeHint')}
         </p>
-        <a class="btn btn-primary btn-sm" href="https://nodejs.org/" target="_blank" rel="noopener">${t('setup.downloadNode')}</a>
+        ${nodeTooOld && canAutoUpgradeNode()
+          ? `<button class="btn btn-primary btn-sm" id="btn-auto-install-node">${t('setup.autoUpgradeNodeBtn')}</button>`
+          : ''}
+        <a class="btn ${nodeTooOld && canAutoUpgradeNode() ? 'btn-secondary' : 'btn-primary'} btn-sm" href="https://nodejs.org/" target="_blank" rel="noopener">${nodeTooOld ? t('setup.downloadLatestNode') : t('setup.downloadNode')}</a>
         <span class="form-hint" style="margin-left:8px">${t('setup.recheckAfterInstall')}</span>
         <div style="margin-top:var(--space-sm);padding:10px 12px;background:var(--bg-tertiary);border-radius:var(--radius-sm);font-size:var(--font-size-xs);color:var(--text-secondary);line-height:1.6">
-          <strong>${t('setup.nodeInstalledButNotDetected')}</strong>
+          <strong>${nodeTooOld ? t('setup.nodeUnsupportedTitle') : t('setup.nodeInstalledButNotDetected')}</strong>
           ${isMacPlatform()
             ? `${t('setup.macNodeHint')}<br>
                <code style="background:var(--bg-secondary);padding:2px 6px;border-radius:3px;user-select:all">open /Applications/ClawPanel.app</code>`
-            : `${t('setup.winNodeHint')}`
+            : `${nodeTooOld ? t('setup.winNodeUpgradeHint') : t('setup.winNodeHint')}`
           }
           <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
             <button class="btn btn-secondary btn-sm" id="btn-scan-node" style="font-size:11px;padding:3px 10px">${icon('search', 12)} ${t('setup.scanNodeBtn')}</button>
@@ -590,6 +604,7 @@ function renderEnvironmentHint() {
 function buildSetupProblemPrompt({ node, git, cliOk, config }) {
   const problems = []
   if (!node.installed) problems.push(`- ${t('setup.promptNodeMissing')}`)
+  else if (node.compatible === false) problems.push(`- ${t('setup.promptNodeUnsupported', { version: node.version || t('common.unknown'), required: node.requiredVersion || t('common.unknown') })}`)
   else problems.push(`- ${t('setup.promptNodeOk', { version: node.version || t('common.unknown') })}`)
   if (!git?.installed) problems.push(`- ${t('setup.promptGitMissing')}`)
   else problems.push(`- ${t('setup.promptGitOk', { version: git.version || t('common.unknown') })}`)
@@ -663,6 +678,68 @@ function bindEvents(page, nodeOk, detectState) {
     } finally {
       btn.disabled = false
       btn.textContent = t('setup.autoInstallGitBtn')
+    }
+  })
+
+  // 一键安装 / 升级 Node.js
+  page.querySelector('#btn-auto-install-node')?.addEventListener('click', async () => {
+    const btn = page.querySelector('#btn-auto-install-node')
+    const yes = await showConfirm({
+      title: t('setup.nodeUpgradeConfirmTitle'),
+      message: t('setup.nodeUpgradeConfirmMessage'),
+      impact: [
+        t('setup.nodeUpgradeConfirmImpactWinget'),
+        t('setup.nodeUpgradeConfirmImpactPermission'),
+        t('setup.nodeUpgradeConfirmImpactRedetect'),
+      ],
+      confirmText: t('setup.autoUpgradeNodeBtn'),
+      cancelText: t('common.cancel'),
+      variant: 'primary',
+    })
+    if (!yes) return
+
+    const modal = showUpgradeModal(t('setup.nodeUpgradeTitle'))
+    modal.setProgressLabels({
+      preparing: t('setup.nodeUpgradePreparing'),
+      downloading: t('setup.nodeUpgradeInstalling'),
+      installing: t('setup.nodeUpgradeVerifying'),
+      done: t('setup.nodeUpgradeDone'),
+    })
+    modal.setProgress(15)
+    modal.appendLog(t('setup.nodeUpgradeStarting'))
+
+    let unlistenLog, unlistenProgress
+    const cleanup = () => {
+      setUpgrading(false)
+      unlistenLog?.()
+      unlistenProgress?.()
+    }
+    setUpgrading(true)
+    btn.disabled = true
+    btn.textContent = t('setup.upgradingNode')
+    try {
+      unlistenLog = await safeTauriListen('upgrade-log', (e) => modal.appendLog(e.payload))
+      unlistenProgress = await safeTauriListen('upgrade-progress', (e) => modal.setProgress(e.payload))
+      const msg = await api.autoInstallNode()
+      modal.setProgress(100)
+      modal.setDone(msg || t('setup.nodeUpgradeSuccess'))
+      modal.appendLog(t('setup.nodeUpgradeRedetecting'))
+      toast(msg || t('setup.nodeUpgradeSuccess'), 'success')
+      await api.invalidatePathCache().catch(() => {})
+      setTimeout(() => runDetect(page), 800)
+    } catch (e) {
+      const errMsg = String(e?.message || e)
+      modal.setError(t('setup.nodeAutoUpgradeFailedTitle'))
+      modal.appendLog(errMsg)
+      modal.appendLog('')
+      modal.appendLog(t('setup.nodeManualInstallHint'))
+      modal.appendLog('https://nodejs.org/')
+      modal.appendLog(t('setup.nodeUpgradeRestartHint'))
+      toast(t('setup.nodeAutoUpgradeFailed', { err: errMsg }), 'error')
+      btn.disabled = false
+      btn.textContent = t('setup.autoUpgradeNodeBtn')
+    } finally {
+      cleanup()
     }
   })
 
@@ -803,19 +880,30 @@ function bindEvents(page, nodeOk, detectState) {
       if (results.length === 0) {
         resultEl.innerHTML = `<span style="color:var(--warning)">${t('setup.scanNotFound')}</span>`
       } else {
-        resultEl.innerHTML = results.map(r =>
-          `<div style="display:flex;align-items:center;gap:6px;margin-top:4px">
-            <span style="color:var(--success)">✓</span>
-            <code style="flex:1;background:var(--bg-secondary);padding:2px 6px;border-radius:3px;font-size:11px">${r.path}</code>
-            <span style="font-size:11px;color:var(--text-tertiary)">${r.version}</span>
-            <button class="btn btn-primary btn-sm btn-use-path" data-path="${r.path}" style="font-size:10px;padding:2px 8px">${t('setup.scanUseBtn')}</button>
+        resultEl.innerHTML = results.map(r => {
+          const compatible = r.compatible !== false
+          const color = compatible ? 'var(--success)' : 'var(--danger)'
+          const status = compatible
+            ? ''
+            : `<span style="font-size:11px;color:var(--danger)">${t('setup.nodeVersionTooLowShort', { required: r.requiredVersion || t('common.unknown') })}</span>`
+          return `<div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+            <span style="color:${color}">${compatible ? '✓' : '✗'}</span>
+            <code style="flex:1;background:var(--bg-secondary);padding:2px 6px;border-radius:3px;font-size:11px">${escapeHtml(r.path)}</code>
+            <span style="font-size:11px;color:var(--text-tertiary)">${escapeHtml(r.version)}</span>
+            ${status}
+            <button class="btn btn-primary btn-sm btn-use-path" data-path="${escapeHtml(r.dir || r.path)}" style="font-size:10px;padding:2px 8px" ${compatible ? '' : 'disabled'}>${compatible ? t('setup.scanUseBtn') : t('setup.nodeUnavailableBtn')}</button>
           </div>`
+        }
         ).join('')
         resultEl.querySelectorAll('.btn-use-path').forEach(b => {
           b.addEventListener('click', async () => {
-            await api.saveCustomNodePath(b.dataset.path)
-            toast(t('setup.nodeSaved'), 'success')
-            setTimeout(() => runDetect(page), 300)
+            try {
+              await api.saveCustomNodePath(b.dataset.path)
+              toast(t('setup.nodeSaved'), 'success')
+              setTimeout(() => runDetect(page), 300)
+            } catch (e) {
+              toast(t('setup.nodePathSaveFailed', { err: e?.message || e }), 'error')
+            }
           })
         })
       }
@@ -838,6 +926,10 @@ function bindEvents(page, nodeOk, detectState) {
     try {
       const result = await api.checkNodeAtPath(dir)
       if (result.installed) {
+        if (result.compatible === false) {
+          resultEl.innerHTML = `<span style="color:var(--danger)">✗ ${t('setup.nodeVersionUnsupported', { version: result.version || t('common.unknown'), required: result.requiredVersion || t('common.unknown') })}</span>`
+          return
+        }
         await api.saveCustomNodePath(dir)
         resultEl.innerHTML = `<span style="color:var(--success)">✓ ${t('setup.nodeFoundSaved', { version: result.version })}</span>`
         toast(t('setup.nodeSaved'), 'success')
@@ -1103,4 +1195,3 @@ function bindEvents(page, nodeOk, detectState) {
     }
   })
 }
-

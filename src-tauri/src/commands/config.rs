@@ -140,6 +140,146 @@ fn parse_version(value: &str) -> Vec<u32> {
         .collect()
 }
 
+fn parse_node_version_triplet(value: &str) -> Option<[u32; 3]> {
+    let parts = parse_version(value);
+    if parts.is_empty() {
+        return None;
+    }
+    Some([
+        *parts.first().unwrap_or(&0),
+        *parts.get(1).unwrap_or(&0),
+        *parts.get(2).unwrap_or(&0),
+    ])
+}
+
+fn cmp_version_triplet(left: [u32; 3], right: [u32; 3]) -> std::cmp::Ordering {
+    left.cmp(&right)
+}
+
+fn node_version_satisfies_clause(version: [u32; 3], clause: &str) -> bool {
+    let clause = clause.trim();
+    if clause.is_empty() || clause == "*" {
+        return true;
+    }
+
+    if let Some(raw) = clause.strip_prefix(">=") {
+        return parse_node_version_triplet(raw)
+            .map(|min| cmp_version_triplet(version, min).is_ge())
+            .unwrap_or(false);
+    }
+    if let Some(raw) = clause.strip_prefix('>') {
+        return parse_node_version_triplet(raw)
+            .map(|min| cmp_version_triplet(version, min).is_gt())
+            .unwrap_or(false);
+    }
+    if let Some(raw) = clause.strip_prefix('^') {
+        let Some(min) = parse_node_version_triplet(raw) else {
+            return false;
+        };
+        let max = [min[0].saturating_add(1), 0, 0];
+        return cmp_version_triplet(version, min).is_ge()
+            && cmp_version_triplet(version, max).is_lt();
+    }
+    parse_node_version_triplet(clause)
+        .map(|target| version == target)
+        .unwrap_or(false)
+}
+
+fn node_version_satisfies_requirement(version: &str, requirement: &str) -> bool {
+    let Some(version) = parse_node_version_triplet(version) else {
+        return false;
+    };
+    let requirement = requirement.trim();
+    if requirement.is_empty() {
+        return true;
+    }
+    requirement.split("||").any(|range| {
+        range
+            .split_whitespace()
+            .all(|clause| node_version_satisfies_clause(version, clause))
+    })
+}
+
+fn read_package_json_field(path: &std::path::Path, pointer: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Value>(&content)
+        .ok()?
+        .pointer(pointer)?
+        .as_str()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn find_openclaw_package_json(cli_path: &std::path::Path) -> Option<PathBuf> {
+    let dir = cli_path.parent()?;
+    let cli_source = crate::utils::classify_cli_source(&cli_path.to_string_lossy());
+    let pkg_names: &[&str] = if cli_source == "npm-zh" || cli_source == "standalone" {
+        &["@qingchencloud/openclaw-zh", "openclaw"]
+    } else {
+        &["openclaw", "@qingchencloud/openclaw-zh"]
+    };
+
+    let mut current = Some(dir);
+    while let Some(candidate_dir) = current {
+        let own_pkg = candidate_dir.join("package.json");
+        if let Some(name) = read_package_json_field(&own_pkg, "/name") {
+            if name == "openclaw" || name == "@qingchencloud/openclaw-zh" {
+                return Some(own_pkg);
+            }
+        }
+        current = candidate_dir.parent();
+    }
+
+    for base in [Some(dir), dir.parent()].into_iter().flatten() {
+        for pkg_name in pkg_names {
+            let pkg = base
+                .join("node_modules")
+                .join(pkg_name)
+                .join("package.json");
+            if pkg.is_file() {
+                return Some(pkg);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn openclaw_node_requirement() -> Option<String> {
+    let cli_path = crate::utils::resolve_openclaw_cli_path()?;
+    let pkg_json = find_openclaw_package_json(std::path::Path::new(&cli_path))?;
+    read_package_json_field(&pkg_json, "/engines/node")
+}
+
+pub(crate) fn ensure_node_runtime_compatible() -> Result<(), String> {
+    let node = check_node()?;
+    let installed = node
+        .get("installed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !installed {
+        return Err("Node.js 未安装或未检测到，请先安装 Node.js 后重新检测".into());
+    }
+    let compatible = node
+        .get("compatible")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if compatible {
+        return Ok(());
+    }
+    let version = node
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let requirement = node
+        .get("requiredVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("当前 OpenClaw 要求的版本");
+    let path = node.get("path").and_then(Value::as_str).unwrap_or("");
+    Err(format!(
+        "Node.js 版本过低：当前检测到 {version}，当前 OpenClaw 要求 {requirement}。请升级 Node.js 后重新检测。检测路径：{path}"
+    ))
+}
+
 /// 提取基础版本号（去掉 -zh.x / -nightly.xxx 等后缀，只保留主版本数字部分）
 /// "2026.3.13-zh.1" → "2026.3.13", "2026.3.13" → "2026.3.13"
 fn base_version(v: &str) -> String {
@@ -4643,16 +4783,28 @@ pub fn check_node() -> Result<Value, String> {
             Ok(o) if o.status.success() => {
                 let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 let detected_from = detect_node_source(&path);
+                let required_version = openclaw_node_requirement();
+                let compatible = required_version
+                    .as_deref()
+                    .map(|req| node_version_satisfies_requirement(&ver, req))
+                    .unwrap_or(true);
                 result.insert("installed".into(), Value::Bool(true));
                 result.insert("version".into(), Value::String(ver));
                 result.insert("path".into(), Value::String(path));
                 result.insert("detectedFrom".into(), Value::String(detected_from));
+                result.insert("compatible".into(), Value::Bool(compatible));
+                result.insert(
+                    "requiredVersion".into(),
+                    required_version.map(Value::String).unwrap_or(Value::Null),
+                );
             }
             _ => {
                 result.insert("installed".into(), Value::Bool(false));
                 result.insert("version".into(), Value::Null);
                 result.insert("path".into(), Value::Null);
                 result.insert("detectedFrom".into(), Value::Null);
+                result.insert("compatible".into(), Value::Bool(false));
+                result.insert("requiredVersion".into(), Value::Null);
             }
         }
     } else {
@@ -4660,6 +4812,8 @@ pub fn check_node() -> Result<Value, String> {
         result.insert("version".into(), Value::Null);
         result.insert("path".into(), Value::Null);
         result.insert("detectedFrom".into(), Value::Null);
+        result.insert("compatible".into(), Value::Bool(false));
+        result.insert("requiredVersion".into(), Value::Null);
     }
     Ok(Value::Object(result))
 }
@@ -4788,6 +4942,8 @@ pub fn check_node_at_path(node_dir: String) -> Result<Value, String> {
     if !node_bin.exists() {
         result.insert("installed".into(), Value::Bool(false));
         result.insert("version".into(), Value::Null);
+        result.insert("compatible".into(), Value::Bool(false));
+        result.insert("requiredVersion".into(), Value::Null);
         return Ok(Value::Object(result));
     }
 
@@ -4798,13 +4954,25 @@ pub fn check_node_at_path(node_dir: String) -> Result<Value, String> {
     match cmd.output() {
         Ok(o) if o.status.success() => {
             let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let required_version = openclaw_node_requirement();
+            let compatible = required_version
+                .as_deref()
+                .map(|req| node_version_satisfies_requirement(&ver, req))
+                .unwrap_or(true);
             result.insert("installed".into(), Value::Bool(true));
             result.insert("version".into(), Value::String(ver));
             result.insert("path".into(), Value::String(node_dir));
+            result.insert("compatible".into(), Value::Bool(compatible));
+            result.insert(
+                "requiredVersion".into(),
+                required_version.map(Value::String).unwrap_or(Value::Null),
+            );
         }
         _ => {
             result.insert("installed".into(), Value::Bool(false));
             result.insert("version".into(), Value::Null);
+            result.insert("compatible".into(), Value::Bool(false));
+            result.insert("requiredVersion".into(), Value::Null);
         }
     }
     Ok(Value::Object(result))
@@ -4815,6 +4983,7 @@ pub fn check_node_at_path(node_dir: String) -> Result<Value, String> {
 pub fn scan_node_paths() -> Result<Value, String> {
     let mut found: Vec<Value> = vec![];
     let home = dirs::home_dir().unwrap_or_default();
+    let required_version = openclaw_node_requirement();
 
     let mut candidates: Vec<(String, String)> = vec![]; // (path, source)
 
@@ -5006,10 +5175,27 @@ pub fn scan_node_paths() -> Result<Value, String> {
             if let Ok(o) = cmd.output() {
                 if o.status.success() {
                     let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let compatible = required_version
+                        .as_deref()
+                        .map(|req| node_version_satisfies_requirement(&ver, req))
+                        .unwrap_or(true);
+                    let node_dir = node_bin
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| dir.clone());
                     let mut entry = serde_json::Map::new();
                     entry.insert("path".into(), Value::String(node_path_str));
+                    entry.insert("dir".into(), Value::String(node_dir));
                     entry.insert("version".into(), Value::String(ver));
                     entry.insert("source".into(), Value::String(source.clone()));
+                    entry.insert("compatible".into(), Value::Bool(compatible));
+                    entry.insert(
+                        "requiredVersion".into(),
+                        required_version
+                            .clone()
+                            .map(Value::String)
+                            .unwrap_or(Value::Null),
+                    );
                     // 标记是否激活
                     let is_active = source.contains("ACTIVE");
                     entry.insert("active".into(), Value::Bool(is_active));
@@ -5059,6 +5245,33 @@ fn is_nvm_active_version(nvm_dir: &str, version_dir: &std::path::Path) -> bool {
 /// 保存用户自定义的 Node.js 路径到 ~/.openclaw/clawpanel.json
 #[tauri::command]
 pub fn save_custom_node_path(node_dir: String) -> Result<(), String> {
+    let detected = check_node_at_path(node_dir.clone())?;
+    if !detected
+        .get("installed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("该目录下未找到 node 可执行文件，请确认路径正确。".into());
+    }
+    if detected
+        .get("compatible")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        == false
+    {
+        let version = detected
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let requirement = detected
+            .get("requiredVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("当前 OpenClaw 要求的版本");
+        return Err(format!(
+            "Node.js 版本过低：当前 {version}，要求 {requirement}。请升级 Node.js 后再使用该路径。"
+        ));
+    }
+
     let config_path = super::panel_config_path();
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -7175,6 +7388,122 @@ pub async fn auto_install_git(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
+/// 尝试自动安装或升级 Node.js LTS
+#[tauri::command]
+pub async fn auto_install_node(app: tauri::AppHandle) -> Result<String, String> {
+    use std::process::Stdio;
+    use tauri::Emitter;
+
+    let _ = app.emit("upgrade-log", "正在尝试安装或升级 Node.js LTS...");
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::{BufRead, BufReader};
+
+        let run_winget = |mode: &str| -> Result<std::process::Child, String> {
+            let mut args = vec![
+                mode,
+                "--id",
+                "OpenJS.NodeJS.LTS",
+                "-e",
+                "--source",
+                "winget",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ];
+            if mode == "upgrade" {
+                args.push("--silent");
+            }
+            let mut cmd = Command::new("winget");
+            cmd.args(args)
+                .creation_flags(0x08000000)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("winget 不可用，请手动升级 Node.js: {e}"))
+        };
+
+        let stream_child_logs = |app_handle: &tauri::AppHandle, child: &mut std::process::Child| {
+            let stderr = child.stderr.take();
+            let stdout = child.stdout.take();
+            let app_for_stderr = app_handle.clone();
+            let stderr_handle = std::thread::spawn(move || {
+                if let Some(pipe) = stderr {
+                    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                        let _ = app_for_stderr.emit("upgrade-log", &line);
+                    }
+                }
+            });
+            if let Some(pipe) = stdout {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let _ = app_handle.emit("upgrade-log", &line);
+                }
+            }
+            let _ = stderr_handle.join();
+        };
+
+        let _ = app.emit("upgrade-progress", 20);
+        let _ = app.emit("upgrade-log", "尝试通过 winget 升级 Node.js LTS...");
+        let mut child = run_winget("upgrade")?;
+        stream_child_logs(&app, &mut child);
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("等待 winget 升级 Node.js 失败: {e}"))?;
+        if !status.success() {
+            let _ = app.emit("upgrade-progress", 45);
+            let _ = app.emit("upgrade-log", "升级命令未成功，尝试改用 winget install...");
+            let mut install_child = run_winget("install")?;
+            stream_child_logs(&app, &mut install_child);
+            let install_status = install_child
+                .wait()
+                .map_err(|e| format!("等待 winget 安装 Node.js 失败: {e}"))?;
+            if !install_status.success() {
+                let requirement =
+                    openclaw_node_requirement().unwrap_or_else(|| "22.19.0 或更高版本".to_string());
+                return Err(format!(
+                    "winget 安装/升级 Node.js 失败，请手动安装满足 {requirement} 的 Node.js：https://nodejs.org/"
+                ));
+            }
+        }
+
+        let _ = app.emit("upgrade-progress", 75);
+        let _ = app.emit("upgrade-log", "正在刷新 PATH 并重新检测 Node.js...");
+        super::refresh_enhanced_path();
+        crate::commands::service::invalidate_cli_detection_cache();
+        let node = check_node()?;
+        if node
+            .get("compatible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let _ = app.emit("upgrade-progress", 100);
+            return Ok("Node.js 已安装或升级，请重新检测后启动 Gateway".into());
+        }
+        let version = node
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let requirement = node
+            .get("requiredVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("当前 OpenClaw 要求的版本");
+        return Err(format!(
+            "Node.js 升级后仍不满足要求：当前 {version}，要求 {requirement}。请重启 ClawPanel 或手动安装新版 Node.js。"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Err("请通过官网、Homebrew、nvm 或 fnm 升级 Node.js 后重新检测。".into())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Err("请使用系统包管理器、nvm 或 fnm 升级 Node.js 后重新检测。".into())
+    }
+}
+
 /// 配置 Git 使用 HTTPS 替代 SSH，解决国内用户 SSH 不通的问题
 #[tauri::command]
 pub fn configure_git_https() -> Result<String, String> {
@@ -7200,6 +7529,7 @@ pub fn invalidate_path_cache() -> Result<(), String> {
 #[cfg(test)]
 mod write_openclaw_config_merge_tests {
     use super::merge_configs_preserving_fields;
+    use super::node_version_satisfies_requirement;
     #[cfg(target_os = "windows")]
     use super::resolve_openclaw_cli_input_path;
     use serde_json::json;
@@ -7282,5 +7612,32 @@ mod write_openclaw_config_merge_tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(resolved, Some(cmd));
+    }
+
+    #[test]
+    fn node_requirement_rejects_versions_below_minimum() {
+        assert!(!node_version_satisfies_requirement("v22.17.0", ">=22.19.0"));
+    }
+
+    #[test]
+    fn node_requirement_accepts_minimum_and_newer_major() {
+        assert!(node_version_satisfies_requirement("v22.19.0", ">=22.19.0"));
+        assert!(node_version_satisfies_requirement("v24.0.0", ">=22.19.0"));
+    }
+
+    #[test]
+    fn node_requirement_supports_common_or_ranges() {
+        assert!(node_version_satisfies_requirement(
+            "v22.20.0",
+            "^22.19.0 || >=24.0.0"
+        ));
+        assert!(!node_version_satisfies_requirement(
+            "v23.0.0",
+            "^22.19.0 || >=24.0.0"
+        ));
+        assert!(node_version_satisfies_requirement(
+            "v24.1.0",
+            "^22.19.0 || >=24.0.0"
+        ));
     }
 }

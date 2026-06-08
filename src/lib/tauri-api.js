@@ -397,6 +397,7 @@ export const api = {
   checkGit: () => cachedInvoke('check_git', {}, 60000),
   scanGitPaths: () => invoke('scan_git_paths'),
   autoInstallGit: () => invoke('auto_install_git'),
+  autoInstallNode: () => invoke('auto_install_node').then(r => { invalidate('check_node', 'get_services_status'); invoke('invalidate_path_cache').catch(() => {}); return r }),
   configureGitHttps: () => invoke('configure_git_https'),
   getDeployConfig: () => cachedInvoke('get_deploy_config'),
   patchModelVision: () => invoke('patch_model_vision'),

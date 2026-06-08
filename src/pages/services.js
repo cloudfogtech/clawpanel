@@ -721,7 +721,7 @@ async function handleServiceAction(action, label, page) {
       // 而不是丢一个 toast 让小白对着 stderr 干瞪眼。
       await _promptDoctorFix(page, actionLabel, e)
     } else {
-      toast(t('services.actionCmdFailed', { action: actionLabel, error: e.message || e }), 'error')
+      toast(humanizeError(e, t('services.actionCmdFailed', { action: actionLabel, error: '' }).trim()), 'error')
     }
     if (actionsEl) actionsEl.innerHTML = origHtml
     if (dot) dot.className = 'status-dot stopped'
@@ -1136,7 +1136,7 @@ async function _promptDoctorFix(page, actionLabel, originalErr) {
     }
   )
   if (!yes) {
-    toast(t('services.actionCmdFailed', { action: actionLabel, error: errMsg }), 'error')
+    toast(humanizeError(errMsg, t('services.actionCmdFailed', { action: actionLabel, error: '' }).trim()), 'error')
     return
   }
 

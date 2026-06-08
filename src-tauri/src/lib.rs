@@ -115,6 +115,7 @@ pub fn run() {
             config::check_git,
             config::scan_git_paths,
             config::auto_install_git,
+            config::auto_install_node,
             config::configure_git_https,
             config::invalidate_path_cache,
             config::get_status_summary,
