@@ -2,10 +2,9 @@
 ///
 /// 检测策略（跨平台统一）：
 ///   1. TCP 连 127.0.0.1:{port}，超时 1.5s
-///   2. 连通 → 认为 Gateway 在运行
+///   2. 连通 → 认为 Gateway 在运行，并尽量解析监听 PID
 ///
-/// 不依赖任何系统命令（无 netstat / PowerShell / launchctl / openclaw health），
-/// 无权限问题，逻辑一致。
+/// 系统命令仅作为 PID 增强信息来源；命令不可用时不影响运行状态判断。
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -120,6 +119,54 @@ fn matches_current_gateway_owner_signature(owner: &GatewayOwnerRecord) -> bool {
 fn gateway_owner_pid_needs_refresh(owner: &GatewayOwnerRecord, pid: Option<u32>) -> bool {
     matches_current_gateway_owner_signature(owner)
         && matches!(pid, Some(current_pid) if owner.pid != Some(current_pid))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_ss_listen_pid_output(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        let Some(idx) = line.find("pid=") else {
+            continue;
+        };
+        let digits: String = line[idx + 4..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(pid) = digits.parse::<u32>() {
+            if pid > 0 {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn parse_lsof_pid_output(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        line.split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+    })
+}
+
+#[cfg(test)]
+mod gateway_pid_parse_tests {
+    use super::{parse_lsof_pid_output, parse_ss_listen_pid_output};
+
+    #[test]
+    fn parses_linux_ss_listener_pid() {
+        let output = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n\
+LISTEN 0      511        127.0.0.1:18789      0.0.0.0:*    users:((\"node\",pid=4242,fd=23))";
+
+        assert_eq!(parse_ss_listen_pid_output(output), Some(4242));
+    }
+
+    #[test]
+    fn parses_lsof_listener_pid() {
+        assert_eq!(parse_lsof_pid_output("4242\n"), Some(4242));
+        assert_eq!(parse_lsof_pid_output("not-a-pid\n4242\n"), Some(4242));
+    }
 }
 
 fn read_gateway_owner() -> Option<GatewayOwnerRecord> {
@@ -933,11 +980,13 @@ mod platform {
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
-        text.lines().next()?.trim().parse::<u32>().ok()
+        super::parse_lsof_pid_output(&text)
     }
 
     /// launchctl 失败时的回退：直接通过 CLI spawn Gateway 进程
     fn start_gateway_direct() -> Result<(), String> {
+        crate::commands::config::ensure_node_runtime_compatible()?;
+
         // 启动前再次检查端口（防止 launchctl→direct 回退链路中重复拉起）
         let port = crate::commands::gateway_listen_port();
         if let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() {
@@ -1002,6 +1051,8 @@ mod platform {
     }
 
     pub fn start_service_impl(label: &str) -> Result<(), String> {
+        crate::commands::config::ensure_node_runtime_compatible()?;
+
         // 启动前检查端口是否已被占用，防止重复拉起导致端口冲突和内存浪费
         let port = crate::commands::gateway_listen_port();
         let pre_check_addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
@@ -1090,6 +1141,8 @@ mod platform {
 
     #[allow(dead_code)]
     pub fn restart_service_impl(label: &str) -> Result<(), String> {
+        crate::commands::config::ensure_node_runtime_compatible()?;
+
         let uid = current_uid()?;
         let path = plist_path(label);
         let domain_target = format!("gui/{}", uid);
@@ -1449,10 +1502,17 @@ mod platform {
         // standalone 安装目录（集中管理，避免多处硬编码）
         for sa_dir in crate::commands::config::all_standalone_dirs() {
             candidates.push(sa_dir.join("openclaw.cmd"));
+            candidates.push(sa_dir.join("openclaw.exe"));
+            candidates.push(sa_dir.join("openclaw.bat"));
+            candidates.push(sa_dir.join("openclaw.js"));
         }
 
         if let Ok(appdata) = env::var("APPDATA") {
-            candidates.push(Path::new(&appdata).join("npm").join("openclaw.cmd"));
+            let npm_dir = Path::new(&appdata).join("npm");
+            candidates.push(npm_dir.join("openclaw.cmd"));
+            candidates.push(npm_dir.join("openclaw.exe"));
+            candidates.push(npm_dir.join("openclaw.bat"));
+            candidates.push(npm_dir.join("openclaw.js"));
         }
         if let Ok(localappdata) = env::var("LOCALAPPDATA") {
             candidates.push(
@@ -1474,7 +1534,9 @@ mod platform {
             }
             let base = Path::new(dir);
             candidates.push(base.join("openclaw.cmd"));
-            candidates.push(base.join("openclaw"));
+            candidates.push(base.join("openclaw.exe"));
+            candidates.push(base.join("openclaw.bat"));
+            candidates.push(base.join("openclaw.js"));
             candidates.push(
                 base.join("node_modules")
                     .join("@qingchencloud")
@@ -1496,7 +1558,7 @@ mod platform {
 
         // 方式1: 检查常见文件路径（零进程，最快）
         for path in candidate_cli_paths() {
-            if path.exists() {
+            if crate::utils::canonicalize_windows_openclaw_cli_path(&path).is_some() {
                 return true;
             }
         }
@@ -1511,12 +1573,12 @@ mod platform {
             if o.status.success() {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 for line in stdout.lines() {
-                    let p = line.trim().to_lowercase();
-                    // 跳过已知第三方 openclaw 路径
-                    if p.contains(".cherrystudio") || p.contains("cherry-studio") {
+                    let p = line.trim();
+                    if p.is_empty() {
                         continue;
                     }
-                    if !p.is_empty() {
+                    if crate::utils::canonicalize_windows_openclaw_cli_path(Path::new(p)).is_some()
+                    {
                         return true;
                     }
                 }
@@ -1621,7 +1683,7 @@ mod platform {
         fs::create_dir_all(openclaw_dir).map_err(|e| format!("创建 OpenClaw 目录失败: {e}"))?;
         let runner_path = openclaw_dir.join("clawpanel-gateway.cmd");
         let content = format!(
-            "@echo off\r\ntitle {GATEWAY_WINDOW_TITLE}\r\necho OpenClaw Gateway is running. Keep this window open.\r\necho Close this window to stop Gateway.\r\necho.\r\n{}\r\necho.\r\necho Gateway exited. You can close this window.\r\n",
+            "@echo off\r\ntitle {GATEWAY_WINDOW_TITLE}\r\necho Starting OpenClaw Gateway. Keep this window open after it starts.\r\necho Close this window to stop Gateway.\r\necho.\r\n{}\r\necho.\r\necho Gateway exited. You can close this window.\r\n",
             gateway_terminal_command(cli)
         );
         fs::write(&runner_path, content).map_err(|e| format!("写入 Gateway 启动脚本失败: {e}"))?;
@@ -1643,6 +1705,7 @@ mod platform {
                     .into(),
             );
         }
+        crate::commands::config::ensure_node_runtime_compatible()?;
 
         let (running, pid) = check_service_status(0, "");
         if running {
@@ -1886,6 +1949,31 @@ mod platform {
         vec!["ai.openclaw.gateway".to_string()]
     }
 
+    fn get_pid_by_port(port: u16) -> Option<u32> {
+        let filter = format!("sport = :{port}");
+        if let Ok(output) = std::process::Command::new("ss")
+            .args(["-ltnp", &filter])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(pid) = super::parse_ss_listen_pid_output(&text) {
+                return Some(pid);
+            }
+        }
+
+        if let Ok(output) = std::process::Command::new("lsof")
+            .args(["-i", &format!("TCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(pid) = super::parse_lsof_pid_output(&text) {
+                return Some(pid);
+            }
+        }
+
+        None
+    }
+
     /// 跨平台统一检测：TCP 连端口
     #[allow(dead_code)]
     pub async fn check_service_status(_uid: u32, _label: &str) -> (bool, Option<u32>) {
@@ -1903,7 +1991,7 @@ mod platform {
         .await
         .unwrap_or(false);
         if result {
-            (true, None)
+            (true, get_pid_by_port(port))
         } else {
             (false, None)
         }
@@ -2000,6 +2088,7 @@ mod platform {
                     .into(),
             );
         }
+        crate::commands::config::ensure_node_runtime_compatible()?;
 
         // 启动前检查端口是否已被占用，防止重复拉起导致端口冲突和内存浪费
         let port = crate::commands::gateway_listen_port();

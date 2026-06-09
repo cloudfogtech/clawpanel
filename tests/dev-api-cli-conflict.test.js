@@ -6,8 +6,10 @@ import path from 'node:path'
 
 import {
   buildOpenclawPathConflictRecords,
+  resolveOpenclawCliInput,
   quarantineOpenclawPathForWeb,
   readJsonFileRelaxed,
+  shouldFallbackStandaloneToNpm,
 } from '../scripts/dev-api.js'
 
 test('Web API JSON 读取会兼容 UTF-8 BOM', () => {
@@ -63,6 +65,25 @@ test('Web API CLI 冲突扫描会排除 standalone 安装', () => {
   assert.deepEqual(records, [])
 })
 
+test('Web API CLI 冲突扫描会排除当前活跃入口', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clawpanel-cli-active-'))
+  try {
+    const cliPath = path.join(tmp, process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw')
+    fs.writeFileSync(cliPath, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n')
+
+    const records = buildOpenclawPathConflictRecords([{
+      path: cliPath,
+      source: 'unknown',
+      version: '9.9.9',
+      active: true,
+    }])
+
+    assert.deepEqual(records, [])
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('Web API CLI 隔离只允许 openclaw 文件并保留可恢复备份', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clawpanel-cli-quarantine-'))
   try {
@@ -81,6 +102,22 @@ test('Web API CLI 隔离只允许 openclaw 文件并保留可恢复备份', () =
   }
 })
 
+test('Web API CLI 隔离拒绝当前 Gateway 使用中的入口', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clawpanel-cli-quarantine-active-'))
+  try {
+    const cliPath = path.join(tmp, process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw')
+    fs.writeFileSync(cliPath, 'echo openclaw\n')
+
+    assert.throws(
+      () => quarantineOpenclawPathForWeb(cliPath, { activeCliPaths: [cliPath] }),
+      /正在被 Gateway 使用/
+    )
+    assert.equal(fs.existsSync(cliPath), true)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('Web API CLI 隔离拒绝非 openclaw 文件', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clawpanel-cli-quarantine-deny-'))
   try {
@@ -89,6 +126,36 @@ test('Web API CLI 隔离拒绝非 openclaw 文件', () => {
 
     assert.throws(() => quarantineOpenclawPathForWeb(filePath), /拒绝隔离非 openclaw 文件/)
     assert.equal(fs.existsSync(filePath), true)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('Web API standalone 当前运行模式失败时不自动降级到 npm', () => {
+  assert.equal(shouldFallbackStandaloneToNpm({ currentInstallMode: 'standalone', method: 'auto' }), false)
+  assert.equal(shouldFallbackStandaloneToNpm({ currentInstallMode: 'standalone', method: 'standalone-r2' }), false)
+})
+
+test('Web API 非 standalone 当前运行模式允许 auto 兜底 npm', () => {
+  assert.equal(shouldFallbackStandaloneToNpm({ currentInstallMode: 'npm', method: 'auto' }), true)
+  assert.equal(shouldFallbackStandaloneToNpm({ currentInstallMode: 'unknown', method: 'auto' }), true)
+  assert.equal(shouldFallbackStandaloneToNpm({ currentInstallMode: 'npm', method: 'standalone-github' }), false)
+})
+
+test('Web API Windows CLI 解析不会绑定无扩展名 openclaw shim', (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('Windows only')
+    return
+  }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clawpanel-cli-shim-'))
+  try {
+    const bare = path.join(tmp, 'openclaw')
+    fs.writeFileSync(bare, '#!/bin/sh\n')
+    assert.equal(resolveOpenclawCliInput(bare), null)
+
+    const cmd = path.join(tmp, 'openclaw.cmd')
+    fs.writeFileSync(cmd, '@echo off\r\n')
+    assert.equal(resolveOpenclawCliInput(bare), cmd)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }

@@ -31,7 +31,7 @@
 
 | 依赖 | 最低版本 | 说明 |
 |------|----------|------|
-| Node.js | 18+ | 前端构建（推荐 22 LTS） |
+| Node.js | 18+ | 前端构建与 Web 后端（推荐 22 LTS）；运行 OpenClaw Gateway 时按当前 OpenClaw 的 `engines.node` 检测 |
 | Rust | stable | Tauri 后端编译 |
 | Tauri CLI | v2 | `cargo install tauri-cli --version "^2"` |
 
@@ -135,8 +135,8 @@ clawpanel/
 │   ├── build.sh                #   macOS/Linux 编译与打包
 │   ├── linux-deploy.sh         #   Linux 服务器一键部署
 │   └── sync-version.js         #   版本号同步脚本
-├── docs/                       # 文档与截图
-│   ├── index.html              #   官网（claw.qt.cool）
+├── docs/                       # 文档、截图与更新清单
+│   ├── update/latest.json      #   旧版前端热更新兼容清单（新客户端不作为主更新入口）
 │   ├── linux-deploy.md         #   Linux 部署指南
 │   └── docker-deploy.md        #   Docker 部署指南
 ├── public/                     # 静态资源（图标、Logo）
@@ -197,7 +197,6 @@ tauri-api.js  →  isTauri?
 | `package.json` | `version` | **主版本源** — npm、前端构建、侧边栏显示 |
 | `src-tauri/tauri.conf.json` | `version` | Tauri 打包版本号 |
 | `src-tauri/Cargo.toml` | `version` | Rust crate 版本号 |
-| `docs/index.html` | `softwareVersion` | 官网 JSON-LD SEO |
 | `CHANGELOG.md` | `## [x.y.z]` | 变更日志（需手动编写内容） |
 
 ### 同步命令
@@ -228,7 +227,7 @@ import { version as APP_VERSION } from '../../package.json'
 # 1. 确认工作区干净
 git status
 
-# 2. 设置新版本号（自动同步到 tauri.conf.json / Cargo.toml / docs/index.html）
+# 2. 设置新版本号（自动同步到 tauri.conf.json / Cargo.toml / Cargo.lock）
 npm run version:set 0.6.0
 
 # 3. 编写 CHANGELOG.md 变更记录
@@ -452,7 +451,7 @@ ClawPanel 支持访问密码保护，**Web 模式和 Tauri 桌面端均可启用
 
 ### 1. 桌面应用（Tauri）
 
-面向 macOS / Windows / Linux 桌面用户，从 [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases) 下载安装包。
+面向 macOS / Windows / Linux 桌面用户，优先从 [官网下载中心](https://claw.qt.cool/download) 下载安装包；[GitHub Releases](https://github.com/qingchencloud/clawpanel/releases) 保留为备用入口。
 
 ### 2. Linux 服务器（Web 版）
 
@@ -557,3 +556,4 @@ git push origin main
 ## 问题反馈
 
 如果发现 Bug 或有功能建议，欢迎通过 [GitHub Issues](https://github.com/qingchencloud/clawpanel/issues) 提交。
+日常交流和使用讨论也可以加入 [Telegram 群](https://t.me/clawpanel)。

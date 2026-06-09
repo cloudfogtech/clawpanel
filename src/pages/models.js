@@ -1327,7 +1327,7 @@ async function importClientConfigs(page, state) {
         ${candidates.map((c, idx) => {
           const models = candidateModels(c)
           const status = c.apiKeyStatus === 'found' ? t('models.importKeyFound') : (c.apiKeyStatus === 'missing' ? t('models.importKeyMissing') : t('models.importKeyNone'))
-          const disabled = !c.importable || !models.length
+          const disabled = !c.importable || c.apiKeyStatus === 'missing' || !models.length
           const checked = !disabled && c.apiKeyStatus !== 'missing'
           return `
             <label style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border-color);border-radius:var(--radius-md);background:var(--bg-tertiary);opacity:${disabled ? '0.65' : '1'}">
@@ -1366,7 +1366,7 @@ async function importClientConfigs(page, state) {
   overlay.querySelector('[data-action="import"]').onclick = () => {
     const selected = [...overlay.querySelectorAll('input[type="checkbox"]:checked')]
       .map(input => candidates[Number(input.dataset.index)])
-      .filter(Boolean)
+      .filter(candidate => candidate && candidate.importable && candidate.apiKeyStatus !== 'missing')
     if (!selected.length) { toast(t('models.importNoneSelected'), 'warning'); return }
     pushUndo(state)
     if (!state.config.models) state.config.models = { mode: 'replace', providers: {} }

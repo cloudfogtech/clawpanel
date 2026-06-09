@@ -249,21 +249,25 @@ export function showUpgradeModal(title) {
   let _finished = false
   let _taskBar = null
   let _progressLabels = null
+  let _closed = false
 
   // 重新打开弹窗（从任务状态栏点击时）
   function reopenModal() {
+    _closed = false
     if (_taskBar) { _taskBar.remove(); _taskBar = null }
     document.body.appendChild(overlay)
   }
 
   // 关闭弹窗：未完成时显示任务状态栏
   function closeModal() {
+    if (_closed) return
+    _closed = true
     overlay.remove()
     if (!_finished) {
       showTaskBar()
     } else {
       if (_taskBar) { _taskBar.remove(); _taskBar = null }
-      _onClose?.()
+      setTimeout(() => _onClose?.(), 0)
     }
   }
 
@@ -290,6 +294,11 @@ export function showUpgradeModal(title) {
   }
 
   closeBtn.onclick = closeModal
+  closeBtn.addEventListener('click', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    closeModal()
+  })
   overlay.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeModal()
   })
@@ -339,6 +348,9 @@ export function showUpgradeModal(title) {
         if (span) { span.textContent = msg || t('common.upgradeFailed'); span.style.color = 'var(--error)' }
       }
       closeBtn.focus()
+    },
+    setCloseText(label) {
+      if (label) closeBtn.textContent = label
     },
     onClose(fn) { _onClose = fn },
     destroy() { overlay.remove(); if (_taskBar) { _taskBar.remove(); _taskBar = null } _onClose?.() },

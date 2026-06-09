@@ -31,7 +31,7 @@ const HERMES_PROVIDER_REGISTRY = [
   hermesProvider('gemini', 'Google AI Studio', 'api_key', 'https://generativelanguage.googleapis.com/v1beta/openai', 'GEMINI_BASE_URL', ['GOOGLE_API_KEY', 'GEMINI_API_KEY'], 'openai_chat', 'openai', ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemma-4-31b-it', 'gemma-4-26b-it']),
   hermesProvider('deepseek', 'DeepSeek', 'api_key', 'https://api.deepseek.com', 'DEEPSEEK_BASE_URL', ['DEEPSEEK_API_KEY'], 'openai_chat', 'openai', ['deepseek-chat', 'deepseek-reasoner']),
   hermesProvider('xai', 'xAI', 'api_key', 'https://api.x.ai/v1', 'XAI_BASE_URL', ['XAI_API_KEY'], 'openai_chat', 'openai', ['grok-4.20-reasoning', 'grok-4-1-fast-reasoning']),
-  hermesProvider('minimax', 'MiniMax (International)', 'api_key', 'https://api.minimax.io/anthropic/v1', 'MINIMAX_BASE_URL', ['MINIMAX_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2', 'MiniMax-M2-highspeed']),
+  hermesProvider('minimax', 'MiniMax (International)', 'api_key', 'https://api.minimax.io/anthropic/v1', 'MINIMAX_BASE_URL', ['MINIMAX_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed']),
   hermesProvider('huggingface', 'Hugging Face', 'api_key', 'https://router.huggingface.co/v1', 'HF_BASE_URL', ['HF_TOKEN'], 'openai_chat', 'openai', ['Qwen/Qwen3.5-397B-A17B', 'Qwen/Qwen3.5-35B-A3B', 'deepseek-ai/DeepSeek-V3.2', 'moonshotai/Kimi-K2.5', 'MiniMaxAI/MiniMax-M2.5', 'zai-org/GLM-5', 'XiaomiMiMo/MiMo-V2-Flash', 'moonshotai/Kimi-K2-Thinking'], true),
   hermesProvider('arcee', 'Arcee AI', 'api_key', 'https://api.arcee.ai/api/v1', 'ARCEE_BASE_URL', ['ARCEEAI_API_KEY'], 'openai_chat', 'openai', []),
   hermesProvider('azure-foundry', 'Azure Foundry', 'api_key', '', 'AZURE_FOUNDRY_BASE_URL', ['AZURE_FOUNDRY_API_KEY'], 'openai_chat', 'openai', [], true),
@@ -45,7 +45,7 @@ const HERMES_PROVIDER_REGISTRY = [
   hermesProvider('kimi-coding-cn', 'Kimi / Moonshot (China)', 'api_key', 'https://api.moonshot.cn/v1', '', ['KIMI_CN_API_KEY'], 'openai_chat', 'openai', ['kimi-for-coding', 'kimi-k2.6', 'kimi-k2.5', 'kimi-k2-thinking', 'kimi-k2-turbo-preview']),
   hermesProvider('alibaba', 'Alibaba Cloud (DashScope)', 'api_key', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', 'DASHSCOPE_BASE_URL', ['DASHSCOPE_API_KEY'], 'openai_chat', 'openai', ['qwen3.5-plus', 'qwen3-coder-plus', 'qwen3-coder-next', 'glm-5', 'glm-4.7', 'kimi-k2.5', 'MiniMax-M2.5']),
   hermesProvider('alibaba-coding-plan', 'Alibaba Cloud (Coding Plan)', 'api_key', 'https://coding-intl.dashscope.aliyuncs.com/v1', 'ALIBABA_CODING_PLAN_BASE_URL', ['ALIBABA_CODING_PLAN_API_KEY', 'DASHSCOPE_API_KEY'], 'openai_chat', 'openai', ['qwen3-coder-plus', 'qwen3-coder-next', 'qwen3.5-plus', 'qwen3.5-coder']),
-  hermesProvider('minimax-cn', 'MiniMax (China)', 'api_key', 'https://api.minimaxi.com/v1', 'MINIMAX_CN_BASE_URL', ['MINIMAX_CN_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2', 'MiniMax-M2-highspeed']),
+  hermesProvider('minimax-cn', 'MiniMax (China)', 'api_key', 'https://api.minimaxi.com/v1', 'MINIMAX_CN_BASE_URL', ['MINIMAX_CN_API_KEY'], 'anthropic_messages', 'anthropic', ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed']),
   hermesProvider('xiaomi', 'Xiaomi MiMo', 'api_key', 'https://api.xiaomimimo.com/v1', 'XIAOMI_BASE_URL', ['XIAOMI_API_KEY'], 'openai_chat', 'openai', ['mimo-v2-pro', 'mimo-v2-omni', 'mimo-v2-flash']),
   hermesProvider('bedrock', 'AWS Bedrock', 'aws_sdk', 'https://bedrock-runtime.us-east-1.amazonaws.com', 'BEDROCK_BASE_URL', [], 'anthropic_messages', 'none', []),
   hermesProvider('openrouter', 'OpenRouter', 'api_key', 'https://openrouter.ai/api/v1', 'OPENAI_BASE_URL', ['OPENROUTER_API_KEY'], 'openai_chat', 'openai', [], true),
@@ -57,7 +57,7 @@ const HERMES_PROVIDER_REGISTRY = [
   hermesProvider('openai-codex', 'OpenAI Codex', 'oauth_external', 'https://chatgpt.com/backend-api/codex', '', [], 'codex_responses', 'none', ['gpt-5.5', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.2-codex', 'gpt-5.1-codex-max', 'gpt-5.1-codex-mini'], false, 'hermes auth login openai-codex'),
   hermesProvider('qwen-oauth', 'Qwen OAuth', 'oauth_external', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', '', [], 'openai_chat', 'none', ['qwen3.5-plus', 'qwen3-coder-plus', 'qwen3-coder-next'], false, 'hermes auth login qwen-oauth'),
   hermesProvider('google-gemini-cli', 'Google Gemini (OAuth)', 'oauth_external', 'https://generativelanguage.googleapis.com/v1beta/openai', '', [], 'openai_chat', 'none', ['gemini-2.5-pro', 'gemini-2.5-flash'], false, 'hermes auth login google-gemini-cli'),
-  hermesProvider('minimax-oauth', 'MiniMax (OAuth)', 'oauth_minimax', 'https://api.minimax.io/anthropic', '', [], 'anthropic_messages', 'none', ['MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2', 'MiniMax-M2-highspeed'], false, 'hermes auth login minimax-oauth'),
+  hermesProvider('minimax-oauth', 'MiniMax (OAuth)', 'oauth_minimax', 'https://api.minimax.io/anthropic', '', [], 'anthropic_messages', 'none', ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed'], false, 'hermes auth login minimax-oauth'),
   hermesProvider('copilot-acp', 'GitHub Copilot ACP', 'external_process', 'http://127.0.0.1:0', 'COPILOT_ACP_BASE_URL', [], 'openai_chat', 'none', ['gpt-4o', 'gpt-4.1', 'claude-3.5-sonnet', 'claude-3.7-sonnet'], false, 'hermes auth login copilot-acp'),
   hermesProvider('custom', 'Custom OpenAI-Compatible', 'api_key', '', 'OPENAI_BASE_URL', ['OPENAI_API_KEY', 'CUSTOM_API_KEY'], 'openai_chat', 'openai', [], true),
 ]
@@ -265,7 +265,98 @@ const PANEL_VERSION = (() => {
     return '0.0.0'
   }
 })()
+const SITE_BASE_URL = 'https://claw.qt.cool'
 const VERSION_POLICY_PATH = path.join(__dev_dirname, '..', 'openclaw-version-policy.json')
+
+function ensureArrayContains(value, required) {
+  const current = Array.isArray(value)
+    ? value.filter(item => typeof item === 'string')
+    : []
+  let changed = !Array.isArray(value) || current.length !== value.length
+  for (const item of required) {
+    if (!current.includes(item)) {
+      current.push(item)
+      changed = true
+    }
+  }
+  return { value: current, changed }
+}
+
+function generatePairingToken() {
+  return crypto.randomBytes(32).toString('base64url')
+}
+
+function operatorTokenIsUsable(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
+  if (entry.revokedAtMs != null) return false
+  if (entry.role !== 'operator') return false
+  if (typeof entry.token !== 'string' || !entry.token.trim()) return false
+  if (!Array.isArray(entry.scopes)) return false
+  return SCOPES.every(scope => entry.scopes.includes(scope))
+}
+
+function ensureOperatorToken(entry, nowMs = Date.now()) {
+  if (!entry.tokens || typeof entry.tokens !== 'object' || Array.isArray(entry.tokens)) {
+    entry.tokens = {}
+  }
+  if (operatorTokenIsUsable(entry.tokens.operator)) return false
+
+  const existing = entry.tokens.operator && typeof entry.tokens.operator === 'object' && !Array.isArray(entry.tokens.operator)
+    ? entry.tokens.operator
+    : null
+  entry.tokens.operator = {
+    token: typeof existing?.token === 'string' && existing.token.trim() ? existing.token : generatePairingToken(),
+    role: 'operator',
+    scopes: SCOPES,
+    createdAtMs: Number.isFinite(Number(existing?.createdAtMs)) && Number(existing.createdAtMs) > 0
+      ? Number(existing.createdAtMs)
+      : nowMs,
+    rotatedAtMs: nowMs,
+  }
+  if (Number.isFinite(Number(existing?.lastUsedAtMs)) && Number(existing.lastUsedAtMs) > 0) {
+    entry.tokens.operator.lastUsedAtMs = Number(existing.lastUsedAtMs)
+  }
+  return true
+}
+
+function normalizeControlUiPairingEntry(entry, deviceId, publicKey, platform, nowMs = Date.now()) {
+  const next = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {}
+  let changed = next !== entry
+  const setString = (key, value) => {
+    if (next[key] === value) return
+    next[key] = value
+    changed = true
+  }
+
+  setString('deviceId', deviceId)
+  setString('publicKey', publicKey)
+  setString('platform', platform)
+  setString('deviceFamily', 'desktop')
+  setString('clientId', 'openclaw-control-ui')
+  setString('clientMode', 'ui')
+  setString('role', 'operator')
+
+  for (const [key, required] of [['roles', ['operator']], ['scopes', SCOPES], ['approvedScopes', SCOPES]]) {
+    const normalized = ensureArrayContains(next[key], required)
+    if (normalized.changed) {
+      next[key] = normalized.value
+      changed = true
+    }
+  }
+
+  changed = ensureOperatorToken(next, nowMs) || changed
+  if (!Number.isFinite(Number(next.createdAtMs)) || Number(next.createdAtMs) <= 0) {
+    next.createdAtMs = nowMs
+    changed = true
+  }
+  if (changed || !Number.isFinite(Number(next.approvedAtMs)) || Number(next.approvedAtMs) <= 0) {
+    next.approvedAtMs = nowMs
+    changed = true
+  }
+
+  return { entry: next, changed }
+}
+
 function normalizeCustomOpenclawDir(raw) {
   if (typeof raw !== 'string') return null
   const trimmed = raw.trim()
@@ -321,13 +412,37 @@ function scanCliIdentity(rawPath) {
   return canonicalCliPath(identityPath) || identityPath
 }
 
+function isWindowsLaunchableOpenclawPath(rawPath) {
+  if (!isWindows) return true
+  const normalized = normalizeCliPath(rawPath)
+  if (!normalized) return false
+  const base = path.basename(normalized).toLowerCase()
+  return ['openclaw.cmd', 'openclaw.exe', 'openclaw.bat', 'openclaw.js'].includes(base)
+}
+
+export function canonicalWindowsOpenclawCliPath(rawPath) {
+  const normalized = normalizeCliPath(rawPath)
+  if (!normalized || !isWindows) return normalized
+  const base = path.basename(normalized).toLowerCase()
+  if (['openclaw', 'openclaw.exe', 'openclaw.ps1'].includes(base)) {
+    for (const name of ['openclaw.cmd', 'openclaw.exe', 'openclaw.bat', 'openclaw.js']) {
+      const candidate = path.join(path.dirname(normalized), name)
+      if (fs.existsSync(candidate) && !isRejectedCliPath(candidate)) return candidate
+    }
+  }
+  if (fs.existsSync(normalized) && isWindowsLaunchableOpenclawPath(normalized) && !isRejectedCliPath(normalized)) {
+    return normalized
+  }
+  return null
+}
+
 function isRejectedCliPath(cliPath) {
   const lower = String(cliPath || '').replace(/\\/g, '/').toLowerCase()
   return lower.includes('/.cherrystudio/') || lower.includes('cherry-studio')
 }
 
 function addCliCandidate(candidates, seen, rawPath) {
-  const normalized = normalizeCliPath(rawPath)
+  const normalized = isWindows ? canonicalWindowsOpenclawCliPath(rawPath) : normalizeCliPath(rawPath)
   if (!normalized || !fs.existsSync(normalized) || isRejectedCliPath(normalized)) return
   const identity = scanCliIdentity(normalized) || normalized
   const key = isWindows ? identity.toLowerCase() : identity
@@ -441,7 +556,7 @@ function classifyCliSource(cliPath) {
     const shimSource = detectWindowsShimSource(normalized)
     if (shimSource) return shimSource
   }
-  if (lower.includes('/npm/') || lower.includes('/node_modules/')) return 'npm-official'
+  if (lower.includes('/npm/') || lower.includes('/npm-global/') || lower.includes('/node_modules/')) return 'npm-official'
   if (lower.includes('/homebrew/') || lower.includes('/usr/local/bin/') || lower.includes('/usr/bin/')) return 'npm-global'
   return 'unknown'
 }
@@ -515,6 +630,114 @@ function readVersionFromInstallation(cliPath) {
   return null
 }
 
+function findOpenclawPackageJson(cliPath) {
+  const resolved = canonicalCliPath(cliPath)
+  if (!resolved || !fs.existsSync(resolved)) return null
+  const dir = path.dirname(resolved)
+  const ownPackageCandidates = []
+  let current = dir
+  while (current && current !== path.dirname(current)) {
+    ownPackageCandidates.push(path.join(current, 'package.json'))
+    current = path.dirname(current)
+  }
+  for (const pkgPath of ownPackageCandidates) {
+    try {
+      if (!fs.existsSync(pkgPath)) continue
+      const name = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))?.name
+      if (name === 'openclaw' || name === '@qingchencloud/openclaw-zh') return pkgPath
+    } catch {}
+  }
+
+  const cliSource = classifyCliSource(resolved)
+  const pkgNames = (cliSource === 'standalone' || cliSource === 'npm-zh')
+    ? [path.join('@qingchencloud', 'openclaw-zh'), 'openclaw']
+    : ['openclaw', path.join('@qingchencloud', 'openclaw-zh')]
+  const bases = [dir, path.dirname(dir)].filter(Boolean)
+  for (const base of bases) {
+    for (const pkgName of pkgNames) {
+      const pkgPath = path.join(base, 'node_modules', pkgName, 'package.json')
+      if (fs.existsSync(pkgPath)) return pkgPath
+    }
+  }
+  return null
+}
+
+function openclawNodeRequirement() {
+  const cliPath = resolveOpenclawCliPath()
+  const pkgPath = cliPath ? findOpenclawPackageJson(cliPath) : null
+  if (!pkgPath) return null
+  try {
+    const requirement = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))?.engines?.node
+    return typeof requirement === 'string' && requirement.trim() ? requirement.trim() : null
+  } catch {
+    return null
+  }
+}
+
+function parseNodeVersionTriplet(value) {
+  const match = String(value || '').match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?/)
+  if (!match) return null
+  return [Number(match[1] || 0), Number(match[2] || 0), Number(match[3] || 0)]
+}
+
+function compareVersionTriplet(left, right) {
+  for (let i = 0; i < 3; i++) {
+    if ((left[i] || 0) > (right[i] || 0)) return 1
+    if ((left[i] || 0) < (right[i] || 0)) return -1
+  }
+  return 0
+}
+
+function nodeVersionSatisfiesClause(version, clause) {
+  const raw = String(clause || '').trim()
+  if (!raw || raw === '*') return true
+  if (raw.startsWith('>=')) {
+    const min = parseNodeVersionTriplet(raw.slice(2))
+    return !!min && compareVersionTriplet(version, min) >= 0
+  }
+  if (raw.startsWith('>')) {
+    const min = parseNodeVersionTriplet(raw.slice(1))
+    return !!min && compareVersionTriplet(version, min) > 0
+  }
+  if (raw.startsWith('^')) {
+    const min = parseNodeVersionTriplet(raw.slice(1))
+    if (!min) return false
+    const max = [min[0] + 1, 0, 0]
+    return compareVersionTriplet(version, min) >= 0 && compareVersionTriplet(version, max) < 0
+  }
+  const target = parseNodeVersionTriplet(raw)
+  return !!target && compareVersionTriplet(version, target) === 0
+}
+
+function nodeVersionSatisfiesRequirement(versionText, requirementText) {
+  const version = parseNodeVersionTriplet(versionText)
+  if (!version) return false
+  const requirement = String(requirementText || '').trim()
+  if (!requirement) return true
+  return requirement.split('||').some(range =>
+    range.trim().split(/\s+/).filter(Boolean).every(clause => nodeVersionSatisfiesClause(version, clause))
+  )
+}
+
+function decorateNodeDetection(base) {
+  const requirement = openclawNodeRequirement()
+  const installed = !!base?.installed
+  const compatible = installed && requirement ? nodeVersionSatisfiesRequirement(base.version, requirement) : installed && !requirement
+  return {
+    ...base,
+    compatible,
+    requiredVersion: requirement,
+  }
+}
+
+function ensureNodeRuntimeCompatibleWeb() {
+  const node = handlers.check_node()
+  if (!node.installed) throw new Error('Node.js 未安装或未检测到，请先安装 Node.js 后重新检测')
+  if (node.compatible === false) {
+    throw new Error(`Node.js 版本过低：当前检测到 ${node.version || 'unknown'}，当前 OpenClaw 要求 ${node.requiredVersion || '当前 OpenClaw 要求的版本'}。请升级 Node.js 后重新检测。检测路径：${node.path || ''}`)
+  }
+}
+
 function readWhereWhichOpenclawCandidates() {
   try {
     const cmd = isWindows ? 'where openclaw' : 'which -a openclaw 2>/dev/null'
@@ -537,6 +760,27 @@ function readWindowsNpmGlobalPrefix() {
   return null
 }
 
+function npmOpenclawCliPath() {
+  const binDir = isWindows
+    ? (readWindowsNpmGlobalPrefix() || (process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : null))
+    : (() => {
+        try {
+          const prefix = execSync('npm config get prefix', { timeout: 5000, windowsHide: true, encoding: 'utf8' }).trim()
+          if (prefix && prefix.toLowerCase() !== 'undefined') return path.join(prefix, 'bin')
+        } catch {}
+        return '/usr/local/bin'
+      })()
+  if (!binDir) return null
+  const names = isWindows
+    ? ['openclaw.cmd', 'openclaw.exe', 'openclaw.bat', 'openclaw.js']
+    : ['openclaw']
+  for (const name of names) {
+    const candidate = path.join(binDir, name)
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return path.join(binDir, names[0])
+}
+
 function addCommonOpenclawCandidates(candidates, seen) {
   if (isWindows) {
     const appdata = process.env.APPDATA || ''
@@ -547,13 +791,16 @@ function addCommonOpenclawCandidates(candidates, seen) {
     const standaloneDir = standaloneInstallDir()
     if (appdata) {
       addCliCandidate(candidates, seen, path.join(appdata, 'npm', 'openclaw.cmd'))
-      addCliCandidate(candidates, seen, path.join(appdata, 'npm', 'openclaw'))
+      addCliCandidate(candidates, seen, path.join(appdata, 'npm', 'openclaw.exe'))
+      addCliCandidate(candidates, seen, path.join(appdata, 'npm', 'openclaw.bat'))
+      addCliCandidate(candidates, seen, path.join(appdata, 'npm', 'openclaw.js'))
     }
     const customPrefix = readWindowsNpmGlobalPrefix()
     if (customPrefix) {
       addCliCandidate(candidates, seen, path.join(customPrefix, 'openclaw.cmd'))
       addCliCandidate(candidates, seen, path.join(customPrefix, 'openclaw.exe'))
-      addCliCandidate(candidates, seen, path.join(customPrefix, 'openclaw'))
+      addCliCandidate(candidates, seen, path.join(customPrefix, 'openclaw.bat'))
+      addCliCandidate(candidates, seen, path.join(customPrefix, 'openclaw.js'))
     }
     if (localappdata) {
       addCliCandidate(candidates, seen, path.join(localappdata, 'Programs', 'OpenClaw', 'openclaw.cmd'))
@@ -604,7 +851,8 @@ function collectPreferredCliCandidates() {
     if (isWindows) {
       addCliCandidate(candidates, seen, path.join(trimmed, 'openclaw.cmd'))
       addCliCandidate(candidates, seen, path.join(trimmed, 'openclaw.exe'))
-      addCliCandidate(candidates, seen, path.join(trimmed, 'openclaw'))
+      addCliCandidate(candidates, seen, path.join(trimmed, 'openclaw.bat'))
+      addCliCandidate(candidates, seen, path.join(trimmed, 'openclaw.js'))
     } else {
       addCliCandidate(candidates, seen, path.join(trimmed, 'openclaw'))
     }
@@ -624,7 +872,7 @@ function collectAllCliCandidates() {
 }
 
 function readBoundOpenclawCliPath() {
-  const normalized = normalizeCliPath(readPanelConfig()?.openclawCliPath || '')
+  const normalized = resolveOpenclawCliInput(readPanelConfig()?.openclawCliPath || '')
   if (!normalized || !fs.existsSync(normalized) || isRejectedCliPath(normalized)) return null
   return normalized
 }
@@ -636,12 +884,12 @@ function resolveOpenclawCliPath() {
 }
 
 function scanAllOpenclawInstallations(activePath = resolveOpenclawCliPath()) {
-  const activeIdentity = scanCliIdentity(activePath)
+  const activeIdentity = cliIdentityKey(activePath)
   return collectAllCliCandidates().map(candidate => ({
     path: candidate,
     source: classifyCliSource(candidate) || 'unknown',
     version: readVersionFromInstallation(candidate),
-    active: !!activeIdentity && scanCliIdentity(candidate) === activeIdentity,
+    active: !!activeIdentity && cliIdentityKey(candidate) === activeIdentity,
   })).sort((a, b) => {
     if (a.active !== b.active) return a.active ? -1 : 1
     const sourceCmp = String(a.source || '').localeCompare(String(b.source || ''))
@@ -673,6 +921,11 @@ function canonicalLowerPathForConflict(rawPath) {
   return text
 }
 
+function cliIdentityKey(rawPath) {
+  const identity = scanCliIdentity(rawPath)
+  return identity ? canonicalLowerPathForConflict(identity) : ''
+}
+
 function standaloneConflictDirs() {
   const dirs = []
   try { dirs.push(standaloneInstallDir()) } catch {}
@@ -687,12 +940,46 @@ function isStandaloneConflictPath(cliPath, source = '') {
   return standaloneConflictDirs().some(dir => canon === dir || canon.startsWith(`${dir}/`))
 }
 
+function gatewayOwnerProtectedCliPath() {
+  const owner = readGatewayOwner()
+  if (!owner) return null
+  const startedBy = owner.startedBy || owner.started_by
+  if (startedBy && startedBy !== 'clawpanel') return null
+  const ownerDir = owner.openclawDir || owner.openclaw_dir
+  if (ownerDir && path.resolve(ownerDir) !== path.resolve(OPENCLAW_DIR)) return null
+  const ownerPort = Number(owner.port || 0)
+  if (ownerPort && ownerPort !== readGatewayPort()) return null
+  return owner.cliPath || owner.cli_path || null
+}
+
+function activeOpenclawCliIdentityKeys(options = {}) {
+  const identities = new Set()
+  const add = rawPath => {
+    const key = cliIdentityKey(rawPath)
+    if (key) identities.add(key)
+  }
+  add(resolveOpenclawCliPath())
+  add(gatewayOwnerProtectedCliPath())
+  for (const rawPath of Array.isArray(options.activeCliPaths) ? options.activeCliPaths : []) {
+    add(rawPath)
+  }
+  return identities
+}
+
+function isActiveOpenclawCliPath(cliPath, options = {}) {
+  const key = cliIdentityKey(cliPath)
+  return !!key && activeOpenclawCliIdentityKeys(options).has(key)
+}
+
 export function buildOpenclawPathConflictRecords(installations = scanAllOpenclawInstallations()) {
   const seen = new Set()
   const records = []
+  const activeIdentities = activeOpenclawCliIdentityKeys()
   for (const item of Array.isArray(installations) ? installations : []) {
     const cliPath = item?.path
     if (!cliPath || isStandaloneConflictPath(cliPath, item.source)) continue
+    const cliIdentity = cliIdentityKey(cliPath)
+    if (item.active || (cliIdentity && activeIdentities.has(cliIdentity))) continue
     const key = canonicalLowerPathForConflict(cliPath) || String(cliPath)
     if (seen.has(key)) continue
     seen.add(key)
@@ -723,6 +1010,9 @@ export function quarantineOpenclawPathForWeb(rawPath, options = {}) {
   if (isStandaloneConflictPath(original, classifyCliSource(original))) {
     throw new Error('拒绝隔离 standalone 安装目录下的 OpenClaw（这是当前运行版本）')
   }
+  if (isActiveOpenclawCliPath(original, options)) {
+    throw new Error('拒绝隔离正在被 Gateway 使用的 OpenClaw（请先停止 Gateway 或切换 CLI 路径）')
+  }
   const fileName = path.basename(original)
   if (!fileName.toLowerCase().startsWith('openclaw')) {
     throw new Error(`拒绝隔离非 openclaw 文件: ${fileName}`)
@@ -740,12 +1030,12 @@ export function quarantineOpenclawPathForWeb(rawPath, options = {}) {
   }
 }
 
-function resolveOpenclawCliInput(rawPath) {
+export function resolveOpenclawCliInput(rawPath) {
   const normalized = normalizeCliPath(rawPath)
   if (!normalized) return null
   if (fs.existsSync(normalized) && fs.statSync(normalized).isDirectory()) {
     const candidates = isWindows
-      ? [path.join(normalized, 'openclaw.cmd'), path.join(normalized, 'openclaw.exe'), path.join(normalized, 'openclaw')]
+      ? [path.join(normalized, 'openclaw.cmd'), path.join(normalized, 'openclaw.exe'), path.join(normalized, 'openclaw.bat'), path.join(normalized, 'openclaw.js')]
       : [path.join(normalized, 'openclaw')]
     for (const candidate of candidates) {
       const resolved = normalizeCliPath(candidate)
@@ -753,6 +1043,7 @@ function resolveOpenclawCliInput(rawPath) {
     }
     return null
   }
+  if (isWindows) return canonicalWindowsOpenclawCliPath(normalized)
   if (!fs.existsSync(normalized) || isRejectedCliPath(normalized)) return null
   return normalized
 }
@@ -762,6 +1053,12 @@ function openclawProcessSpec(args = []) {
   if (!cliPath) throw new Error('openclaw CLI 未安装')
   if (isWindows) {
     const cliArg = /[\s&()]/.test(cliPath) ? `"${cliPath}"` : cliPath
+    if (path.extname(cliPath).toLowerCase() === '.js') {
+      return {
+        command: process.env.ComSpec || 'cmd.exe',
+        args: ['/d', '/s', '/c', 'node', cliArg, ...args],
+      }
+    }
     return {
       command: process.env.ComSpec || 'cmd.exe',
       args: ['/d', '/s', '/c', cliArg, ...args],
@@ -886,6 +1183,126 @@ function recommendedIsNewer(recommended, current) {
     return versionGt(recommended, current)
   }
   return false
+}
+
+function cacheBustedSiteUrl(pathname, params = {}) {
+  const url = new URL(pathname, SITE_BASE_URL)
+  for (const [key, value] of Object.entries(params)) {
+    const normalized = String(value || '').trim()
+    if (normalized) url.searchParams.set(key, normalized)
+  }
+  url.searchParams.set('_t', Date.now().toString())
+  return url.toString()
+}
+
+function normalizeSiteLocale(locale) {
+  const value = String(locale || '').trim().toLowerCase()
+  return value.startsWith('zh') ? 'zh-CN' : 'en'
+}
+
+function normalizePublicUrl(raw) {
+  const value = String(raw || '').trim()
+  if (!value) return ''
+  let url
+  try {
+    url = value.startsWith('/') ? new URL(value, SITE_BASE_URL) : new URL(value)
+  } catch {
+    return ''
+  }
+  const host = url.hostname.toLowerCase()
+  if (host === 'claw.qt.cool') {
+    url.protocol = 'https:'
+    return url.toString()
+  }
+  if ((host === 'github.com' || host === 'api.github.com') && url.protocol === 'https:') {
+    return url.toString()
+  }
+  return ''
+}
+
+function normalizeSiteUrlFields(value) {
+  if (Array.isArray(value)) {
+    value.forEach(normalizeSiteUrlFields)
+    return value
+  }
+  if (!value || typeof value !== 'object') return value
+  for (const key of ['downloadUrl', 'url', 'ctaUrl']) {
+    if (typeof value[key] === 'string') {
+      const normalized = normalizePublicUrl(value[key])
+      if (normalized || value[key].trim()) value[key] = normalized
+    }
+  }
+  for (const child of Object.values(value)) normalizeSiteUrlFields(child)
+  return value
+}
+
+function assetDownloadable(asset) {
+  return asset?.source !== 'unavailable' && typeof asset?.downloadUrl === 'string' && asset.downloadUrl.trim()
+}
+
+function assetMatches(asset, key, expected) {
+  return String(asset?.[key] || '').toLowerCase() === expected
+}
+
+function selectRecommendedSiteAsset(assets = []) {
+  const targetPlatform = isWindows ? 'windows' : isMac ? 'macos' : isLinux ? 'linux' : ''
+  const targetArch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : process.arch
+  const platformCandidates = assets.filter(asset => assetDownloadable(asset) && assetMatches(asset, 'platform', targetPlatform))
+  const archMatches = (asset) => assetMatches(asset, 'arch', targetArch) || assetMatches(asset, 'arch', 'any')
+
+  const remoteRecommended = platformCandidates.find(asset => asset?.recommended === true && archMatches(asset))
+    || platformCandidates.find(asset => asset?.recommended === true)
+  if (remoteRecommended) return remoteRecommended
+
+  const candidates = assets.filter(assetDownloadable)
+  if (isWindows) {
+    const lightSetup = platformCandidates.find(asset => {
+      const name = String(asset?.name || '').toLowerCase()
+      return archMatches(asset)
+        && assetMatches(asset, 'fileType', 'exe')
+        && name.includes('x64-setup.exe')
+        && !name.includes('full')
+    })
+    if (lightSetup) return lightSetup
+    return platformCandidates.find(asset => archMatches(asset) && assetMatches(asset, 'fileType', 'exe')) || platformCandidates[0] || null
+  }
+  if (isMac) {
+    return platformCandidates.find(asset => archMatches(asset) && assetMatches(asset, 'fileType', 'dmg')) || platformCandidates[0] || null
+  }
+  if (isLinux) {
+    for (const fileType of ['appimage', 'deb', 'rpm']) {
+      const hit = platformCandidates.find(asset => assetMatches(asset, 'fileType', fileType))
+      if (hit) return hit
+    }
+  }
+  return platformCandidates[0] || candidates[0] || null
+}
+
+async function getSitePanelUpdate() {
+  const resp = await globalThis.fetch(cacheBustedSiteUrl('/api/v1/latest'), {
+    signal: AbortSignal.timeout(10000),
+    headers: { 'User-Agent': 'ClawPanel' },
+  })
+  if (!resp.ok) throw new Error(`site: HTTP ${resp.status}`)
+  const json = normalizeSiteUrlFields(await resp.json())
+  const latest = String(json.version || json.tagName || '').replace(/^v/, '').trim()
+  if (!latest) throw new Error('site: 未找到版本号')
+  const assets = Array.isArray(json.assets) ? json.assets : []
+  const recommendedAsset = selectRecommendedSiteAsset(assets)
+  return {
+    latest,
+    url: SITE_BASE_URL,
+    source: 'site',
+    downloadUrl: recommendedAsset?.downloadUrl || SITE_BASE_URL,
+    assets,
+    recommendedAsset: recommendedAsset || null,
+    releaseNotes: json.releaseNotes || '',
+    publishedAt: json.publishedAt || '',
+    tagName: json.tagName || '',
+    downloads: json.downloads || null,
+    telemetry: json.telemetry || null,
+    update: json.update || null,
+  }
 }
 
 function loadVersionPolicy() {
@@ -1025,8 +1442,25 @@ async function _tryStandaloneInstall(version, logs, overrideBaseUrl = null) {
     throw new Error('standalone 解压后未找到 openclaw 可执行文件')
   }
 
-  logs.push(`✅ standalone 安装完成 (${remoteVersion})`)
+  const cliPath = path.join(installDir, binFile)
+  const verifiedVersion = readVersionFromInstallation(cliPath)
+  if (!verifiedVersion) {
+    throw new Error('standalone 安装后无法读取目标 CLI 版本，已保留旧绑定')
+  }
+  if (!versionsMatch(verifiedVersion, remoteVersion)) {
+    throw new Error(`standalone 安装校验失败：目标 CLI 版本为 ${verifiedVersion}，清单版本为 ${remoteVersion}，已保留旧绑定`)
+  }
+  logs.push(`目标 CLI 验证通过: ${cliPath} (${verifiedVersion})`)
+  try {
+    bindOpenclawCliPath(cliPath)
+    logs.push(`已切换当前 CLI: ${cliPath}`)
+  } catch (e) {
+    logs.push(`⚠️ 自动绑定当前 CLI 失败: ${e.message || e}`)
+  }
+
+  logs.push(`✅ standalone 安装完成 (${verifiedVersion})`)
   logs.push(`安装目录: ${installDir}`)
+  logs.push('旧安装已保留。如需清理，请在“安装管理与清理”里确认后处理。')
   return true
 }
 
@@ -1456,6 +1890,18 @@ function detectInstalledSource() {
   return 'official'
 }
 
+function detectActiveCliInstallMode() {
+  const activeCliPath = resolveOpenclawCliPath()
+  const activeCliSource = classifyCliSource(activeCliPath)
+  if (activeCliSource === 'standalone') return 'standalone'
+  if (['npm-zh', 'npm-official', 'npm-global'].includes(activeCliSource)) return 'npm'
+  return 'unknown'
+}
+
+export function shouldFallbackStandaloneToNpm({ currentInstallMode = 'unknown', method = 'auto' } = {}) {
+  return method === 'auto' && currentInstallMode !== 'standalone'
+}
+
 function getLocalOpenclawVersion() {
   let current = readVersionFromInstallation(resolveOpenclawCliPath())
   if (!current) {
@@ -1638,6 +2084,38 @@ function readPanelConfig() {
   } catch {}
   applyOpenclawPathConfig({})
   return {}
+}
+
+function writePanelConfigFile(config) {
+  const nextConfig = config && typeof config === 'object' && !Array.isArray(config) ? { ...config } : {}
+  if (typeof nextConfig.openclawDir === 'string') {
+    const trimmed = nextConfig.openclawDir.trim()
+    if (trimmed) nextConfig.openclawDir = trimmed
+    else delete nextConfig.openclawDir
+  } else if (nextConfig.openclawDir == null) {
+    delete nextConfig.openclawDir
+  }
+  for (const key of ['dockerEndpoint', 'dockerDefaultImage']) {
+    if (typeof nextConfig[key] === 'string') {
+      const trimmed = nextConfig[key].trim()
+      if (trimmed) nextConfig[key] = trimmed
+      else delete nextConfig[key]
+    } else if (nextConfig[key] == null) {
+      delete nextConfig[key]
+    }
+  }
+  const panelDir = path.dirname(PANEL_CONFIG_PATH)
+  if (!fs.existsSync(panelDir)) fs.mkdirSync(panelDir, { recursive: true })
+  fs.writeFileSync(PANEL_CONFIG_PATH, JSON.stringify(nextConfig, null, 2))
+  invalidateConfigCache()
+  applyOpenclawPathConfig(nextConfig)
+}
+
+function bindOpenclawCliPath(cliPath) {
+  const resolved = resolveOpenclawCliInput(cliPath) || cliPath
+  const cfg = readPanelConfig()
+  cfg.openclawCliPath = resolved
+  writePanelConfigFile(cfg)
 }
 
 function normalizeDockerEndpoint(raw) {
@@ -2247,8 +2725,44 @@ function mergeConfigsPreservingFields(existing, next) {
   return merged
 }
 
+function modelEnvValuesForConfig(config) {
+  const values = {}
+  if (config?.env && typeof config.env === 'object' && !Array.isArray(config.env)) {
+    for (const [key, value] of Object.entries(config.env)) {
+      if (!isValidEnvKey(key)) continue
+      if (typeof value === 'string') values[key] = value
+      else if (typeof value === 'number' || typeof value === 'boolean') values[key] = String(value)
+    }
+  }
+  const envPath = path.join(OPENCLAW_DIR, '.env')
+  if (fs.existsSync(envPath)) {
+    for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+      const parsed = parseDotenvLine(line)
+      if (parsed && values[parsed[0]] === undefined) values[parsed[0]] = parsed[1]
+    }
+  }
+  return values
+}
+
+function validateModelProviderEnvRefs(config) {
+  const providers = config?.models?.providers
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) return
+  const values = modelEnvValuesForConfig(config)
+  for (const [providerName, provider] of Object.entries(providers)) {
+    if (!provider || typeof provider !== 'object') continue
+    const envKey = modelApiKeyEnvRef(provider.apiKey)
+    if (!envKey) continue
+    const configured = values[envKey] !== undefined && String(values[envKey]).trim()
+    const processEnv = process.env[envKey] !== undefined && String(process.env[envKey]).trim()
+    if (!configured && !processEnv) {
+      throw new Error(`模型服务商 "${providerName}" 的 API Key 引用了缺失的环境变量 "${envKey}"。请先在 OpenClaw env、~/.openclaw/.env 或当前进程环境中补齐，或删除该服务商后再保存。`)
+    }
+  }
+}
+
 function writeOpenclawConfigFile(config) {
   const cleaned = stripUiFields(config)
+  validateModelProviderEnvRefs(cleaned)
   if (fs.existsSync(CONFIG_PATH)) fs.copyFileSync(CONFIG_PATH, CONFIG_PATH + '.bak')
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cleaned, null, 2))
 }
@@ -8375,7 +8889,8 @@ function _scanJsonClientFile(out, data) {
     apiKey,
     apiKeyStatus,
     models: [model],
-    warning: apiKeyStatus === 'missing' ? '未在当前进程环境中检测到对应 API Key 环境变量，导入后需要在 OpenClaw env 或 .env 中补齐。' : '',
+    importable: apiKeyStatus !== 'missing',
+    warning: apiKeyStatus === 'missing' ? '未在当前进程环境中检测到对应 API Key 环境变量。请先在 OpenClaw env 或 .env 中补齐后再导入。' : '',
   })
 }
 
@@ -8399,7 +8914,7 @@ function scanModelClientConfigs() {
         ? 'ChatGPT/Codex OAuth 令牌不会导入到 OpenClaw。请优先使用 Hermes 的 openai-codex 登录。'
         : (apiKeyStatus === 'none'
           ? 'Codex 配置没有声明可安全引用的 env_key，无法自动导入 API Key。请在 Codex 配置中添加 env_key，或在 OpenClaw 中手动配置服务商密钥。'
-          : (apiKeyStatus === 'missing' ? '未在当前进程环境中检测到 Codex 配置引用的 API Key 环境变量，导入后需要在 OpenClaw env 或 .env 中补齐。' : ''))
+          : (apiKeyStatus === 'missing' ? '未在当前进程环境中检测到 Codex 配置引用的 API Key 环境变量。请先在 OpenClaw env 或 .env 中补齐后再导入。' : ''))
       _pushClientCandidate(candidates, {
         id: 'codex-cli',
         source: 'Codex CLI',
@@ -8411,7 +8926,7 @@ function scanModelClientConfigs() {
         apiKey: envKey ? `\${${envKey}}` : '',
         apiKeyStatus,
         models: [model],
-        importable: !isExternalCodex && apiKeyStatus !== 'none',
+        importable: !isExternalCodex && apiKeyStatus !== 'none' && apiKeyStatus !== 'missing',
         authHint: isExternalCodex ? 'hermes auth login openai-codex' : '',
         warning,
       })
@@ -8605,6 +9120,7 @@ const handlers = {
       writeGatewayOwner(status.pid || null)
       return true
     }
+    ensureNodeRuntimeCompatibleWeb()
     if (isMac) {
       macStartService(label)
       await waitForGatewayRunning(label)
@@ -10336,9 +10852,9 @@ const handlers = {
   check_node() {
     try {
       const ver = execSync('node --version 2>&1', { windowsHide: true }).toString().trim()
-      return { installed: true, version: ver, path: findCommandPath('node') }
+      return decorateNodeDetection({ installed: true, version: ver, path: findCommandPath('node') })
     } catch {
-      return { installed: false, version: null, path: null }
+      return decorateNodeDetection({ installed: false, version: null, path: null })
     }
   },
 
@@ -11223,6 +11739,7 @@ const handlers = {
 
   async upgrade_openclaw({ source = 'chinese', version, method = 'auto' } = {}) {
     const currentSource = detectInstalledSource()
+    const currentInstallMode = detectActiveCliInstallMode()
     const pkg = npmPackageName(source)
     const recommended = recommendedVersionFor(source)
     const ver = version || recommended || 'latest'
@@ -11231,6 +11748,14 @@ const handlers = {
     const npmBin = isWindows ? 'npm.cmd' : 'npm'
     const registry = pickRegistryForPackage(pkg)
     const logs = []
+    const activeCliBefore = resolveOpenclawCliPath()
+    const currentVersionBefore = getLocalOpenclawVersion()
+    const installationsBefore = scanAllOpenclawInstallations(activeCliBefore)
+    logs.push('升级前扫描当前 OpenClaw 安装...')
+    logs.push(`当前使用: ${activeCliBefore || '未检测到 openclaw CLI'}${currentVersionBefore ? ` (${currentVersionBefore})` : ''}`)
+    if (installationsBefore.length > 1) {
+      logs.push(`检测到 ${installationsBefore.length} 个 OpenClaw 安装；升级成功后会切换到新版，旧安装不会自动删除。`)
+    }
 
     // ── standalone 安装（auto / standalone-r2 / standalone-github） ──
     const tryStandalone = source !== 'official' && ['auto', 'standalone-r2', 'standalone-github'].includes(method)
@@ -11269,8 +11794,10 @@ const handlers = {
               return logs.join('\n')
             }
           } catch (e) {
-            if (method === 'auto') {
+            if (shouldFallbackStandaloneToNpm({ currentInstallMode, method })) {
               logs.push(`standalone 不可用（GitHub: ${e.message}），降级到 npm 安装...`)
+            } else if (method === 'auto') {
+              throw new Error(`当前 OpenClaw 使用 standalone 独立包模式，已阻止自动降级到 npm 全局安装。请稍后重试独立包升级，或在升级方式中手动选择 npm。standalone 安装失败: CDN=${cdnErr}, GitHub=${e.message}`)
             } else {
               throw new Error(`standalone 安装失败: CDN=${cdnErr}, GitHub=${e.message}`)
             }
@@ -11306,7 +11833,30 @@ const handlers = {
       if (needUninstallOld) {
         try { execSync(`${npmBin} uninstall -g ${oldPkg} 2>&1`, { timeout: 60000, windowsHide: true }) } catch {}
       }
-      logs.push(`安装完成 (${pkg}@${ver})`)
+
+      if (needUninstallOld) {
+        logs.push('正在修复 npm CLI 入口（避免旧包卸载删除 openclaw.cmd）...')
+        try {
+          runInstall(registry)
+          logs.push('npm CLI 入口已确认')
+        } catch (e) {
+          throw new Error(`安装完成但修复 npm CLI 入口失败: ${e.stderr?.toString() || e.message || e}`)
+        }
+      }
+
+      const npmCli = npmOpenclawCliPath()
+      const installedVersion = npmCli
+        ? (readVersionFromInstallation(npmCli) || getLocalOpenclawVersion())
+        : getLocalOpenclawVersion()
+      if (!npmCli || !installedVersion) {
+        throw new Error(`安装完成但无法读取 OpenClaw 版本${npmCli ? `: ${npmCli}` : ''}`)
+      }
+      if (ver !== 'latest' && !versionsMatch(installedVersion, ver)) {
+        throw new Error(`安装校验失败：目标 CLI 版本为 ${installedVersion}，期望版本为 ${ver}`)
+      }
+      bindOpenclawCliPath(npmCli)
+      logs.push(`已切换当前 CLI: ${npmCli} (${installedVersion})`)
+      logs.push(`安装完成 (${pkg}@${installedVersion})`)
       return `${logs.join('\n')}\n${out.slice(-400)}`
     } catch (e) {
       throw new Error('安装失败: ' + (e.stderr?.toString() || e.message).slice(-300))
@@ -11445,11 +11995,11 @@ const handlers = {
     if (fs.existsSync(PAIRED_PATH)) paired = JSON.parse(fs.readFileSync(PAIRED_PATH, 'utf8'))
     const platform = process.platform === 'darwin' ? 'macos' : process.platform
     if (paired[deviceId]) {
-      if (paired[deviceId].platform !== platform) {
-        paired[deviceId].platform = platform
-        paired[deviceId].deviceFamily = 'desktop'
+      const normalized = normalizeControlUiPairingEntry(paired[deviceId], deviceId, publicKey, platform)
+      if (normalized.changed) {
+        paired[deviceId] = normalized.entry
         fs.writeFileSync(PAIRED_PATH, JSON.stringify(paired, null, 2))
-        return { message: '设备已配对（已修正平台字段）', changed: true }
+        return { message: '设备已配对（已修正权限字段）', changed: true }
       }
       return { message: '设备已配对', changed: originsChanged }
     }
@@ -11458,7 +12008,15 @@ const handlers = {
       deviceId, publicKey, platform, deviceFamily: 'desktop',
       clientId: 'openclaw-control-ui', clientMode: 'ui',
       role: 'operator', roles: ['operator'],
-      scopes: SCOPES, approvedScopes: SCOPES, tokens: {},
+      scopes: SCOPES, approvedScopes: SCOPES,
+      tokens: {
+        operator: {
+          token: generatePairingToken(),
+          role: 'operator',
+          scopes: SCOPES,
+          createdAtMs: nowMs,
+        },
+      },
       createdAtMs: nowMs, approvedAtMs: nowMs,
     }
     fs.writeFileSync(PAIRED_PATH, JSON.stringify(paired, null, 2))
@@ -11775,28 +12333,7 @@ const handlers = {
   },
 
   write_panel_config({ config }) {
-    const nextConfig = config && typeof config === 'object' ? { ...config } : {}
-    if (typeof nextConfig.openclawDir === 'string') {
-      const trimmed = nextConfig.openclawDir.trim()
-      if (trimmed) nextConfig.openclawDir = trimmed
-      else delete nextConfig.openclawDir
-    } else if (nextConfig.openclawDir == null) {
-      delete nextConfig.openclawDir
-    }
-    for (const key of ['dockerEndpoint', 'dockerDefaultImage']) {
-      if (typeof nextConfig[key] === 'string') {
-        const trimmed = nextConfig[key].trim()
-        if (trimmed) nextConfig[key] = trimmed
-        else delete nextConfig[key]
-      } else if (nextConfig[key] == null) {
-        delete nextConfig[key]
-      }
-    }
-    const panelDir = path.dirname(PANEL_CONFIG_PATH)
-    if (!fs.existsSync(panelDir)) fs.mkdirSync(panelDir, { recursive: true })
-    fs.writeFileSync(PANEL_CONFIG_PATH, JSON.stringify(nextConfig, null, 2))
-    invalidateConfigCache()
-    applyOpenclawPathConfig(nextConfig)
+    writePanelConfigFile(config)
     return true
   },
 
@@ -11923,7 +12460,7 @@ const handlers = {
     if (!fs.existsSync(nodeBin)) throw new Error(`未在 ${nodeDir} 找到 node`)
     try {
       const ver = execSync(`"${nodeBin}" --version 2>&1`, { timeout: 5000, windowsHide: true }).toString().trim()
-      return { installed: true, version: ver, path: nodeBin }
+      return decorateNodeDetection({ installed: true, version: ver, path: nodeBin })
     } catch (e) {
       throw new Error('node 检测失败: ' + e.message)
     }
@@ -11939,7 +12476,7 @@ const handlers = {
       if (fs.existsSync(nodeBin)) {
         try {
           const ver = execSync(`"${nodeBin}" --version 2>&1`, { timeout: 5000, windowsHide: true }).toString().trim()
-          results.push({ path: p, version: ver })
+          results.push(decorateNodeDetection({ installed: true, path: nodeBin, dir: p, version: ver }))
         } catch {}
       }
     }
@@ -11985,6 +12522,11 @@ const handlers = {
   },
 
   save_custom_node_path({ nodeDir }) {
+    const detected = handlers.check_node_at_path({ nodeDir })
+    if (!detected.installed) throw new Error('该目录下未找到 node 可执行文件，请确认路径正确。')
+    if (detected.compatible === false) {
+      throw new Error(`Node.js 版本过低：当前 ${detected.version || 'unknown'}，要求 ${detected.requiredVersion || '当前 OpenClaw 要求的版本'}。请升级 Node.js 后再使用该路径。`)
+    }
     const cfg = readPanelConfig()
     cfg.customNodePath = nodeDir
     if (!fs.existsSync(OPENCLAW_DIR)) fs.mkdirSync(OPENCLAW_DIR, { recursive: true })
@@ -12010,25 +12552,31 @@ const handlers = {
   },
 
   async check_panel_update() {
-    const sources = [
-      { api: 'https://api.github.com/repos/qingchencloud/clawpanel/releases/latest', releases: 'https://github.com/qingchencloud/clawpanel/releases', name: 'github' },
-      { api: 'https://gitee.com/api/v5/repos/QtCodeCreators/clawpanel/releases/latest', releases: 'https://gitee.com/QtCodeCreators/clawpanel/releases', name: 'gitee' },
-    ]
-    let lastErr = ''
-    for (const src of sources) {
-      try {
-        const resp = await globalThis.fetch(src.api, {
-          signal: AbortSignal.timeout(8000),
-          headers: { 'User-Agent': 'ClawPanel' },
-        })
-        if (!resp.ok) { lastErr = `${src.name}: HTTP ${resp.status}`; continue }
-        const json = await resp.json()
-        const tag = (json.tag_name || '').replace(/^v/, '').trim()
-        if (!tag) { lastErr = `${src.name}: 未找到版本号`; continue }
-        return { latest: tag, url: json.html_url || src.releases, source: src.name, downloadUrl: 'https://claw.qt.cool' }
-      } catch (e) { lastErr = `${src.name}: ${e.message}`; continue }
+    try {
+      return await getSitePanelUpdate()
+    } catch (e) {
+      return {
+        latest: null,
+        url: SITE_BASE_URL,
+        source: 'site',
+        downloadUrl: SITE_BASE_URL,
+        error: `site: ${e.message || e}`,
+      }
     }
-    return { latest: null, url: 'https://github.com/qingchencloud/clawpanel/releases', error: lastErr }
+  },
+
+  async check_site_announcements({ locale } = {}) {
+    const resp = await globalThis.fetch(cacheBustedSiteUrl('/api/v1/announcements', {
+      app: 'ClawPanel',
+      version: PANEL_VERSION,
+      locale: normalizeSiteLocale(locale),
+      surface: 'client',
+    }), {
+      signal: AbortSignal.timeout(10000),
+      headers: { 'User-Agent': 'ClawPanel' },
+    })
+    if (!resp.ok) throw new Error(`公告服务器返回 ${resp.status}`)
+    return normalizeSiteUrlFields(await resp.json())
   },
 
   write_env_file({ path: p, config }) {
@@ -14758,7 +15306,7 @@ const handlers = {
   download_frontend_update() { throw new Error('Web 模式无需前端热更新，刷新浏览器即可') },
   rollback_frontend_update() { throw new Error('Web 模式不支持前端热更新回滚') },
   get_update_status() { return { status: 'idle', mode: 'web' } },
-  // 注意：check_panel_update 的真实实现在前面（line ~6785）—— 走 GitHub/Gitee release API。
+  // 注意：check_panel_update 的真实实现在前面 —— 只走官网 API。
   // 这里不能再 stub，否则 object literal 的后定义会覆盖前者，导致 Web 模式永远看不到新版。
 
   // —— 应用重启（Web 端由 tauri-api.js 包装层直接调 location.reload，到这里说明绕过了包装）——

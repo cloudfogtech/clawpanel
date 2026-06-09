@@ -96,7 +96,7 @@ async function loadXintianData(page) {
     </div>
     <div class="stat-card">
       <div class="stat-card-header"><span class="stat-card-label">心甜Claw</span></div>
-      <div class="stat-card-value" style="font-size:var(--font-size-md)">Windows</div>
+      <div class="stat-card-value" style="font-size:var(--font-size-md)">Windows / macOS / Linux</div>
       <div class="stat-card-meta" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <a class="btn btn-primary btn-sm" href="https://xtclaw.xtnet.cc/download" target="_blank" rel="noopener" style="padding:2px 8px;font-size:var(--font-size-xs)">${t('engine.xtCtaDownloadWin')}</a>
         <a class="btn btn-secondary btn-sm" href="https://xtclaw.xtnet.cc/" target="_blank" rel="noopener" style="padding:2px 8px;font-size:var(--font-size-xs)">${t('engine.xtCtaVisitSite')}</a>
@@ -592,6 +592,7 @@ async function doInstall(page, title, source, version) {
       unlistenDone = await listen('upgrade-done', (e) => {
         cleanup()
         modal.setDone(typeof e.payload === 'string' ? e.payload : t('about.operationDone'))
+        loadData(page)
       })
 
       unlistenError = await listen('upgrade-error', async (e) => {
@@ -617,6 +618,8 @@ async function doInstall(page, title, source, version) {
       const msg = await api.upgradeOpenclaw(source, version)
       modal.setDone(typeof msg === 'string' ? msg : (msg?.message || t('about.operationDone')))
       cleanup()
+      window.dispatchEvent(new CustomEvent('openclaw:runtime-changed'))
+      loadData(page)
     }
   } catch (e) {
     cleanup()
@@ -629,53 +632,138 @@ async function doInstall(page, title, source, version) {
   }
 }
 
+function escapeAttr(value) {
+  return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+function safeExternalHref(raw, fallback = 'https://claw.qt.cool') {
+  try {
+    const url = new URL(String(raw || '').trim() || fallback, 'https://claw.qt.cool')
+    const host = url.hostname.toLowerCase()
+    if (host === 'claw.qt.cool') {
+      url.protocol = 'https:'
+      return url.toString()
+    }
+    if ((host === 'github.com' || host === 'api.github.com') && url.protocol === 'https:') {
+      return url.toString()
+    }
+  } catch {}
+  return fallback
+}
+
+function formatBytes(value, fallback = '') {
+  const size = Number(value)
+  if (!Number.isFinite(size) || size <= 0) return fallback
+  const units = ['B', 'KB', 'MB', 'GB']
+  let next = size
+  let unit = 0
+  while (next >= 1024 && unit < units.length - 1) {
+    next /= 1024
+    unit += 1
+  }
+  return `${next >= 10 || unit === 0 ? next.toFixed(0) : next.toFixed(1)} ${units[unit]}`
+}
+
+function formatInstallerSummary(asset) {
+  if (!asset || typeof asset !== 'object') return ''
+  const name = asset.name || t('about.downloadFullInstaller')
+  const size = asset.sizeText || formatBytes(asset.size)
+  const meta = [
+    [asset.platform, asset.arch].filter(Boolean).join('/'),
+    asset.fileType ? String(asset.fileType).toUpperCase() : '',
+    size,
+  ].filter(Boolean).join(' · ')
+  return meta ? `${name} (${meta})` : name
+}
+
+function renderPanelUpdateMeta({ statusHtml, installerSummary, websiteDownloadUrl, githubFallbackUrl }) {
+  return `
+    <div class="panel-update-status">${statusHtml}</div>
+    ${installerSummary ? `<div class="panel-update-installer">${escapeAttr(installerSummary)}</div>` : ''}
+    <div class="panel-update-actions">
+      <button class="btn btn-secondary btn-sm" type="button" data-panel-update-details>${t('about.viewUpdateDetails')}</button>
+      <a class="btn btn-primary btn-sm" href="${escapeAttr(websiteDownloadUrl)}" target="_blank" rel="noopener">${t('about.downloadRecommendedInstaller')}</a>
+      <a class="btn btn-secondary btn-sm" href="${escapeAttr(githubFallbackUrl)}" target="_blank" rel="noopener">${t('about.downloadFromGitHub')}</a>
+    </div>
+  `
+}
+
+function bindPanelUpdateDetails(meta, detail) {
+  meta.querySelector('[data-panel-update-details]')?.addEventListener('click', () => {
+    window.dispatchEvent(new CustomEvent('clawpanel:show-installer-update', {
+      detail: { ...detail, force: true },
+    }))
+  })
+}
+
 async function checkNewVersion(cards, panelVersion) {
   const el = () => cards.querySelector('#panel-update-meta')
-  const btnSm = 'padding:2px 8px;font-size:var(--font-size-xs)'
 
-  // 尝试获取 Tauri 二进制版本，检测「假更新」：
-  // 前端通过热更新升级到 v0.13.0，但 Tauri 二进制仍是 v0.9.9
+  // Tauri 二进制版本才是完整安装包版本；前端版本可能来自历史热更新目录。
   let binaryVersion = panelVersion
   try {
     const { getVersion } = await import('@tauri-apps/api/app')
     binaryVersion = await getVersion()
   } catch {}
 
-  // 前端版本 > 二进制版本 = 热更新导致版本不一致
+  // 前端版本 > 二进制版本时，提醒用户用完整安装包覆盖到真实新版本。
   const isFakeUpdate = binaryVersion !== panelVersion && compareVersions(panelVersion, binaryVersion) > 0
 
   try {
     const info = await api.checkPanelUpdate()
     const meta = el()
     if (!meta) return
+    meta.classList.add('panel-update-meta')
+    meta.removeAttribute('style')
 
     const latest = info?.latest || ''
+    const recommendedAsset = info?.recommendedAsset || null
+    const installerSummary = formatInstallerSummary(recommendedAsset)
+    const websiteDownloadUrl = safeExternalHref(info?.recommendedAsset?.downloadUrl || info?.downloadUrl)
+    const githubFallbackUrl = info?.source === 'site'
+      ? 'https://github.com/qingchencloud/clawpanel/releases'
+      : safeExternalHref(info?.url, 'https://github.com/qingchencloud/clawpanel/releases')
     // 用二进制版本（真实应用版本）做比较，避免假更新导致误判为「已是最新」
     const effectiveVersion = isFakeUpdate ? binaryVersion : panelVersion
 
     if (isFakeUpdate) {
-      meta.innerHTML = `
-        <span style="color:var(--warning)">⚠️ ${t('about.versionMismatch', { frontend: panelVersion, binary: binaryVersion })}</span>
-        <span style="color:var(--text-tertiary);font-size:var(--font-size-xs)">${t('about.hotUpdateDeprecated')}</span>
-        <a class="btn btn-primary btn-sm" href="https://claw.qt.cool" target="_blank" rel="noopener" style="${btnSm}">${t('about.downloadFullInstaller')}</a>
-        <a class="btn btn-secondary btn-sm" href="${info.url || 'https://github.com/qingchencloud/clawpanel/releases'}" target="_blank" rel="noopener" style="${btnSm}">${t('about.downloadFromGitHub')}</a>
-      `
+      meta.innerHTML = renderPanelUpdateMeta({
+        statusHtml: `<span class="panel-update-warning">⚠️ ${t('about.versionMismatch', { frontend: panelVersion, binary: binaryVersion })}</span><span>${t('about.installerOnlyUpdateHint')}</span>`,
+        installerSummary,
+        websiteDownloadUrl,
+        githubFallbackUrl,
+      })
+      bindPanelUpdateDetails(meta, { panelInfo: info, latest, installedVersion: binaryVersion })
     } else if (latest && latest !== effectiveVersion && compareVersions(latest, effectiveVersion) > 0) {
-      meta.innerHTML = `
-        <span style="color:var(--accent)">${t('about.newVersionAvailable', { version: latest })}</span>
-        <a class="btn btn-primary btn-sm" href="https://claw.qt.cool" target="_blank" rel="noopener" style="${btnSm}">${t('about.downloadFromWebsite')}</a>
-        <a class="btn btn-secondary btn-sm" href="${info.url || 'https://github.com/qingchencloud/clawpanel/releases'}" target="_blank" rel="noopener" style="${btnSm}">${t('about.downloadFromGitHub')}</a>
-      `
+      meta.innerHTML = renderPanelUpdateMeta({
+        statusHtml: `<span class="panel-update-new">${t('about.newVersionAvailable', { version: latest })}</span>`,
+        installerSummary,
+        websiteDownloadUrl,
+        githubFallbackUrl,
+      })
+      bindPanelUpdateDetails(meta, { panelInfo: info, latest, installedVersion: binaryVersion })
     } else {
       meta.innerHTML = `<span style="color:var(--success)">${t('about.upToDate')}</span>`
     }
   } catch (err) {
     const meta = el()
     if (!meta) return
+    meta.classList.add('panel-update-meta')
+    meta.removeAttribute('style')
     if (isFakeUpdate) {
-      meta.innerHTML = `<span style="color:var(--warning)">⚠️ ${t('about.versionMismatch', { frontend: panelVersion, binary: binaryVersion })}</span> <a class="btn btn-primary btn-sm" href="https://claw.qt.cool" target="_blank" rel="noopener" style="${btnSm}">${t('about.downloadFullInstaller')}</a>`
+      meta.innerHTML = `
+        <div class="panel-update-status"><span class="panel-update-warning">⚠️ ${t('about.versionMismatch', { frontend: panelVersion, binary: binaryVersion })}</span></div>
+        <div class="panel-update-actions">
+          <a class="btn btn-primary btn-sm" href="https://claw.qt.cool" target="_blank" rel="noopener">${t('about.downloadFullInstaller')}</a>
+        </div>
+      `
     } else {
-      meta.innerHTML = `<span style="color:var(--text-tertiary)">${t('about.checkUpdateFailed')}</span> <a class="btn btn-secondary btn-sm" href="https://claw.qt.cool" target="_blank" rel="noopener" style="${btnSm}">${t('about.goToWebsite')}</a>`
+      meta.innerHTML = `
+        <div class="panel-update-status"><span>${t('about.checkUpdateFailed')}</span></div>
+        <div class="panel-update-actions">
+          <a class="btn btn-secondary btn-sm" href="https://claw.qt.cool" target="_blank" rel="noopener">${t('about.goToWebsite')}</a>
+        </div>
+      `
     }
   }
 }

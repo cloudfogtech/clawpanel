@@ -5,7 +5,102 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.18.2] - 2026-06-08
+
+### 修复 (Fixes)
+
+- **Node.js 版本过低导致 Gateway 启动失败** — 启动 Gateway 前会读取当前 OpenClaw 安装包的 `engines.node` 要求，发现 Node.js 不兼容时提前阻断并给出可执行提示，不再让用户看到后端崩溃日志
+- **Windows Node.js 版本过低时升级引导不足** — 设置向导在检测到 Node.js 过低时提供一键升级入口，通过 `winget upgrade/install OpenJS.NodeJS.LTS` 安装或升级 Node.js LTS，并在升级后刷新 PATH 检测
+- **自定义 Node.js 路径可选中旧版本** — 扫描和手动保存 Node.js 路径时会同步校验版本兼容性，版本不满足当前 OpenClaw 要求的路径不再允许保存
+- **macOS / Linux / Web 模式缺少同等保护** — 桌面端 macOS 启动链路、Web/headless 后端 `start_service`、路径扫描和自定义路径保存均补齐 Node.js 兼容检测
+- **新手引导误导用户创建 Agent** — 默认 `main` Agent 已内置可用；仪表盘新手步骤改为“确认默认 Agent”，有任意 Agent 即视为完成，不再要求用户创建第一个 Agent
+
+### 改进 (Improvements)
+
+- **升级弹窗体验优化** — 自动过滤 winget 进度块和旋转符号噪音；升级成功后按钮改为“完成”，并提示回到仪表盘或服务页启动 Gateway
+- **跨端 Node.js 升级提示更清晰** — Windows 显示一键升级，macOS / Linux 显示各自的手动升级建议和重启/重新检测提示
+- **Gateway 错误更用户友好** — 服务页会把 Node.js 版本过低错误转成普通用户能理解的升级提示
+- **发布文案口径统一** — Release Notes、README、多语言 README 与部署文档统一说明 Node.js 要求，避免把 ClawPanel Web 后端的 Node.js 18+ 误读为当前 OpenClaw Gateway 的完整运行要求
+
+### 测试与验证 (Testing)
+
+- 已通过 `npm run build`
+- 已通过 `node -e "import('./scripts/dev-api.js').then(()=>console.log('dev-api import ok'))"`
+- 已通过 `cd src-tauri && cargo fmt --check`
+- 已通过 `cd src-tauri && cargo check`
+- 已通过 `cd src-tauri && cargo test node_requirement --lib`
+- 已通过 `git diff --check`
+- 已通过 `npm run tauri build`（Windows NSIS / MSI 本地打包）
+
+## [0.18.1] - 2026-06-07
+
+### 修复 (Fixes)
+
+- **Windows OpenClaw 切换/升级后版本丢失** — 修复 npm 源切换时新旧包共用 `openclaw.cmd`，旧包卸载把新 CLI shim 一并删除的问题；安装成功后会重新确认 npm CLI 入口、读取版本并写入 ClawPanel 绑定
+- **standalone 升级后仍使用旧 CLI** — standalone 安装完成后先校验目标 CLI 版本，再自动切换当前绑定路径，避免升级成功但面板仍指向旧 npm 全局目录
+- **多安装路径提示误导** — 安装管理与仪表盘会区分“当前绑定安装”和 PATH 残留；已绑定新版时，旧 npm 路径只提示为 PATH 残留，不再误导用户再次绑定旧版
+- **Gateway 配对失败 / role-upgrade 循环** — 自动配对会补齐已有设备记录中的 `operator` role、scopes、approvedScopes 和 operator token，避免控制台反复提示 `pairing required: device is asking for a higher role`
+- **配对修复误杀手动 Gateway** — 设备配对和聊天页自动配对不再主动 reload/restart Gateway，避免 Windows 上手动启动的 Gateway 被面板重启打断
+- **Codex 导入缺少 API Key 后 OpenClaw 无法启动** — 导入 Codex/OpenAI 客户端配置时，如果引用的环境变量缺失，会阻止导入并提示补齐；保存 OpenClaw 配置时也会校验模型服务商的环境变量引用
+- **仪表盘升级后仍显示旧版本/未知来源** — 升级或卸载完成后自动清理仪表盘版本缓存并刷新；自定义 npm prefix（如 `D:\...\npm-global\openclaw.cmd`）会读取 shim 内容识别为官方版或汉化版
+- **升级弹窗关闭无效** — 修复升级完成后关闭按钮可能被页面刷新打断的问题
+
+### 改进 (Improvements)
+
+- **安装校验更严格** — npm 与 standalone 安装完成后都会校验目标版本，校验失败会保留旧绑定并给出明确错误
+- **Gateway 重装提示更清晰** — 切换 OpenClaw 源后会先修复并绑定当前 CLI，再重装 Gateway 服务，失败时保留更明确的手动处理提示
+- **Web/dev 后端行为对齐** — `scripts/dev-api.js` 同步桌面端的配对规范化、模型环境变量校验、安装绑定和 PATH 残留处理逻辑
+
+### 测试与验证 (Testing)
+
+- 已通过 `npm run build`
+- 已通过 `node --check scripts\dev-api.js`
+- 已通过 `cd src-tauri && cargo fmt --check`
+- 已通过 `cd src-tauri && cargo check`
+- 已通过 `cd src-tauri && cargo test commands::pairing::tests`
+- 已通过 `npm run tauri build`（Windows NSIS / MSI 本地打包）
+
+## [0.18.0] - 2026-06-06
+
+### 新功能 (Features)
+
+- **接入官方独立站 API** — 客户端版本发现、推荐安装包、下载链接、公告通知统一走 `https://claw.qt.cool`，由 Rust/Tauri 后端封装后提供给前端使用
+- **完整安装包更新流程** — 启动检查和关于页改为推荐下载官方完整安装包，按 Windows / macOS / Linux 展示安装引导，不再把 Web 热更新作为用户主路径
+- **官网公告与通知中心** — 新增左下角系统公告入口，支持通知与固定公告分流、关闭去重、中文/英文 fallback，以及官网 `surface=client` 公告接口
+- **桌面端心跳统计** — Tauri 后台任务定时上报匿名稳定 client id、版本、平台、架构、语言等粗粒度信息，用于官网统计在线情况
+- **登录页语言切换** — 首次登录和锁屏登录页支持直接切换语言
+
+### 改进 (Improvements)
+
+- **更新弹窗重设计** — 支持 Markdown 更新日志、安全渲染、长日志滚动、底部按钮固定、移动端适配和官网 / GitHub 下载入口
+- **关于页更新入口收口** — 版本卡片只展示推荐安装包和 GitHub 备用下载，不再暴露热更新按钮
+- **公告 UI 收紧** — 公告弹窗、底部工具按钮、默认密码提醒条都改为更轻量的客户端风格，减少遮挡
+- **多引擎侧边栏适配** — 修复 Hermes / Xintian 主题对底部工具按钮的旧样式污染，通知、夜间模式、语言按钮统一为紧凑图标按钮
+- **官网 URL 安全归一化** — 下载链接只允许官方站和 GitHub fallback，latest / announcements / legacy update 请求都附带 `_t` 缓存小尾巴
+- **移除旧官网单页** — 删除仓库内 `docs/index.html`，官网由独立站维护；版本同步脚本不再处理旧官网 SEO 内容
+
+### 修复 (Fixes)
+
+- **Windows OpenClaw CLI 路径识别** — 补充 `openclaw.cmd` / `.exe` / `.bat` / `.js` 识别与规范化，避免把 npm 目录下不可直接执行的 `openclaw` shim 当作 Gateway 启动命令
+- **更新日志显示不完整** — 更新弹窗内日志区域限制高度并独立滚动，避免内容截断或按钮被挤出视口
+- **关于页更新信息挤压** — 修复推荐安装包文件名过长导致卡片文字竖排、布局破坏的问题
+- **默认密码提醒过重** — 顶部提醒从大色块横幅改为轻量安全提示条，PC 和移动端都降低高度和视觉干扰
+- **公告标签无法切换** — 修复通知为空时点击“通知”标签无反应的问题
+
+### 兼容性 (Compatibility)
+
+- `/update/latest.json` 继续只服务 `web-*.zip` 热更新包；新版用户升级主路径为完整安装包
+- 完整安装包更新只打开浏览器下载，不做静默安装
+
+### 测试与验证 (Testing)
+
+- 已通过 `git diff --check`
+- 已通过 `node --test tests\site-message-center.test.js`
+- 已通过 `cd src-tauri && cargo fmt --check`
+- 已通过 `cd src-tauri && cargo test site_api::tests`
+- 已通过 `cd src-tauri && cargo check`
+- 已通过 `cd src-tauri && cargo clippy --all-targets -- -D warnings`
+- 已通过 `npm run build`
 
 ## [0.17.0] - 2026-05-28
 

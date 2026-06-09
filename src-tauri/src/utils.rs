@@ -21,7 +21,8 @@ fn push_windows_cli_files(
 ) {
     push_unique_candidate(candidates, seen, base.join("openclaw.cmd"));
     push_unique_candidate(candidates, seen, base.join("openclaw.exe"));
-    push_unique_candidate(candidates, seen, base.join("openclaw"));
+    push_unique_candidate(candidates, seen, base.join("openclaw.bat"));
+    push_unique_candidate(candidates, seen, base.join("openclaw.js"));
     push_unique_candidate(
         candidates,
         seen,
@@ -137,6 +138,53 @@ fn common_windows_cli_candidates() -> Vec<std::path::PathBuf> {
     candidates
 }
 
+#[cfg(target_os = "windows")]
+pub fn is_windows_launchable_openclaw_path(path: &std::path::Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        file_name.as_str(),
+        "openclaw.cmd" | "openclaw.exe" | "openclaw.bat" | "openclaw.js"
+    )
+}
+
+#[cfg(target_os = "windows")]
+pub fn canonicalize_windows_openclaw_cli_path(
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        file_name.as_str(),
+        "openclaw" | "openclaw.exe" | "openclaw.ps1"
+    ) {
+        for name in [
+            "openclaw.cmd",
+            "openclaw.exe",
+            "openclaw.bat",
+            "openclaw.js",
+        ] {
+            let candidate = path.with_file_name(name);
+            if candidate.exists() && !is_rejected_cli_path(&candidate.to_string_lossy()) {
+                return Some(candidate);
+            }
+        }
+    }
+    if path.exists()
+        && is_windows_launchable_openclaw_path(path)
+        && !is_rejected_cli_path(&path.to_string_lossy())
+    {
+        return Some(path.to_path_buf());
+    }
+    None
+}
+
 pub fn is_rejected_cli_path(cli_path: &str) -> bool {
     let lower = cli_path.replace('\\', "/").to_lowercase();
     lower.contains("/.cherrystudio/") || lower.contains("cherry-studio")
@@ -193,7 +241,7 @@ fn find_openclaw_cmd() -> Option<std::path::PathBuf> {
     }
     common_windows_cli_candidates()
         .into_iter()
-        .find(|candidate| candidate.exists() && !is_rejected_cli_path(&candidate.to_string_lossy()))
+        .find_map(|candidate| canonicalize_windows_openclaw_cli_path(&candidate))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -264,8 +312,25 @@ pub fn classify_cli_source(cli_path: &str) -> String {
     if lower.contains("openclaw-zh") || lower.contains("@qingchencloud") {
         return "npm-zh".into();
     }
+    #[cfg(target_os = "windows")]
+    {
+        if lower.ends_with("/openclaw.cmd") || lower.ends_with("/openclaw.bat") {
+            if let Ok(content) = std::fs::read_to_string(cli_path) {
+                let content = content.to_lowercase();
+                if content.contains("@qingchencloud") || content.contains("openclaw-zh") {
+                    return "npm-zh".into();
+                }
+                if content.contains("/node_modules/openclaw/")
+                    || content.contains("\\node_modules\\openclaw\\")
+                {
+                    return "npm-official".into();
+                }
+            }
+        }
+    }
     // npm 全局（大概率官方版）
-    if lower.contains("/npm/") || lower.contains("/node_modules/") {
+    if lower.contains("/npm/") || lower.contains("/npm-global/") || lower.contains("/node_modules/")
+    {
         return "npm-official".into();
     }
     // Homebrew

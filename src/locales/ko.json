@@ -2132,8 +2132,8 @@
       "failurePrefix": "커널 업그레이드 실패:"
     },
     "upgradeHint": {
-      "title": "새 커널 사용 가능",
-      "subtitle": "{from} → {to}, 클릭하여 업그레이드",
+      "title": "실행 중인 Gateway 업그레이드 가능",
+      "subtitle": "Gateway {from} → 권장 {to}",
       "dismissTooltip": "이 세션에서는 알리지 않음"
     }
   },

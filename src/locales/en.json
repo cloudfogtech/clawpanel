@@ -2275,20 +2275,20 @@
       "failurePrefix": "Kernel upgrade failed:"
     },
     "upgradeHint": {
-      "title": "New kernel available",
-      "subtitle": "{from} → {to}, click to upgrade",
+      "title": "Running Gateway can be upgraded",
+      "subtitle": "Gateway {from} → recommended {to}",
       "dismissTooltip": "Don't remind me this session"
     },
     "tooOldForProtocol": "Gateway kernel is too old and does not support the handshake protocol used by this ClawPanel. Please upgrade the OpenClaw kernel to the recommended version ({recommended}) and retry. You can upgrade from \"Services → OpenClaw → Upgrade\"."
   },
   "cliConflict": {
-    "title": "Detected {count} possibly conflicting OpenClaw installation(s)",
-    "desc": "Your PATH has OpenClaw installations not managed by ClawPanel (e.g. Cherry Studio bundled, legacy npm global). They can cause terminal commands to pick up old versions, triggering schema mismatches and doctor --fix hangs.",
+    "title": "Detected {count} stale OpenClaw PATH entries",
+    "desc": "The current ClawPanel binding is not affected, but PATH still contains an old or unmanaged openclaw. Terminal commands or third-party tools that resolve openclaw through PATH may still pick up the old version.",
     "viewDetails": "View details",
     "hideDetails": "Hide details",
-    "quarantineAll": "Quarantine all",
+    "quarantineAll": "Quarantine PATH entries",
     "quarantining": "Quarantining…",
-    "quarantineOne": "Quarantine",
+    "quarantineOne": "Quarantine this entry",
     "dismiss": "Dismiss",
     "dismissedHint": "Dismissed for this session. Next launch will scan again.",
     "quarantineOk": "Quarantined {count} item(s)",

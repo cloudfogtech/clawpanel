@@ -2358,20 +2358,20 @@
       "failurePrefix": "内核升级失败:"
     },
     "upgradeHint": {
-      "title": "有新内核可用",
-      "subtitle": "{from} → {to}，点此一键升级",
+      "title": "运行中 Gateway 可升级",
+      "subtitle": "Gateway {from} → 推荐 {to}",
       "dismissTooltip": "本次会话不再提醒"
     },
     "tooOldForProtocol": "Gateway 内核版本过旧，不兼容当前 ClawPanel 使用的握手协议。请把 OpenClaw 内核升级到推荐版本（{recommended}）后重试。可在「服务管理 → OpenClaw → 一键升级」中完成升级。"
   },
   "cliConflict": {
-    "title": "检测到 {count} 处可能冲突的 OpenClaw 安装",
-    "desc": "系统 PATH 中存在非 ClawPanel 管理的 OpenClaw（如 Cherry Studio 内嵌、旧 npm 全局），可能导致终端命令拿到老版本，引发 schema 不兼容、doctor --fix 卡死等问题。",
+    "title": "检测到 {count} 处 PATH 残留的 OpenClaw",
+    "desc": "ClawPanel 当前绑定不受影响；但系统 PATH 中仍有旧版或非面板管理的 openclaw。终端直接执行 openclaw、或第三方工具按 PATH 调用时，可能拿到旧版本。",
     "viewDetails": "查看详情",
     "hideDetails": "收起详情",
-    "quarantineAll": "一键隔离",
+    "quarantineAll": "隔离 PATH 残留",
     "quarantining": "正在隔离…",
-    "quarantineOne": "隔离",
+    "quarantineOne": "隔离此项",
     "dismiss": "暂时忽略",
     "dismissedHint": "已忽略本次检测。下次启动会重新扫描。",
     "quarantineOk": "已隔离 {count} 个冲突项",

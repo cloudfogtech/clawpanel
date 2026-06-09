@@ -49,6 +49,20 @@ function readBoundCliPath(panelConfig) {
   return String(panelConfig?.openclawCliPath || '').trim()
 }
 
+function quoteCommandPath(path) {
+  return String(path || '').replace(/"/g, '\\"')
+}
+
+function openclawInstallDirForCommand(path) {
+  const value = String(path || '').trim()
+  if (!value) return ''
+  const normalized = value.replace(/\\/g, '/')
+  if (/\/openclaw(?:\.cmd|\.exe|\.bat|\.ps1|\.js)?$/i.test(normalized)) {
+    return value.replace(/[\\/][^\\/]+$/, '')
+  }
+  return value
+}
+
 let _foreignGatewayPromptKey = ''
 
 export function isForeignGatewayService(service) {
@@ -236,14 +250,15 @@ export async function showGatewayConflictGuidance({ error = null, service = null
 
 /** 根据安装来源返回卸载命令 */
 function uninstallCommandForSource(source, path) {
+  const isWin = navigator.platform?.startsWith('Win') || navigator.userAgent?.includes('Windows')
   if (source === 'standalone') {
-    const isWin = navigator.platform?.startsWith('Win') || navigator.userAgent?.includes('Windows')
-    const p = escapeHtml(path || '')
+    const p = quoteCommandPath(openclawInstallDirForCommand(path))
     return isWin ? `rmdir /s /q "${p}"` : `rm -rf "${p}"`
   }
   if (source === 'npm-official' || source === 'official') return 'npm uninstall -g openclaw'
-  // npm-zh, npm-global, and others
-  return 'npm uninstall -g @qingchencloud/openclaw-zh'
+  if (source === 'npm-zh' || source === 'npm-global') return 'npm uninstall -g @qingchencloud/openclaw-zh'
+  const p = quoteCommandPath(path)
+  return isWin ? `del /f /q "${p}"` : `rm -f "${p}"`
 }
 
 /**
@@ -259,6 +274,11 @@ export async function showInstallationCleanup({ onRefresh = null } = {}) {
   const installations = dedupeOpenclawInstallations(Array.isArray(versionInfo?.all_installations) ? versionInfo.all_installations : [])
   const boundPath = readBoundCliPath(panelConfig)
   const currentPath = versionInfo?.cli_path || ''
+  const hasActiveBoundInstall = installations.some(inst =>
+    inst?.active
+    && boundPath
+    && openclawInstallationIdentity({ path: inst.path }) === openclawInstallationIdentity({ path: boundPath })
+  )
 
   const sourceLabel = (src) => cliSourceLabel(src)
 
@@ -277,16 +297,21 @@ export async function showInstallationCleanup({ onRefresh = null } = {}) {
 
     const uninstallCmd = uninstallCommandForSource(inst.source, inst.path)
 
-    // 操作区：非活跃的安装显示卸载命令 + 复制按钮；活跃的显示绑定按钮
+    // 操作区：所有未绑定安装都可以绑定；非活跃安装额外显示清理命令。
     let actions = ''
-    if (isActive && !isBound) {
-      actions = `<button class="btn btn-primary btn-xs cleanup-bind-btn" data-path="${escapeHtml(inst.path)}" style="margin-top:8px">${t('services.cleanupBindThis')}</button>`
-    } else if (!isActive) {
+    const shouldOfferBind = !isBound && (!hasActiveBoundInstall || isActive)
+    const bindButton = shouldOfferBind
+      ? `<button class="btn btn-primary btn-xs cleanup-bind-btn" data-path="${escapeHtml(inst.path)}">${t('services.cleanupBindThis')}</button>`
+      : ''
+    if (!isActive) {
       actions = `
         <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          ${bindButton}
           <code style="flex:1;min-width:0;font-size:11px;padding:4px 8px;background:var(--bg-tertiary);border-radius:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:all" title="${escapeHtml(uninstallCmd)}">${escapeHtml(uninstallCmd)}</code>
           <button class="btn btn-secondary btn-xs cleanup-copy-cmd" data-cmd="${escapeHtml(uninstallCmd)}" style="flex-shrink:0">${t('services.cleanupCopyCmd')}</button>
         </div>`
+    } else if (bindButton) {
+      actions = `<div style="margin-top:8px">${bindButton}</div>`
     }
 
     return `

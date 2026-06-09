@@ -2132,8 +2132,8 @@
       "failurePrefix": "Échec de la mise à jour du noyau :"
     },
     "upgradeHint": {
-      "title": "Nouveau noyau disponible",
-      "subtitle": "{from} → {to}, cliquez pour mettre à jour",
+      "title": "Running Gateway can be upgraded",
+      "subtitle": "Gateway {from} → recommended {to}",
       "dismissTooltip": "Ne plus avertir pendant cette session"
     }
   },

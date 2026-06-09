@@ -30,7 +30,7 @@
 
 ClawPanel es un panel de gestión visual que soporta múltiples frameworks de AI Agent, actualmente con soporte dual para [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) y [Hermes Agent](https://github.com/nousresearch/hermes-agent). Cuenta con un **asistente IA inteligente integrado** que te ayuda a instalar, diagnosticar configuraciones automáticamente, solucionar problemas y corregir errores. 8 herramientas + 4 modos + Q&A interactivo — fácil de gestionar para principiantes y expertos.
 
-> 🌐 **Sitio web**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Descargar**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **Sitio web**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Descargar**: [Centro de descargas oficial](https://claw.qt.cool/download) | Alternativa: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
 ### 🎁 QingchenCloud AI API
 
@@ -52,7 +52,7 @@ ClawPanel es un panel de gestión visual que soporta múltiples frameworks de AI
 - **Orange Pi / Raspberry Pi / RK3588** — `npm run serve` para ejecutar
 - **Docker ARM64** — `docker run ghcr.io/qingchencloud/openclaw:latest`
 - **Armbian / Debian / Ubuntu Server** — Detección automática de arquitectura
-- Sin necesidad de Rust / Tauri / GUI — **solo Node.js 18+**
+- Sin necesidad de Rust / Tauri / GUI. ClawPanel Web requiere **Node.js 18+**; OpenClaw Gateway se valida según el `engines.node` de la versión instalada de OpenClaw, recomendado **Node.js 22.19.0+**.
 
 ## Comunidad
 
@@ -60,6 +60,8 @@ Una comunidad de desarrolladores y entusiastas apasionados por los AI Agents —
 
 <p align="center">
   <a href="https://discord.gg/U9AttmsNHh"><strong>Discord</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://t.me/clawpanel"><strong>Telegram</strong></a>
   &nbsp;·&nbsp;
   <a href="https://github.com/qingchencloud/clawpanel/discussions"><strong>Discussions</strong></a>
   &nbsp;·&nbsp;
@@ -90,7 +92,7 @@ Una comunidad de desarrolladores y entusiastas apasionados por los AI Agents —
 
 ## Descargar e instalar
 
-Visita [Releases](https://github.com/qingchencloud/clawpanel/releases/latest) para la última versión:
+Visita el [centro de descargas oficial](https://claw.qt.cool/download) para la última versión. GitHub Releases sigue disponible como alternativa:
 
 | Plataforma | Instalador |
 |-----------|-----------|

@@ -2,7 +2,7 @@
  * 心甜Claw 引擎（产品宣传入口）
  * ------------------------------------------------------------------
  * 这不是一个本地引擎，而是「心甜Claw」产品的一个产品落地页入口：
- *   - 桌面客户端 + SaaS 后端，Windows 安装即用
+ *   - 桌面客户端 + SaaS 后端，Windows / macOS / Linux 安装即用
  *   - ClawPanel 里只承载宣传 + 跳转下载
  *
  * 因此它的 detect/boot/cleanup 都是 no-op，永远 ready，
@@ -19,7 +19,7 @@ let _listeners = []
 export default {
   id: 'xintian',
   name: '心甜Claw',
-  description: 'Xintian Claw · Worry-free AI Companion for Windows',
+  description: 'Xintian Claw · Worry-free AI Companion for desktop',
   icon: XINTIAN_ICON,
 
   async detect() {

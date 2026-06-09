@@ -85,6 +85,11 @@ export function clearRequestLogs() {
   _requestLogs.length = 0
 }
 
+function normalizeSiteLocale(locale) {
+  const value = String(locale || '').trim().toLowerCase()
+  return value.startsWith('zh') ? 'zh-CN' : 'en'
+}
+
 function cachedInvoke(cmd, args = {}, ttl = CACHE_TTL) {
   const key = cmd + JSON.stringify(args)
   const cached = _cache.get(key)
@@ -250,6 +255,7 @@ export async function checkBackendHealth() {
 let _reloadTimer = null
 function _debouncedReloadGateway() {
   clearTimeout(_reloadTimer)
+  if (!isTauriRuntime()) return
   _reloadTimer = setTimeout(() => { invoke('reload_gateway').catch(() => {}) }, 3000)
 }
 
@@ -391,10 +397,12 @@ export const api = {
   checkGit: () => cachedInvoke('check_git', {}, 60000),
   scanGitPaths: () => invoke('scan_git_paths'),
   autoInstallGit: () => invoke('auto_install_git'),
+  autoInstallNode: () => invoke('auto_install_node').then(r => { invalidate('check_node', 'get_services_status'); invoke('invalidate_path_cache').catch(() => {}); return r }),
   configureGitHttps: () => invoke('configure_git_https'),
   getDeployConfig: () => cachedInvoke('get_deploy_config'),
   patchModelVision: () => invoke('patch_model_vision'),
   checkPanelUpdate: () => invoke('check_panel_update'),
+  checkSiteAnnouncements: (locale) => invoke('check_site_announcements', { locale: normalizeSiteLocale(locale) }),
   writeEnvFile: (path, config) => invoke('write_env_file', { path, config }),
 
   // 备份管理

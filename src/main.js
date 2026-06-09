@@ -16,11 +16,13 @@ import { statusIcon } from './lib/icons.js'
 import { isForeignGatewayError, showGatewayConflictGuidance } from './lib/gateway-ownership.js'
 import { tryShowEngagement } from './components/engagement.js'
 import { toast } from './components/toast.js'
-import { initI18n, t } from './lib/i18n.js'
+import { initI18n, t, getLang, setLang, getAvailableLangs } from './lib/i18n.js'
+import { renderMarkdown } from './lib/markdown.js'
 import { initFeatureGates } from './lib/feature-gates.js'
 import { onKernelChange } from './lib/kernel.js'
 import { showFloorBlocker, hideFloorBlocker } from './components/floor-blocker.js'
 import { registerEngine, initEngineManager, getActiveEngine, getActiveEngineId, needsInitialEngineChoice, isEngineSetupDeferred, adoptActiveEngineSelection, onEngineChange } from './lib/engine-manager.js'
+import { initSiteMessageCenter, refreshSiteMessageCenter } from './components/site-message-center.js'
 import openclawEngine from './engines/openclaw/index.js'
 import hermesEngine from './engines/hermes/index.js'
 import xintianEngine from './engines/xintian/index.js'
@@ -36,6 +38,7 @@ import './style/agents.css'
 import './style/debug.css'
 import './style/assistant.css'
 import './style/ai-drawer.css'
+import './style/site-message-center.css'
 // 引擎专属样式（scope 到 [data-engine="<id>"] 子树，不影响其他引擎）
 import './engines/hermes/style/hermes.css'
 import './engines/xintian/style/xintian.css'
@@ -47,6 +50,268 @@ initI18n()
 /** HTML 转义，防止 XSS 注入 */
 function escapeHtml(str) {
   return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+function sanitizeReleaseNotesHtml(html) {
+  if (!html || typeof DOMParser === 'undefined') return ''
+  const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html')
+  const root = doc.body.firstElementChild
+  const allowedTags = new Set([
+    'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DIV', 'EM', 'H1', 'H2', 'H3', 'H4',
+    'LI', 'OL', 'P', 'PRE', 'SPAN', 'STRONG', 'TABLE', 'TBODY', 'TD',
+    'TH', 'THEAD', 'TR', 'UL',
+  ])
+  const blockedTags = new Set(['EMBED', 'IFRAME', 'MATH', 'OBJECT', 'SCRIPT', 'STYLE', 'SVG'])
+
+  const walk = (node) => {
+    for (const child of Array.from(node.children)) {
+      if (blockedTags.has(child.tagName)) {
+        child.remove()
+        continue
+      }
+      if (!allowedTags.has(child.tagName)) {
+        walk(child)
+        child.replaceWith(...Array.from(child.childNodes))
+        continue
+      }
+
+      for (const attr of Array.from(child.attributes)) {
+        const name = attr.name.toLowerCase()
+        if (name.startsWith('on') || name === 'style') {
+          child.removeAttribute(attr.name)
+        }
+      }
+
+      if (child.tagName === 'A') {
+        const href = child.getAttribute('href') || ''
+        const safe = safeExternalHref(href, '')
+        if (safe) {
+          child.setAttribute('href', safe)
+          child.setAttribute('target', '_blank')
+          child.setAttribute('rel', 'noopener')
+        } else {
+          child.removeAttribute('href')
+        }
+      } else {
+        child.removeAttribute('href')
+        child.removeAttribute('src')
+        child.removeAttribute('target')
+        child.removeAttribute('rel')
+      }
+
+      walk(child)
+    }
+  }
+
+  walk(root)
+  return root.innerHTML
+}
+
+function renderReleaseNotesMarkdown(markdown) {
+  const text = String(markdown || '').trim()
+  if (!text) return ''
+  return sanitizeReleaseNotesHtml(renderMarkdown(text))
+}
+
+function safeExternalHref(raw, fallback = 'https://claw.qt.cool') {
+  try {
+    const url = new URL(String(raw || '').trim() || fallback, 'https://claw.qt.cool')
+    const host = url.hostname.toLowerCase()
+    if (host === 'claw.qt.cool') {
+      url.protocol = 'https:'
+      return url.toString()
+    }
+    if ((host === 'github.com' || host === 'api.github.com') && url.protocol === 'https:') {
+      return url.toString()
+    }
+  } catch {}
+  return fallback
+}
+
+function compareVersions(a, b) {
+  const parse = (value) => String(value || '').replace(/^v/i, '').split(/[^0-9]/).filter(Boolean).map(Number)
+  const pa = parse(a)
+  const pb = parse(b)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const av = pa[i] || 0
+    const bv = pb[i] || 0
+    if (av > bv) return 1
+    if (av < bv) return -1
+  }
+  return 0
+}
+
+async function getInstalledAppVersion() {
+  if (!isTauriRuntime()) return APP_VERSION
+  try {
+    const { getVersion } = await import('@tauri-apps/api/app')
+    return await getVersion()
+  } catch {
+    return APP_VERSION
+  }
+}
+
+function formatBytes(value, fallback = '') {
+  const size = Number(value)
+  if (!Number.isFinite(size) || size <= 0) return fallback
+  const units = ['B', 'KB', 'MB', 'GB']
+  let next = size
+  let unit = 0
+  while (next >= 1024 && unit < units.length - 1) {
+    next /= 1024
+    unit += 1
+  }
+  return `${next >= 10 || unit === 0 ? next.toFixed(0) : next.toFixed(1)} ${units[unit]}`
+}
+
+function getInstallerAsset(panelInfo) {
+  const asset = panelInfo?.recommendedAsset
+  return asset && typeof asset === 'object' ? asset : null
+}
+
+function getInstallerUrl(panelInfo) {
+  return safeExternalHref(
+    panelInfo?.recommendedAsset?.downloadUrl || panelInfo?.downloadUrl || 'https://claw.qt.cool'
+  )
+}
+
+function getGitHubReleaseUrl(panelInfo) {
+  if (panelInfo?.source === 'site') return 'https://github.com/qingchencloud/clawpanel/releases'
+  return safeExternalHref(panelInfo?.url, 'https://github.com/qingchencloud/clawpanel/releases')
+}
+
+function getInstallerStepKey(asset) {
+  const platform = String(asset?.platform || '').toLowerCase()
+  const fileType = String(asset?.fileType || '').toLowerCase()
+  const name = String(asset?.name || '').toLowerCase()
+  if (platform === 'windows' || fileType === 'exe' || fileType === 'msi') return 'about.installerStepWindows'
+  if (platform === 'macos' || fileType === 'dmg') return 'about.installerStepMacos'
+  if (platform === 'linux') {
+    if (fileType === 'deb') return 'about.installerStepLinuxDeb'
+    if (fileType === 'rpm') return 'about.installerStepLinuxRpm'
+    if (fileType === 'appimage' || name.endsWith('.appimage')) return 'about.installerStepLinuxAppImage'
+    return 'about.installerStepLinux'
+  }
+  return 'about.installerStepGeneric'
+}
+
+function formatInstallerMeta(asset) {
+  if (!asset) return ''
+  const parts = []
+  const platform = [asset.platform, asset.arch].filter(Boolean).join(' / ')
+  const size = asset.sizeText || formatBytes(asset.size)
+  if (platform) parts.push(platform)
+  if (asset.fileType) parts.push(String(asset.fileType).toUpperCase())
+  if (size) parts.push(size)
+  if (asset.sourceText) parts.push(asset.sourceText)
+  return parts.join(' · ')
+}
+
+function showInstallerUpdateModal({ panelInfo, latest, installedVersion }) {
+  const old = document.getElementById('installer-update-overlay')
+  if (old) old.remove()
+
+  const asset = getInstallerAsset(panelInfo)
+  const downloadUrl = getInstallerUrl(panelInfo)
+  const githubUrl = getGitHubReleaseUrl(panelInfo)
+  const assetName = asset?.name || t('about.downloadFullInstaller')
+  const assetMeta = formatInstallerMeta(asset)
+  const changelog = String(panelInfo?.releaseNotes || '').trim()
+  const versionKey = String(latest || '').trim()
+  const sessionKey = versionKey ? `clawpanel_update_seen_session_${versionKey}` : ''
+
+  const overlay = document.createElement('div')
+  overlay.id = 'installer-update-overlay'
+  overlay.className = 'modal-overlay installer-update-overlay'
+  overlay.setAttribute('role', 'dialog')
+  overlay.setAttribute('aria-modal', 'true')
+  overlay.innerHTML = `
+    <div class="modal installer-update-modal" tabindex="-1">
+      <button class="installer-update-close" id="btn-installer-update-close" title="${t('common.close')}">&times;</button>
+      <div class="installer-update-head">
+        <div class="installer-update-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <path d="M7 10l5 5 5-5"/>
+            <path d="M12 15V3"/>
+          </svg>
+        </div>
+        <div class="installer-update-title-wrap">
+          <div class="installer-update-kicker">${t('about.installerUpdateKicker')}</div>
+          <div class="installer-update-title">${t('about.versionAvailable', { version: latest })}</div>
+          <div class="installer-update-subtitle">${t('about.installerUpdateSubtitle')}</div>
+        </div>
+      </div>
+
+      <div class="installer-update-grid">
+        <div class="installer-update-version-card">
+          <span>${t('about.currentAppVersion')}</span>
+          <strong>v${escapeHtml(installedVersion || APP_VERSION)}</strong>
+        </div>
+        <div class="installer-update-version-card installer-update-version-card-new">
+          <span>${t('about.latestAppVersion')}</span>
+          <strong>v${escapeHtml(latest)}</strong>
+        </div>
+      </div>
+
+      <div class="installer-update-asset">
+        <div class="installer-update-asset-label">${t('about.recommendedInstaller')}</div>
+        <div class="installer-update-asset-name">${escapeHtml(assetName)}</div>
+        ${assetMeta ? `<div class="installer-update-asset-meta">${escapeHtml(assetMeta)}</div>` : ''}
+      </div>
+
+      <div class="installer-update-steps">
+        <div class="installer-update-section-title">${t('about.installerStepsTitle')}</div>
+        <ol>
+          <li>${t('about.installerStepDownload')}</li>
+          <li>${t(getInstallerStepKey(asset))}</li>
+          <li>${t('about.installerStepRestart')}</li>
+        </ol>
+      </div>
+
+      ${changelog ? `
+        <div class="installer-update-notes">
+          <div class="installer-update-section-title">${t('about.releaseNotes')}</div>
+          <div class="installer-update-release-text installer-update-release-markdown">${renderReleaseNotesMarkdown(changelog)}</div>
+        </div>
+      ` : ''}
+
+      <div class="installer-update-actions">
+        <button class="btn btn-secondary btn-sm" id="btn-installer-update-later">${t('about.remindLater')}</button>
+        <button class="btn btn-secondary btn-sm" id="btn-installer-update-ignore">${t('about.dismissVersion')}</button>
+        <a class="btn btn-secondary btn-sm" id="btn-installer-update-github" href="${escapeHtml(githubUrl)}" target="_blank" rel="noopener">${t('about.downloadFromGitHub')}</a>
+        <a class="btn btn-primary btn-sm" id="btn-installer-update-download" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${t('about.downloadRecommendedInstaller')}</a>
+      </div>
+    </div>
+  `
+
+  const closeForSession = () => {
+    if (sessionKey) sessionStorage.setItem(sessionKey, '1')
+    overlay.remove()
+  }
+  const ignoreVersion = () => {
+    if (versionKey) localStorage.setItem('clawpanel_update_dismissed', versionKey)
+    overlay.remove()
+  }
+
+  document.body.appendChild(overlay)
+  overlay.querySelector('#btn-installer-update-close')?.addEventListener('click', closeForSession)
+  overlay.querySelector('#btn-installer-update-later')?.addEventListener('click', closeForSession)
+  overlay.querySelector('#btn-installer-update-ignore')?.addEventListener('click', ignoreVersion)
+  overlay.querySelector('#btn-installer-update-download')?.addEventListener('click', closeForSession)
+  overlay.querySelector('#btn-installer-update-github')?.addEventListener('click', closeForSession)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) closeForSession()
+  })
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeForSession()
+  })
+  const modal = overlay.querySelector('.installer-update-modal')
+  if (modal) {
+    modal.scrollTop = 0
+    modal.focus({ preventScroll: true })
+    requestAnimationFrame(() => { modal.scrollTop = 0 })
+  }
 }
 
 async function openGatewayConflict(error = null) {
@@ -175,42 +440,75 @@ function _genCaptcha() {
   return { q: `${a} + ${b} = ?`, a: a + b }
 }
 
+function renderLoginLanguageSwitch() {
+  const langs = getAvailableLangs()
+  const current = getLang()
+  const currentLang = langs.find(lang => lang.code === current) || langs[0]
+  const options = langs.map(lang => `
+    <option value="${escapeHtml(lang.code)}" ${lang.code === current ? 'selected' : ''}>
+      ${escapeHtml(lang.label)} · ${escapeHtml(lang.code)}
+    </option>
+  `).join('')
+  return `
+    <label class="login-lang-switch">
+      <span class="login-lang-label">Language</span>
+      <select id="login-lang-select" aria-label="Language">
+        ${options}
+      </select>
+      <span class="login-lang-current">${escapeHtml(currentLang?.code || current)}</span>
+    </label>
+  `
+}
+
 function showLoginOverlay(defaultPw) {
   const hasDefault = !!defaultPw
   const overlay = document.createElement('div')
   overlay.id = 'login-overlay'
   let _captcha = _loginFailCount >= CAPTCHA_THRESHOLD ? _genCaptcha() : null
   const securityLabel = t('sidebar.security')
-  const accessPasswordField = '<code style="background:rgba(99,102,241,.1);padding:1px 5px;border-radius:3px;font-size:10px">accessPassword</code>'
-  const resetPath = '<code style="background:rgba(99,102,241,.1);padding:2px 6px;border-radius:3px;font-size:10px;word-break:break-all">~/.openclaw/clawpanel.json</code>'
+  const accessPasswordField = '<code>accessPassword</code>'
+  const resetPath = '<code>~/.openclaw/clawpanel.json</code>'
   overlay.innerHTML = `
     <div class="login-card">
-      ${_logoSvg}
-      <div class="login-title">ClawPanel</div>
-      <div class="login-desc">${hasDefault
-        ? `${t('security.firstLoginHint')}<br><span style="font-size:12px;color:#6366f1;font-weight:600">${t('security.firstLoginChangeHint', { security: securityLabel })}</span>`
-        : (isTauri ? t('security.appLocked') : t('security.loginPrompt'))}</div>
+      <div class="login-topbar">
+        <div class="login-brand">
+          <span class="login-brand-mark"><img src="/images/logo.png" alt="" aria-hidden="true"></span>
+          <div class="login-brand-copy">
+            <span class="login-brand-kicker">claw.qt.cool</span>
+            <span class="login-title">ClawPanel</span>
+          </div>
+        </div>
+        ${renderLoginLanguageSwitch()}
+      </div>
+      <div class="login-copy">
+        <div class="login-heading">${hasDefault ? t('security.firstLoginHint') : (isTauri ? t('security.appLocked') : t('security.loginPrompt'))}</div>
+        ${hasDefault
+          ? `<div class="login-security-note">${statusIcon('warn', 14)}<span>${t('security.firstLoginChangeHint', { security: securityLabel })}</span></div>`
+          : `<div class="login-desc">${t('security.accessPasswordPlaceholder')}</div>`}
+      </div>
       <form id="login-form">
-        <input class="login-input" type="${hasDefault ? 'text' : 'password'}" id="login-pw" placeholder="${t('security.accessPasswordPlaceholder')}" autocomplete="current-password" autofocus value="${hasDefault ? defaultPw : ''}" />
-        <div id="login-captcha" style="display:${_captcha ? 'block' : 'none'};margin-bottom:10px">
-          <div style="font-size:12px;color:#888;margin-bottom:6px">${t('security.captchaPrompt')}<strong id="captcha-q" style="color:var(--text-primary,#333)">${_captcha ? _captcha.q : ''}</strong></div>
-          <input class="login-input" type="number" id="login-captcha-input" placeholder="${t('security.captchaPlaceholder')}" style="text-align:center" />
+        <div class="login-field">
+          <input class="login-input" type="${hasDefault ? 'text' : 'password'}" id="login-pw" placeholder="${t('security.accessPasswordPlaceholder')}" autocomplete="current-password" autofocus value="${hasDefault ? defaultPw : ''}" />
+        </div>
+        <div id="login-captcha" class="login-captcha" style="display:${_captcha ? 'block' : 'none'}">
+          <div class="login-captcha-label">${t('security.captchaPrompt')}<strong id="captcha-q">${_captcha ? _captcha.q : ''}</strong></div>
+          <input class="login-input login-captcha-input" type="number" id="login-captcha-input" placeholder="${t('security.captchaPlaceholder')}" />
         </div>
         <button class="login-btn" type="submit">${t('security.loginAction')}</button>
         <div class="login-error" id="login-error"></div>
       </form>
-      ${!hasDefault ? `<details class="login-forgot" style="margin-top:16px;text-align:center">
-        <summary style="font-size:11px;color:#aaa;cursor:pointer;list-style:none;user-select:none">${t('security.forgotPassword')}</summary>
-        <div style="margin-top:8px;font-size:11px;color:#888;line-height:1.8;text-align:left;background:rgba(0,0,0,.03);border-radius:8px;padding:10px 14px">
+      ${!hasDefault ? `<details class="login-forgot">
+        <summary>${t('security.forgotPassword')}</summary>
+        <div class="login-forgot-body">
           ${isTauri
             ? `${t('security.resetPasswordLocal', { field: accessPasswordField })}<br>${resetPath}`
             : `${t('security.resetPasswordRemote', { field: accessPasswordField })}<br>${resetPath}`
           }
         </div>
       </details>` : ''}
-      <div style="margin-top:${hasDefault ? '20' : '12'}px;font-size:11px;color:#aaa;text-align:center">
-        <a href="https://claw.qt.cool" target="_blank" rel="noopener" style="color:#aaa;text-decoration:none">claw.qt.cool</a>
-        <span style="margin:0 6px">·</span>v${APP_VERSION}
+      <div class="login-footer">
+        <a href="https://claw.qt.cool" target="_blank" rel="noopener">claw.qt.cool</a>
+        <span>v${APP_VERSION}</span>
       </div>
     </div>
   `
@@ -218,6 +516,14 @@ function showLoginOverlay(defaultPw) {
   _hideSplash()
 
   return new Promise((resolve) => {
+    overlay.querySelector('#login-lang-select')?.addEventListener('change', (event) => {
+      const next = event.target.value
+      if (!next || next === getLang()) return
+      setLang(next)
+      overlay.remove()
+      showLoginOverlay(defaultPw).then(resolve)
+    })
+
     overlay.querySelector('#login-form').addEventListener('submit', async (e) => {
       e.preventDefault()
       const pw = overlay.querySelector('#login-pw').value
@@ -401,12 +707,17 @@ async function boot() {
   if (sessionStorage.getItem('clawpanel_must_change_pw') === '1') {
     const banner = document.createElement('div')
     banner.id = 'pw-change-banner'
-    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;padding:10px 20px;display:flex;align-items:center;justify-content:center;gap:12px;font-size:13px;font-weight:500;box-shadow:0 2px 8px rgba(0,0,0,0.15)'
+    banner.className = 'password-change-banner'
     banner.innerHTML = `
-      <span>${statusIcon('warn', 14)} ${t('common.defaultPasswordBanner')}</span>
-      <a href="#/security" style="color:#fff;background:rgba(255,255,255,0.2);min-height:44px;padding:0 14px;border-radius:8px;text-decoration:none;font-size:12px;font-weight:600;display:inline-flex;align-items:center;justify-content:center" onclick="document.getElementById('pw-change-banner').remove();sessionStorage.removeItem('clawpanel_must_change_pw')">${t('common.goSecurity')}</a>
-      <button aria-label="${t('common.close')}" title="${t('common.close')}" onclick="this.parentElement.remove()" style="width:44px;height:44px;flex:0 0 44px;display:inline-flex;align-items:center;justify-content:center;background:none;border:none;border-radius:8px;color:rgba(255,255,255,0.7);cursor:pointer;font-size:16px;padding:0;margin-left:0">✕</button>
+      <span class="password-change-text">${statusIcon('warn', 14)} ${t('common.defaultPasswordBanner')}</span>
+      <a class="password-change-action" href="#/security" data-pw-banner-action>${t('common.goSecurity')}</a>
+      <button class="password-change-close" type="button" aria-label="${t('common.close')}" title="${t('common.close')}" data-pw-banner-close>✕</button>
     `
+    banner.querySelector('[data-pw-banner-action]')?.addEventListener('click', () => {
+      banner.remove()
+      sessionStorage.removeItem('clawpanel_must_change_pw')
+    })
+    banner.querySelector('[data-pw-banner-close]')?.addEventListener('click', () => banner.remove())
     document.body.prepend(banner)
   }
 
@@ -561,6 +872,7 @@ async function boot() {
             setDefaultRoute('/setup')
             navigate('/setup')
           }
+          window.dispatchEvent(new CustomEvent('openclaw:runtime-changed'))
         }
         await listen('upgrade-done', refreshAfterTask)
         await listen('upgrade-error', refreshAfterTask)
@@ -580,17 +892,12 @@ async function autoConnectWebSocket() {
     const rawPassword = config?.gateway?.auth?.password
     const password = (typeof rawPassword === 'string') ? rawPassword : ''
 
-    // 启动前先确保设备已配对 + allowedOrigins 已写入，无需用户手动操作
+    // 启动前先确保设备已配对 + allowedOrigins 已写入，无需用户手动操作。
+    // 不在这里自动重启 Gateway：Windows 上手动启动的 Gateway 会被 stop/restart 打断。
     let needReload = false
     try {
       const pairResult = await api.autoPairDevice()
       console.log('[main] 设备配对 + origins 已就绪:', pairResult)
-      // 仅在配置实际变更时才需要 reload（dev-api 返回 {changed}，Tauri 返回字符串）
-      if (typeof pairResult === 'object' && pairResult.changed) {
-        needReload = true
-      } else if (typeof pairResult === 'string' && pairResult !== '设备已配对') {
-        needReload = true
-      }
     } catch (pairErr) {
       console.warn('[main] autoPairDevice 失败（非致命）:', pairErr)
     }
@@ -607,13 +914,15 @@ async function autoConnectWebSocket() {
     }
 
     // 统一 reload Gateway（配对 origins + vision patch 合并为一次 reload）
-    if (needReload) {
+    if (needReload && isTauriRuntime()) {
       try {
         await api.reloadGateway()
         console.log('[main] Gateway 已重载')
       } catch (reloadErr) {
         console.warn('[main] reloadGateway 失败（非致命）:', reloadErr)
       }
+    } else if (needReload) {
+      console.log('[main] Web/headless 模式跳过自动 reload Gateway')
     }
 
     // TCP 端口就绪探测：等待 Gateway 端口可达后再发起 WS 连接（仅 Tauri 桌面端）
@@ -862,79 +1171,55 @@ function showGuardianRecovery() {
 
 // === 全局版本更新检测 ===
 const UPDATE_CHECK_INTERVAL = 30 * 60 * 1000 // 30 分钟
+const ANNOUNCEMENT_CHECK_INTERVAL = 30 * 60 * 1000 // 30 分钟
 let _updateCheckTimer = null
+let _announcementCheckTimer = null
 
 async function checkGlobalUpdate() {
-  const banner = document.getElementById('update-banner')
-  if (!banner) return
-
   try {
-    const info = await api.checkFrontendUpdate()
-    if (!info.hasUpdate) return
+    const [panelResult, versionResult] = await Promise.allSettled([
+      api.checkPanelUpdate(),
+      getInstalledAppVersion(),
+    ])
+    const panelInfo = panelResult.status === 'fulfilled' ? panelResult.value : null
+    const installedVersion = versionResult.status === 'fulfilled' ? versionResult.value : APP_VERSION
 
-    const ver = info.latestVersion || info.manifest?.version || ''
-    if (!ver) return
+    const panelLatest = panelInfo?.latest || ''
+    const hasFullInstallerUpdate = !!panelLatest && compareVersions(panelLatest, installedVersion) > 0
+    if (!hasFullInstallerUpdate) return
+
+    const ver = panelLatest
 
     // 用户已忽略过该版本，不再打扰
     const dismissed = localStorage.getItem('clawpanel_update_dismissed')
     if (dismissed === ver) return
+    if (sessionStorage.getItem(`clawpanel_update_seen_session_${ver}`) === '1') return
 
-    const changelog = info.manifest?.changelog || ''
-    const canHotUpdate = isTauriRuntime()
-      && info.manifest?.downloadUrl
-      && info.manifest?.hash
-
-    banner.classList.remove('update-banner-hidden')
-    banner.innerHTML = `
-      <div class="update-banner-content">
-        <div class="update-banner-text">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          <span class="update-banner-ver">${t('about.versionAvailable', { version: ver })}</span>
-          ${changelog ? `<span class="update-banner-changelog">· ${changelog}</span>` : ''}
-        </div>
-        ${canHotUpdate ? `<button class="btn btn-sm btn-primary" id="btn-hot-update">${t('about.hotUpdateNow')}</button>` : ''}
-        <a class="btn btn-sm" href="https://claw.qt.cool" target="_blank" rel="noopener">${t('about.downloadFromWebsite')}</a>
-        <a class="btn btn-sm" href="https://github.com/qingchencloud/clawpanel/releases" target="_blank" rel="noopener">${t('about.downloadFromGitHub')}</a>
-        <button class="update-banner-close" id="btn-update-dismiss" title="${t('about.dismissVersion')}">✕</button>
-      </div>
-    `
-
-    // 关闭按钮：记住忽略的版本
-    banner.querySelector('#btn-update-dismiss')?.addEventListener('click', () => {
-      localStorage.setItem('clawpanel_update_dismissed', ver)
-      banner.classList.add('update-banner-hidden')
-    })
-
-    // 热更新按钮
-    const hotUpdateBtn = banner.querySelector('#btn-hot-update')
-    if (hotUpdateBtn && canHotUpdate) {
-      hotUpdateBtn.addEventListener('click', async () => {
-        hotUpdateBtn.disabled = true
-        hotUpdateBtn.textContent = t('about.hotUpdateDownloading')
-        try {
-          await api.downloadFrontendUpdate(
-            info.manifest.downloadUrl,
-            info.manifest.hash,
-            ver
-          )
-          hotUpdateBtn.style.display = 'none'
-          toast(t('about.hotUpdateDone'), 'success')
-          // 在 banner 中插入重启按钮
-          const rebootBtn = document.createElement('button')
-          rebootBtn.className = 'btn btn-sm btn-primary'
-          rebootBtn.textContent = t('about.restartApp')
-          rebootBtn.onclick = () => api.relaunchApp().catch(() => {})
-          banner.querySelector('.update-banner-text').after(rebootBtn)
-        } catch (err) {
-          hotUpdateBtn.disabled = false
-          hotUpdateBtn.textContent = t('about.hotUpdateNow')
-          toast(t('about.hotUpdateFailed') + ': ' + (err.message || err), 'error')
-        }
-      })
-    }
+    showInstallerUpdateModal({ panelInfo, latest: ver, installedVersion })
   } catch {
     // 检查失败静默忽略
   }
+}
+
+async function openInstallerUpdateDialog(options = {}) {
+  const panelInfo = options.panelInfo || await api.checkPanelUpdate()
+  const installedVersion = options.installedVersion || await getInstalledAppVersion()
+  const latest = options.latest || panelInfo?.latest || ''
+  if (!latest) return false
+  if (!options.force && compareVersions(latest, installedVersion) <= 0) return false
+
+  showInstallerUpdateModal({ panelInfo, latest, installedVersion })
+  return true
+}
+
+window.addEventListener('clawpanel:show-installer-update', (event) => {
+  openInstallerUpdateDialog({ ...(event.detail || {}), force: true }).catch(() => {
+    toast(t('about.checkUpdateFailed'), 'error')
+  })
+})
+
+async function checkSiteAnnouncements() {
+  await refreshSiteMessageCenter({ auto: true })
 }
 
 function startUpdateChecker() {
@@ -944,6 +1229,11 @@ function startUpdateChecker() {
   setTimeout(checkGlobalUpdate, 5000)
   // 之后每 30 分钟检查一次
   _updateCheckTimer = setInterval(checkGlobalUpdate, UPDATE_CHECK_INTERVAL)
+}
+
+function startAnnouncementChecker() {
+  setTimeout(checkSiteAnnouncements, 8000)
+  _announcementCheckTimer = setInterval(checkSiteAnnouncements, ANNOUNCEMENT_CHECK_INTERVAL)
 }
 
 // 启动：先检查后端 → 认证 → 加载应用
@@ -976,7 +1266,11 @@ function startUpdateChecker() {
         <div style="margin-top:24px;font-size:11px;color:#a1a1aa">${t('common.pageLoadFailedHint')}<br><a href="https://github.com/qingchencloud/clawpanel/issues" target="_blank" style="color:#6366f1">GitHub Issues</a></div>
       </div>`
   }
+  initSiteMessageCenter({
+    fetcher: () => api.checkSiteAnnouncements(getLang()),
+  })
   startUpdateChecker()
+  startAnnouncementChecker()
 
   // 初始化全局 AI 助手浮动按钮（延迟加载，不阻塞启动）
   setTimeout(async () => {

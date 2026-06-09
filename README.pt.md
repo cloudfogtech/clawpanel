@@ -30,7 +30,7 @@
 
 ClawPanel é um painel de gestão visual que suporta múltiplos frameworks de AI Agent, atualmente com suporte dual para [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) e [Hermes Agent](https://github.com/nousresearch/hermes-agent). Possui um **assistente IA inteligente integrado** que ajuda a instalar, diagnosticar configurações automaticamente, resolver problemas e corrigir erros. 8 ferramentas + 4 modos + Q&A interativo — fácil de gerenciar para iniciantes e especialistas.
 
-> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Download**: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **Website**: [claw.qt.cool](https://claw.qt.cool/) | 📦 **Download**: [Centro de download oficial](https://claw.qt.cool/download) | Fallback: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
 
 ### 🎁 QingchenCloud AI API
 
@@ -52,7 +52,7 @@ ClawPanel é um painel de gestão visual que suporta múltiplos frameworks de AI
 - **Orange Pi / Raspberry Pi / RK3588** — `npm run serve` para executar
 - **Docker ARM64** — `docker run ghcr.io/qingchencloud/openclaw:latest`
 - **Armbian / Debian / Ubuntu Server** — Detecção automática de arquitetura
-- Sem necessidade de Rust / Tauri / GUI — **apenas Node.js 18+**
+- Sem necessidade de Rust / Tauri / GUI. O ClawPanel Web requer **Node.js 18+**; o OpenClaw Gateway é validado conforme o `engines.node` do OpenClaw instalado, com **Node.js 22.19.0+** recomendado.
 
 ## Comunidade
 
@@ -60,6 +60,8 @@ Uma comunidade de desenvolvedores e entusiastas apaixonados por AI Agents — ju
 
 <p align="center">
   <a href="https://discord.gg/U9AttmsNHh"><strong>Discord</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://t.me/clawpanel"><strong>Telegram</strong></a>
   &nbsp;·&nbsp;
   <a href="https://github.com/qingchencloud/clawpanel/discussions"><strong>Discussions</strong></a>
   &nbsp;·&nbsp;
@@ -90,7 +92,7 @@ Uma comunidade de desenvolvedores e entusiastas apaixonados por AI Agents — ju
 
 ## Download e instalação
 
-Acesse [Releases](https://github.com/qingchencloud/clawpanel/releases/latest) para a versão mais recente:
+Acesse o [centro de download oficial](https://claw.qt.cool/download) para a versão mais recente. GitHub Releases continua disponível como fallback:
 
 | Plataforma | Instalador |
 |-----------|-----------|

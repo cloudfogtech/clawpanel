@@ -2132,8 +2132,8 @@
       "failurePrefix": "Falló la actualización del kernel:"
     },
     "upgradeHint": {
-      "title": "Nuevo kernel disponible",
-      "subtitle": "{from} → {to}, haz clic para actualizar",
+      "title": "Running Gateway can be upgraded",
+      "subtitle": "Gateway {from} → recommended {to}",
       "dismissTooltip": "No avisar en esta sesión"
     }
   },

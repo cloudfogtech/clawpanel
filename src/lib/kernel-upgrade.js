@@ -11,6 +11,28 @@ import { toast } from '../components/toast.js'
 import { t } from './i18n.js'
 import { getKernelSnapshot } from './kernel.js'
 
+async function resolveKernelUpgradePolicy(snap) {
+  try {
+    const info = await api.getVersionInfo()
+    const source = String(info?.source || '').toLowerCase()
+    const cliSource = String(info?.cli_source || '').toLowerCase()
+    const variant = source === 'chinese' || cliSource === 'standalone' || cliSource === 'npm-zh'
+      ? 'chinese'
+      : source === 'official' || cliSource === 'npm-official' || cliSource === 'npm-global'
+        ? 'official'
+        : (snap.variant === 'chinese' ? 'chinese' : 'official')
+    return {
+      variant,
+      targetVersion: info?.recommended || snap.target || '',
+    }
+  } catch {
+    return {
+      variant: snap.variant === 'chinese' ? 'chinese' : 'official',
+      targetVersion: snap.target || '',
+    }
+  }
+}
+
 /**
  * 触发一键升级。会自动检测当前内核 variant（官方/汉化）选择源，调推荐版本。
  *
@@ -26,8 +48,7 @@ export async function triggerKernelUpgrade(opts = {}) {
     return false
   }
 
-  const variant = snap.variant === 'chinese' ? 'chinese' : 'official'
-  const targetVersion = snap.target || ''
+  const { variant, targetVersion } = await resolveKernelUpgradePolicy(snap)
 
   // 1. 确认对话框
   if (!opts.skipConfirm) {

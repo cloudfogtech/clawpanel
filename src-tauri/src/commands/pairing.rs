@@ -1,5 +1,219 @@
 /// 设备配对命令
 /// 自动向 Gateway 注册设备，跳过手动配对流程
+use base64::Engine;
+
+const CONTROL_UI_CLIENT_ID: &str = "openclaw-control-ui";
+const CONTROL_UI_CLIENT_MODE: &str = "ui";
+const CONTROL_UI_ROLE: &str = "operator";
+const CONTROL_UI_DEVICE_FAMILY: &str = "desktop";
+const CONTROL_UI_SCOPES: &[&str] = &[
+    "operator.admin",
+    "operator.approvals",
+    "operator.pairing",
+    "operator.read",
+    "operator.write",
+];
+
+fn scope_values() -> Vec<serde_json::Value> {
+    CONTROL_UI_SCOPES
+        .iter()
+        .map(|scope| serde_json::Value::String((*scope).to_string()))
+        .collect()
+}
+
+fn generate_pairing_token() -> String {
+    let bytes: [u8; 32] = rand::random();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn ensure_string_field(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+) -> bool {
+    if obj.get(key).and_then(|v| v.as_str()) == Some(value) {
+        return false;
+    }
+    obj.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    true
+}
+
+fn ensure_array_contains(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    required: &[&str],
+) -> bool {
+    let mut changed = false;
+    let mut values: Vec<String> = obj
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for item in required {
+        if !values.iter().any(|existing| existing == item) {
+            values.push((*item).to_string());
+            changed = true;
+        }
+    }
+
+    let normalized: Vec<serde_json::Value> = values
+        .iter()
+        .map(|item| serde_json::Value::String(item.clone()))
+        .collect();
+    if obj.get(key).and_then(|v| v.as_array()) != Some(&normalized) {
+        obj.insert(key.to_string(), serde_json::Value::Array(normalized));
+        changed = true;
+    }
+
+    changed
+}
+
+fn operator_token_is_usable(value: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = value.and_then(|v| v.as_object()) else {
+        return false;
+    };
+    if obj
+        .get("revokedAtMs")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if obj.get("role").and_then(|v| v.as_str()) != Some(CONTROL_UI_ROLE) {
+        return false;
+    }
+    if !obj
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let scopes: Vec<String> = obj
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    CONTROL_UI_SCOPES
+        .iter()
+        .all(|scope| scopes.iter().any(|existing| existing == scope))
+}
+
+fn ensure_operator_token(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    now_ms: u64,
+) -> bool {
+    let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
+    if !tokens.is_object() {
+        *tokens = serde_json::json!({});
+    }
+    let Some(tokens_obj) = tokens.as_object_mut() else {
+        return false;
+    };
+
+    if operator_token_is_usable(tokens_obj.get(CONTROL_UI_ROLE)) {
+        return false;
+    }
+
+    let existing = tokens_obj.get(CONTROL_UI_ROLE).and_then(|v| v.as_object());
+    let token = existing
+        .and_then(|entry| entry.get("token"))
+        .and_then(|v| v.as_str())
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| token.to_string())
+        .unwrap_or_else(generate_pairing_token);
+    let created_at_ms = existing
+        .and_then(|entry| entry.get("createdAtMs"))
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
+        .unwrap_or(now_ms);
+
+    tokens_obj.insert(
+        CONTROL_UI_ROLE.to_string(),
+        serde_json::json!({
+            "token": token,
+            "role": CONTROL_UI_ROLE,
+            "scopes": scope_values(),
+            "createdAtMs": created_at_ms,
+            "rotatedAtMs": now_ms,
+            "lastUsedAtMs": existing
+                .and_then(|entry| entry.get("lastUsedAtMs"))
+                .and_then(|v| v.as_u64()),
+        }),
+    );
+    true
+}
+
+fn normalize_control_ui_pairing(
+    entry: &mut serde_json::Value,
+    device_id: &str,
+    public_key: &str,
+    platform: &str,
+    now_ms: u64,
+) -> bool {
+    if !entry.is_object() {
+        *entry = serde_json::json!({});
+    }
+
+    let Some(obj) = entry.as_object_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    changed |= ensure_string_field(obj, "deviceId", device_id);
+    changed |= ensure_string_field(obj, "publicKey", public_key);
+    changed |= ensure_string_field(obj, "platform", platform);
+    changed |= ensure_string_field(obj, "deviceFamily", CONTROL_UI_DEVICE_FAMILY);
+    changed |= ensure_string_field(obj, "clientId", CONTROL_UI_CLIENT_ID);
+    changed |= ensure_string_field(obj, "clientMode", CONTROL_UI_CLIENT_MODE);
+    changed |= ensure_string_field(obj, "role", CONTROL_UI_ROLE);
+    changed |= ensure_array_contains(obj, "roles", &[CONTROL_UI_ROLE]);
+    changed |= ensure_array_contains(obj, "scopes", CONTROL_UI_SCOPES);
+    changed |= ensure_array_contains(obj, "approvedScopes", CONTROL_UI_SCOPES);
+
+    changed |= ensure_operator_token(obj, now_ms);
+    if !obj
+        .get("createdAtMs")
+        .and_then(|v| v.as_u64())
+        .map(|v| v > 0)
+        .unwrap_or(false)
+    {
+        obj.insert("createdAtMs".into(), serde_json::json!(now_ms));
+        changed = true;
+    }
+    if changed
+        || !obj
+            .get("approvedAtMs")
+            .and_then(|v| v.as_u64())
+            .map(|v| v > 0)
+            .unwrap_or(false)
+    {
+        obj.insert("approvedAtMs".into(), serde_json::json!(now_ms));
+        changed = true;
+    }
+
+    changed
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 #[tauri::command]
 pub fn auto_pair_device() -> Result<String, String> {
@@ -31,63 +245,42 @@ pub fn auto_pair_device() -> Result<String, String> {
 
     let os_platform = std::env::consts::OS; // "windows" | "macos" | "linux"
 
-    // 如果已配对，档查 platform 字段是否正确；不正确则覆盖更新，
-    // 避免 Gateway 因 metadata-upgrade 拒绝静默自动配对
+    let now_ms = now_ms();
+
+    // 如果已配对，仍要补齐控制 UI 必需字段。
+    // 旧版本可能只写入了 publicKey，但缺失 role/scopes/approvedScopes，
+    // Gateway 会把它视为 roleFrom=<none>，从而拒绝 operator 握手。
     if let Some(existing) = paired.get_mut(&device_id) {
-        let current_platform = existing
-            .get("platform")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if current_platform != os_platform {
-            if let Some(obj) = existing.as_object_mut() {
-                obj.insert(
-                    "platform".to_string(),
-                    serde_json::Value::String(os_platform.to_string()),
-                );
-                obj.insert(
-                    "deviceFamily".to_string(),
-                    serde_json::Value::String("desktop".to_string()),
-                );
-            }
+        if normalize_control_ui_pairing(existing, &device_id, &public_key, os_platform, now_ms) {
             let new_content = serde_json::to_string_pretty(&paired)
                 .map_err(|e| format!("序列化 paired.json 失败: {e}"))?;
             std::fs::write(&paired_path, new_content)
                 .map_err(|e| format!("更新 paired.json 失败: {e}"))?;
-            return Ok("设备已配对（已修正平台字段）".into());
+            return Ok("设备已配对（已修正权限字段）".into());
         }
         return Ok("设备已配对".into());
     }
 
     // 添加设备到配对列表
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
     paired[&device_id] = serde_json::json!({
         "deviceId": device_id,
         "publicKey": public_key,
         "platform": os_platform,
-        "deviceFamily": "desktop",
-        "clientId": "openclaw-control-ui",
-        "clientMode": "ui",
-        "role": "operator",
-        "roles": ["operator"],
-        "scopes": [
-            "operator.admin",
-            "operator.approvals",
-            "operator.pairing",
-            "operator.read",
-            "operator.write"
-        ],
-        "approvedScopes": [
-            "operator.admin",
-            "operator.approvals",
-            "operator.pairing",
-            "operator.read",
-            "operator.write"
-        ],
-        "tokens": {},
+        "deviceFamily": CONTROL_UI_DEVICE_FAMILY,
+        "clientId": CONTROL_UI_CLIENT_ID,
+        "clientMode": CONTROL_UI_CLIENT_MODE,
+        "role": CONTROL_UI_ROLE,
+        "roles": [CONTROL_UI_ROLE],
+        "scopes": scope_values(),
+        "approvedScopes": scope_values(),
+        "tokens": {
+            (CONTROL_UI_ROLE): {
+                "token": generate_pairing_token(),
+                "role": CONTROL_UI_ROLE,
+                "scopes": scope_values(),
+                "createdAtMs": now_ms
+            }
+        },
         "createdAtMs": now_ms,
         "approvedAtMs": now_ms
     });
@@ -248,4 +441,72 @@ pub async fn pairing_approve_channel(
         args.push("--notify".into());
     }
     run_pairing_command(args).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_existing_pairing_upgrades_missing_operator_fields() {
+        let mut entry = serde_json::json!({
+            "deviceId": "device-1",
+            "publicKey": "old-key",
+            "clientId": "openclaw-control-ui"
+        });
+
+        let changed =
+            normalize_control_ui_pairing(&mut entry, "device-1", "new-key", "windows", 1234);
+
+        assert!(changed);
+        assert_eq!(entry["publicKey"], "new-key");
+        assert_eq!(entry["platform"], "windows");
+        assert_eq!(entry["deviceFamily"], "desktop");
+        assert_eq!(entry["clientMode"], "ui");
+        assert_eq!(entry["role"], "operator");
+        assert_eq!(entry["roles"], serde_json::json!(["operator"]));
+        assert_eq!(entry["scopes"], serde_json::json!(scope_values()));
+        assert_eq!(entry["approvedScopes"], serde_json::json!(scope_values()));
+        assert_eq!(entry["tokens"]["operator"]["role"], "operator");
+        assert_eq!(
+            entry["tokens"]["operator"]["scopes"],
+            serde_json::json!(scope_values())
+        );
+        assert!(entry["tokens"]["operator"]["token"]
+            .as_str()
+            .map(|token| !token.is_empty())
+            .unwrap_or(false));
+        assert_eq!(entry["approvedAtMs"], serde_json::json!(1234));
+    }
+
+    #[test]
+    fn normalize_existing_pairing_keeps_complete_entry_unchanged() {
+        let mut entry = serde_json::json!({
+            "deviceId": "device-1",
+            "publicKey": "key",
+            "platform": "windows",
+            "deviceFamily": "desktop",
+            "clientId": "openclaw-control-ui",
+            "clientMode": "ui",
+            "role": "operator",
+            "roles": ["operator"],
+            "scopes": scope_values(),
+            "approvedScopes": scope_values(),
+            "tokens": {
+                "operator": {
+                    "token": "existing-token",
+                    "role": "operator",
+                    "scopes": scope_values(),
+                    "createdAtMs": 1
+                }
+            },
+            "createdAtMs": 1,
+            "approvedAtMs": 1
+        });
+
+        let changed = normalize_control_ui_pairing(&mut entry, "device-1", "key", "windows", 1234);
+
+        assert!(!changed);
+        assert_eq!(entry["approvedAtMs"], serde_json::json!(1));
+    }
 }

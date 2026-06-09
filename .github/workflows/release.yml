@@ -267,35 +267,59 @@ jobs:
             CHANGELOG_HEADER="主要变更"
           fi
 
-          # 按 conventional commit 前缀分类
-          get_logs() {
-            local prefix="$1"
-            if [ -n "$RANGE" ]; then
-              git log "$RANGE" --pretty=format:"%s" --no-merges | { grep -iE "^${prefix}" || true; } | sed "s/^${prefix}[:(] */- /" | head -20
-            else
-              git log --pretty=format:"%s" --no-merges -30 | { grep -iE "^${prefix}" || true; } | sed "s/^${prefix}[:(] */- /" | head -20
-            fi
-          }
+          # 优先使用人工整理的 CHANGELOG.md 当前版本段，避免 Release Notes 只显示 release commit。
+          CHANGELOG_BODY=$(python3 - "$VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
 
-          FEATS=$(get_logs "feat")
-          FIXES=$(get_logs "fix")
-          OTHERS=$(
-            if [ -n "$RANGE" ]; then
-              git log "$RANGE" --pretty=format:"%s" --no-merges | { grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" || true; } | sed 's/^/- /' | head -10
-            else
-              git log --pretty=format:"%s" --no-merges -30 | { grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" || true; } | sed 's/^/- /' | head -10
-            fi
+          version = sys.argv[1]
+          path = pathlib.Path("CHANGELOG.md")
+          if not path.exists():
+              sys.exit(0)
+
+          text = path.read_text(encoding="utf-8")
+          current = re.search(rf"^## \[{re.escape(version)}\](?:\s+-\s+.+)?\s*$", text, re.MULTILINE)
+          if not current:
+              sys.exit(0)
+
+          rest = text[current.end():]
+          next_version = re.search(r"^## \[", rest, re.MULTILINE)
+          section = rest[:next_version.start()] if next_version else rest
+          print(section.strip())
+          PY
           )
 
-          CHANGELOG_BODY=""
-          if [ -n "$FEATS" ]; then
-            CHANGELOG_BODY="${CHANGELOG_BODY}"$'\n### ✨ 新功能\n'"${FEATS}"$'\n'
-          fi
-          if [ -n "$FIXES" ]; then
-            CHANGELOG_BODY="${CHANGELOG_BODY}"$'\n### 🐛 修复\n'"${FIXES}"$'\n'
-          fi
-          if [ -n "$OTHERS" ]; then
-            CHANGELOG_BODY="${CHANGELOG_BODY}"$'\n### 📦 其他\n'"${OTHERS}"$'\n'
+          if [ -z "$CHANGELOG_BODY" ]; then
+            # CHANGELOG.md 缺失时，退回 conventional commit 前缀分类。
+            get_logs() {
+              local prefix="$1"
+              if [ -n "$RANGE" ]; then
+                git log "$RANGE" --pretty=format:"%s" --no-merges | { grep -iE "^${prefix}" || true; } | sed "s/^${prefix}[:(] */- /" | head -20
+              else
+                git log --pretty=format:"%s" --no-merges -30 | { grep -iE "^${prefix}" || true; } | sed "s/^${prefix}[:(] */- /" | head -20
+              fi
+            }
+
+            FEATS=$(get_logs "feat")
+            FIXES=$(get_logs "fix")
+            OTHERS=$(
+              if [ -n "$RANGE" ]; then
+                git log "$RANGE" --pretty=format:"%s" --no-merges | { grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" || true; } | sed 's/^/- /' | head -10
+              else
+                git log --pretty=format:"%s" --no-merges -30 | { grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" || true; } | sed 's/^/- /' | head -10
+              fi
+            )
+
+            if [ -n "$FEATS" ]; then
+              CHANGELOG_BODY="${CHANGELOG_BODY}"$'\n### ✨ 新功能\n'"${FEATS}"$'\n'
+            fi
+            if [ -n "$FIXES" ]; then
+              CHANGELOG_BODY="${CHANGELOG_BODY}"$'\n### 🐛 修复\n'"${FIXES}"$'\n'
+            fi
+            if [ -n "$OTHERS" ]; then
+              CHANGELOG_BODY="${CHANGELOG_BODY}"$'\n### 📦 其他\n'"${OTHERS}"$'\n'
+            fi
           fi
           if [ -z "$CHANGELOG_BODY" ]; then
             CHANGELOG_BODY=$'\n- 常规更新与优化\n'
@@ -350,7 +374,7 @@ jobs:
             echo "3. 如未安装 OpenClaw，按提示一键安装即可"
             echo "4. 安装完成后自动跳转仪表盘，开始使用"
             echo ""
-            echo '> **系统要求**：Node.js 18+（推荐 22 LTS）'
+            echo '> **系统要求**：ClawPanel Web 后端需要 Node.js 18+；运行 OpenClaw Gateway 会按当前 OpenClaw 的 engines.node 自动检测，建议 Node.js 22.19.0+。'
             echo ""
             echo "---"
             echo ""
@@ -358,7 +382,7 @@ jobs:
             echo "${CHANGELOG_BODY}"
             echo "---"
             echo ""
-            echo "📖 [项目主页](https://github.com/${REPO}) · 💬 [反馈问题](https://github.com/${REPO}/issues) · 📣 [QQ 群](https://qt.cool/c/OpenClaw)"
+            echo "📖 [项目主页](https://github.com/${REPO}) · 💬 [反馈问题](https://github.com/${REPO}/issues) · 📣 [QQ 群](https://qt.cool/c/OpenClaw) · Telegram: https://t.me/clawpanel"
           } > release_body.md
 
           gh release edit "$TAG_NAME" --notes-file release_body.md

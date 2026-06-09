@@ -9,7 +9,7 @@
  * 5. 从 snapshot.sessionDefaults.mainSessionKey 获取 sessionKey
  * 6. 开始正常通信
  */
-import { api } from './tauri-api.js'
+import { api, isTauriRuntime } from './tauri-api.js'
 import { t } from './i18n.js'
 import { KERNEL_TARGET } from './feature-catalog.js'
 
@@ -590,13 +590,10 @@ export class WsClient {
       const result = await api.autoPairDevice()
       console.log('[ws] 配对结果:', result)
 
-      // 配对后需要 reload Gateway 使 allowedOrigins 生效
-      try {
-        await api.reloadGateway()
-        console.log('[ws] Gateway 已重载')
-      } catch (e) {
-        console.warn('[ws] reloadGateway 失败（非致命）:', e)
-      }
+      // 这里只修配对文件，不自动重启 Gateway。
+      // Windows 上手动启动的 Gateway 会被 restart/stop 打断，表现为“启动后一会就停止”。
+      // Gateway 对设备配对文件按连接读取；如遇 origin 配置变更，交由用户手动重启。
+      console.log('[ws] 自动配对文件已修复，跳过自动重启 Gateway')
 
       // 修复 #160: 不调用 reconnect()（它会重置 _autoPairAttempts 导致无限循环），
       // 而是直接重连一次。如果仍然失败，_autoPairAttempts 不会被重置，不会再次触发自动修复。

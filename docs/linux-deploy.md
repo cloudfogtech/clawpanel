@@ -49,7 +49,7 @@
 
 | 依赖 | 最低版本 | 说明 |
 |------|----------|------|
-| Node.js | 18+ | 推荐 22 LTS |
+| Node.js | 18+ | ClawPanel Web 后端；运行 OpenClaw Gateway 建议 22.19.0+，实际要求按当前 OpenClaw `engines.node` 检测 |
 | npm | 随 Node.js | 包管理器 |
 | Git | 任意 | 克隆仓库 |
 | OpenClaw | 最新 | ClawPanel 管理的对象 |
@@ -349,7 +349,7 @@ sudo npm install -g openclaw@2026.3.11 --registry https://registry.npmjs.org
 sudo npm install -g @qingchencloud/openclaw-zh@2026.3.7-zh.2 --registry https://registry.npmjs.org
 ```
 
-> **维护说明**：如果你是 ClawPanel 维护者，后续只需要更新仓库根目录的 `openclaw-version-policy.json`，即可统一调整不同面板版本对应的推荐 OpenClaw 版本。程序版本号、热更新清单、桌面图标的维护方式见 `docs/version-maintenance.md`。
+> **维护说明**：如果你是 ClawPanel 维护者，后续只需要更新仓库根目录的 `openclaw-version-policy.json`，即可统一调整不同面板版本对应的推荐 OpenClaw 版本。桌面端程序版本以 `package.json` 为唯一真相源，运行 `npm run version:sync` 同步到 Tauri 配置；`docs/update/latest.json` 仅保留给旧版前端热更新兼容链路。
 
 > **权限说明**：Linux 全局 npm 包安装需要 root 权限。ClawPanel 现已自动检测非 root 用户并加 sudo，同时会自动补 GitHub HTTPS rewrite 规则；如仍遇权限问题，手动加 `sudo` 即可。
 
@@ -357,7 +357,8 @@ sudo npm install -g @qingchencloud/openclaw-zh@2026.3.7-zh.2 --registry https://
 
 - **ClawPanel**：`git pull` 获取最新代码，无需重新安装依赖（除非 package.json 变了）
 - **OpenClaw**：优先通过面板切换到推荐稳定版；如需尝试其它版本，请在「关于」页手动切换
-- **前端热更新**：面板支持前端热更新（不需要 git pull），在「关于」页面点击「热更新」按钮即可
+- **ClawPanel 桌面版**：通过官网版本接口发现新版本，下载推荐完整安装包后覆盖安装
+- **前端热更新**：仅保留旧版本兼容和回滚目录处理，新版用户界面不再作为主更新入口展示
 
 ---
 

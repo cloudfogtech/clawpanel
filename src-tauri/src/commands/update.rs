@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 前端热更新目录 (~/.openclaw/clawpanel/web-update/)
 pub fn update_dir() -> PathBuf {
@@ -18,8 +19,17 @@ pub async fn check_frontend_update() -> Result<Value, String> {
     let client = super::build_http_client(std::time::Duration::from_secs(10), Some("ClawPanel"))
         .map_err(|e| format!("HTTP 客户端错误: {e}"))?;
 
+    let url = format!(
+        "{}?_t={}",
+        LATEST_JSON_URL,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
     let resp = client
-        .get(LATEST_JSON_URL)
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
@@ -28,7 +38,8 @@ pub async fn check_frontend_update() -> Result<Value, String> {
         return Err(format!("服务器返回 {}", resp.status()));
     }
 
-    let manifest: Value = resp.json().await.map_err(|e| format!("解析失败: {e}"))?;
+    let mut manifest: Value = resp.json().await.map_err(|e| format!("解析失败: {e}"))?;
+    normalize_manifest_url(&mut manifest);
 
     let latest = manifest
         .get("version")
@@ -208,6 +219,30 @@ pub fn version_ge(current: &str, required: &str) -> bool {
 
 fn version_gt(left: &str, right: &str) -> bool {
     version_ge(left, right) && !version_ge(right, left)
+}
+
+fn normalize_manifest_url(manifest: &mut Value) {
+    let download_url = manifest
+        .get("downloadUrl")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+        .map(String::from)
+        .or_else(|| {
+            manifest
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+                .map(String::from)
+        });
+
+    if let Some(raw) = download_url {
+        if let Some(normalized) = super::site_api::normalize_public_url(&raw) {
+            if let Some(obj) = manifest.as_object_mut() {
+                obj.insert("downloadUrl".into(), Value::String(normalized.clone()));
+                obj.insert("url".into(), Value::String(normalized));
+            }
+        }
+    }
 }
 
 /// 根据文件扩展名推断 MIME 类型

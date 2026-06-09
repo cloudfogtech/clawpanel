@@ -19,6 +19,7 @@
 //! 隔离而非删除，是为了让用户/被影响的第三方软件可以恢复，避免 ClawPanel 越界破坏用户系统。
 
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,6 +80,73 @@ fn canonical_lower(path: &Path) -> String {
         s.pop();
     }
     s
+}
+
+fn cli_identity(path: &Path) -> String {
+    #[cfg(target_os = "windows")]
+    if let Some(canonical) = crate::utils::canonicalize_windows_openclaw_cli_path(path) {
+        return canonical_lower(&canonical);
+    }
+    canonical_lower(path)
+}
+
+fn gateway_owner_cli_path() -> Option<PathBuf> {
+    let owner_path = crate::commands::openclaw_dir().join("gateway-owner.json");
+    let content = std::fs::read_to_string(owner_path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let started_by = value
+        .get("started_by")
+        .or_else(|| value.get("startedBy"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !started_by.is_empty() && started_by != "clawpanel" {
+        return None;
+    }
+    if let Some(owner_dir) = value
+        .get("openclaw_dir")
+        .or_else(|| value.get("openclawDir"))
+        .and_then(|v| v.as_str())
+    {
+        if canonical_lower(Path::new(owner_dir))
+            != canonical_lower(&crate::commands::openclaw_dir())
+        {
+            return None;
+        }
+    }
+    if let Some(port) = value.get("port").and_then(|v| v.as_u64()) {
+        if port != crate::commands::gateway_listen_port() as u64 {
+            return None;
+        }
+    }
+    value
+        .get("cli_path")
+        .or_else(|| value.get("cliPath"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn active_cli_identities() -> HashSet<String> {
+    let mut identities = HashSet::new();
+    if let Some(path) = crate::utils::resolve_openclaw_cli_path() {
+        let identity = cli_identity(Path::new(&path));
+        if !identity.is_empty() {
+            identities.insert(identity);
+        }
+    }
+    if let Some(path) = gateway_owner_cli_path() {
+        let identity = cli_identity(&path);
+        if !identity.is_empty() {
+            identities.insert(identity);
+        }
+    }
+    identities
+}
+
+fn is_active_gateway_cli_path(path: &Path) -> bool {
+    let identity = cli_identity(path);
+    !identity.is_empty() && active_cli_identities().contains(&identity)
 }
 
 /// 候选可执行文件名（带扩展名）
@@ -170,6 +238,7 @@ pub async fn scan_openclaw_path_conflicts() -> Result<Vec<CliConflict>, String> 
         .map(|p| canonical_lower(p))
         .filter(|s| !s.is_empty())
         .collect();
+    let active_identities = active_cli_identities();
 
     let path_var = crate::commands::enhanced_path();
     #[cfg(target_os = "windows")]
@@ -198,6 +267,9 @@ pub async fn scan_openclaw_path_conflicts() -> Result<Vec<CliConflict>, String> 
                 .iter()
                 .any(|sa| !sa.is_empty() && canon.starts_with(sa));
             if is_standalone {
+                continue;
+            }
+            if active_identities.contains(&cli_identity(&candidate)) {
                 continue;
             }
 
@@ -237,6 +309,11 @@ pub async fn quarantine_openclaw_path(path: String) -> Result<QuarantineRecord, 
         if !sa_canon.is_empty() && canon.starts_with(&sa_canon) {
             return Err("拒绝隔离 standalone 安装目录下的 OpenClaw（这是当前运行版本）".into());
         }
+    }
+    if is_active_gateway_cli_path(&original) {
+        return Err(
+            "拒绝隔离正在被 Gateway 使用的 OpenClaw（请先停止 Gateway 或切换 CLI 路径）".into(),
+        );
     }
 
     // 安全检查 2：文件名必须以 openclaw 开头（防止误用接口隔离别的文件）

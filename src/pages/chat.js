@@ -229,7 +229,7 @@ export async function render() {
         <div class="chat-input-wrapper">
           <textarea id="chat-input" rows="1" placeholder="${t('chat.inputPlaceholder')}"></textarea>
         </div>
-        <button class="chat-send-btn" id="chat-send-btn" disabled>
+        <button class="chat-send-btn" id="chat-send-btn" type="button" disabled>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
         <button class="chat-hosted-btn btn btn-sm btn-ghost" id="chat-hosted-btn" title="${t('chat.hostedAgent')}">
@@ -394,6 +394,10 @@ function bindEvents(page) {
     if (_textarea.value === '/') showCmdPanel()
     else if (!_textarea.value.startsWith('/')) hideCmdPanel()
   })
+  _textarea.addEventListener('compositionend', updateSendState)
+  _textarea.addEventListener('change', updateSendState)
+  _textarea.addEventListener('keyup', updateSendState)
+  requestAnimationFrame(updateSendState)
 
   _textarea.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); sendMessage() }
@@ -1056,7 +1060,9 @@ function bindConnectOverlay(page) {
       try {
         if (desc) desc.textContent = t('chat.writingConfig')
         await api.autoPairDevice()
-        await api.reloadGateway()
+        if (isTauriRuntime()) {
+          await api.reloadGateway()
+        }
         if (desc) desc.textContent = t('chat.fixDoneReconnecting')
         // 断开旧连接，重新发起
         wsClient.disconnect()
@@ -1254,7 +1260,17 @@ async function connectGateway() {
     const gw = config?.gateway || {}
     const host = isTauriRuntime() ? `127.0.0.1:${gw.port || 18789}` : location.host
     const token = gw.auth?.token || gw.authToken || ''
-    wsClient.connect(host, token)
+    const password = typeof gw.auth?.password === 'string' ? gw.auth.password : ''
+
+    // 聊天页可能比 main.js 的全局自动连接更早发起 WS。
+    // 新机器首次启动时，如果这里直接连接，Gateway 会在配对字段生效前拒绝 operator 角色。
+    try {
+      await api.autoPairDevice()
+    } catch (pairErr) {
+      console.warn('[chat] autoPairDevice 失败（非致命）:', pairErr)
+    }
+
+    wsClient.connect(host, token, { password })
   } catch (e) {
     toast(`${t('common.loadFailed')}: ${e.message}`, 'error')
   }
@@ -1641,7 +1657,7 @@ function hideCmdPanel() {
 
 function toggleCmdPanel() {
   if (_cmdPanelEl?.style.display === 'block') hideCmdPanel()
-  else { _textarea.value = '/'; showCmdPanel(); _textarea.focus() }
+  else { _textarea.value = '/'; showCmdPanel(); _textarea.focus(); updateSendState() }
 }
 
 // ── 消息发送 ──

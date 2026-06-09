@@ -9,12 +9,16 @@ import { toast } from './toast.js'
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0'
 import { t, getLang, setLang, getAvailableLangs } from '../lib/i18n.js'
 import { isFeatureAvailable } from '../lib/feature-gates.js'
-import { getKernelSnapshot } from '../lib/kernel.js'
+import { getKernelSnapshot, recommendedIsNewer } from '../lib/kernel.js'
 import { triggerKernelUpgrade } from '../lib/kernel-upgrade.js'
 import { getActiveEngine, getActiveEngineId, listEngines, needsInitialEngineChoice, isEngineSetupDeferred, switchEngine, onEngineChange } from '../lib/engine-manager.js'
 
 // 当用户点 "暂时不升级" 时，本地会话内不再显示升级提示
 const SS_DISMISSED_KERNEL_UPGRADE = 'clawpanel_kernel_upgrade_dismissed'
+const KERNEL_POLICY_TTL = 5 * 60 * 1000
+let _kernelPolicyInfo = null
+let _kernelPolicyFetchedAt = 0
+let _kernelPolicyLoading = false
 
 function NAV_ITEMS_FULL() { return [
   {
@@ -234,6 +238,7 @@ export function renderSidebar(el) {
   const isDark = getTheme() === 'dark'
   const sunIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>'
   const moonIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>'
+  const bellIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 10-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>'
 
   const langCode = getLang()
   const langs = getAvailableLangs()
@@ -254,19 +259,22 @@ export function renderSidebar(el) {
 
   html += `
     <div class="sidebar-footer">
-      <div class="nav-item" id="btn-theme-toggle">
-        ${isDark ? sunIcon : moonIcon}
-        <span>${isDark ? t('sidebar.themeLight') : t('sidebar.themeDark')}</span>
-      </div>
-      <div class="lang-switcher" id="lang-switcher">
-        <button class="nav-item lang-trigger" id="btn-lang-toggle">
-          ${globeIcon}
-          <span>${currentLang.label}</span>
-          <svg class="lang-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><path d="M18 15l-6-6-6 6"/></svg>
+      <div class="sidebar-tools" aria-label="ClawPanel tools">
+        <button class="sidebar-tool-btn site-message-trigger" type="button" title="${t('siteMessages.title')}" aria-label="${t('siteMessages.title')}">
+          ${bellIcon}
+          <span class="site-message-tool-badge" aria-hidden="true"></span>
         </button>
-        <div class="lang-dropdown" id="lang-dropdown">
-          ${langs.length > 4 ? '<div class="lang-search-wrap"><input class="lang-search" id="lang-search" type="text" placeholder="Search..." autocomplete="off"></div>' : ''}
-          <div class="lang-options" id="lang-options">${langOptions}</div>
+        <button class="sidebar-tool-btn" id="btn-theme-toggle" type="button" title="${isDark ? t('sidebar.themeLight') : t('sidebar.themeDark')}" aria-label="${isDark ? t('sidebar.themeLight') : t('sidebar.themeDark')}">
+          ${isDark ? sunIcon : moonIcon}
+        </button>
+        <div class="lang-switcher" id="lang-switcher">
+          <button class="sidebar-tool-btn lang-trigger" id="btn-lang-toggle" type="button" title="${currentLang.label}" aria-label="${currentLang.label}">
+            ${globeIcon}
+          </button>
+          <div class="lang-dropdown" id="lang-dropdown">
+            ${langs.length > 4 ? '<div class="lang-search-wrap"><input class="lang-search" id="lang-search" type="text" placeholder="Search..." autocomplete="off"></div>' : ''}
+            <div class="lang-options" id="lang-options">${langOptions}</div>
+          </div>
         </div>
       </div>
       <div class="sidebar-meta">
@@ -277,6 +285,8 @@ export function renderSidebar(el) {
   `
 
   el.innerHTML = html
+  window.dispatchEvent(new CustomEvent('clawpanel:site-message-launcher-mounted'))
+  _ensureKernelPolicyInfo(el)
 
   // 应用折叠态（桌面端）
   _setDesktopSidebarCollapsed(collapsed)
@@ -417,6 +427,34 @@ export function renderSidebar(el) {
 
 function _escSidebar(s) { return String(s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;') }
 
+function _kernelPolicyTarget(snap) {
+  return _kernelPolicyInfo?.recommended || snap?.target || ''
+}
+
+function _isRunningGatewayBelowTarget(snap) {
+  if (!snap?.version) return false
+  const target = _kernelPolicyTarget(snap)
+  return target ? recommendedIsNewer(target, snap.version) : !snap.isLatest
+}
+
+function _ensureKernelPolicyInfo(el) {
+  const snap = getKernelSnapshot()
+  if (getActiveEngineId() !== 'openclaw' || !snap?.version) return
+  const now = Date.now()
+  if (_kernelPolicyLoading) return
+  if (_kernelPolicyInfo && now - _kernelPolicyFetchedAt < KERNEL_POLICY_TTL) return
+
+  _kernelPolicyLoading = true
+  api.getVersionInfo()
+    .then(info => {
+      _kernelPolicyInfo = info || null
+      _kernelPolicyFetchedAt = Date.now()
+      if (el?.isConnected) renderSidebar(el)
+    })
+    .catch(() => {})
+    .finally(() => { _kernelPolicyLoading = false })
+}
+
 /**
  * 渲染"内核可升级"卡片。
  *
@@ -424,7 +462,7 @@ function _escSidebar(s) { return String(s || '').replace(/</g, '&lt;').replace(/
  * - 当前引擎是 openclaw
  * - 已成功握手 Gateway（snapshot 有 version）
  * - 高于硬地板（< floor 由 floor-blocker 接管）
- * - 低于推荐目标（!isLatest）
+ * - 运行中的 Gateway 低于推荐目标
  * - 用户未在本会话中点击过 "暂不升级"
  *
  * 不满足任何一条返回空串。
@@ -436,13 +474,13 @@ function _renderKernelUpgradeHint() {
   const snap = getKernelSnapshot()
   if (!snap || !snap.version) return ''
   if (!snap.aboveFloor) return ''   // floor-blocker 处理
-  if (snap.isLatest) return ''       // 已经是推荐目标
+  if (!_isRunningGatewayBelowTarget(snap)) return '' // 运行中的 Gateway 已经达到推荐目标
 
   const arrowIcon = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>'
   const sparkIcon = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L13.5 8.5 20 10l-6.5 1.5L12 18l-1.5-6.5L4 10l6.5-1.5z"/></svg>'
 
   const fromLabel = snap.versionLabel || snap.version
-  const toLabel = snap.target || ''
+  const toLabel = _kernelPolicyTarget(snap)
 
   return `
     <div class="kernel-upgrade-hint" id="kernel-upgrade-hint" role="button" tabindex="0">
@@ -513,4 +551,3 @@ function _filterLangOptions(query) {
     opt.style.display = (label.includes(q) || code.includes(q)) ? '' : 'none'
   })
 }
-
