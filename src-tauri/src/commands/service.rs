@@ -2000,6 +2000,101 @@ mod platform {
         None
     }
 
+    fn find_listening_pids(port: u16) -> Vec<u32> {
+        let mut pids = Vec::new();
+        let filter = format!("sport = :{port}");
+        if let Ok(output) = std::process::Command::new("ss")
+            .args(["-ltnp", &filter])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for segment in text.split("pid=").skip(1) {
+                let pid_text: String = segment.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(pid) = pid_text.parse::<u32>() {
+                    if pid > 0 && !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+
+        if pids.is_empty() {
+            if let Ok(output) = std::process::Command::new("lsof")
+                .args(["-i", &format!("TCP:{port}"), "-sTCP:LISTEN", "-t"])
+                .output()
+            {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid > 0 && !pids.contains(&pid) {
+                            pids.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+        pids
+    }
+
+    fn read_process_command_line(pid: u32) -> Option<String> {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let text = raw
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn is_gateway_command_line(cmdline: &str) -> bool {
+        let lower = cmdline.to_ascii_lowercase();
+        lower.contains("openclaw") && lower.contains("gateway")
+    }
+
+    fn is_gateway_port_responsive(port: u16) -> bool {
+        use std::io::{Read, Write};
+        let addr = format!("127.0.0.1:{port}");
+        let Ok(socket_addr) = addr.parse() else {
+            return false;
+        };
+        let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&socket_addr, Duration::from_secs(3))
+        else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let req = format!("GET /health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        if stream.write_all(req.as_bytes()).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 256];
+        match stream.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let resp = String::from_utf8_lossy(&buf[..n]);
+                resp.contains("200") || resp.contains("OK")
+            }
+            _ => false,
+        }
+    }
+
+    fn is_gateway_port_responsive_with_retry(port: u16, retries: u32, interval: Duration) -> bool {
+        for attempt in 0..retries {
+            if attempt > 0 {
+                std::thread::sleep(interval);
+            }
+            if is_gateway_port_responsive(port) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 跨平台统一检测：TCP 连端口
     #[allow(dead_code)]
     pub async fn check_service_status(_uid: u32, _label: &str) -> (bool, Option<u32>) {
@@ -2023,23 +2118,45 @@ mod platform {
         }
     }
 
-    /// 清理残留的 Gateway 进程（Linux 版：通过 fuser 查端口占用进程并 kill）
+    /// 清理残留的 Gateway 进程。
+    ///
+    /// 只处理命令行确认是 openclaw gateway 且 /health 连续无响应的进程，避免把同端口的
+    /// 其他服务或仍在启动中的健康 Gateway 误杀。
     fn cleanup_zombie_gateway_processes() {
         let port = crate::commands::gateway_listen_port();
-        // 尝试用 fuser 找到端口占用进程
-        if let Ok(output) = std::process::Command::new("fuser")
-            .args([&format!("{port}/tcp")])
-            .output()
-        {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            for pid_str in pids.split_whitespace() {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &pid.to_string()])
-                        .output();
-                    eprintln!("[cleanup_zombie] killed PID {pid} on port {port}");
-                }
+        let pids = find_listening_pids(port);
+        if pids.is_empty() {
+            return;
+        }
+
+        let responsive =
+            is_gateway_port_responsive_with_retry(port, 3, std::time::Duration::from_millis(800));
+        for pid in pids {
+            let Some(cmdline) = read_process_command_line(pid) else {
+                super::guardian_log(&format!(
+                    "跳过清理端口 {port} 上的 PID {pid}：无法读取命令行"
+                ));
+                continue;
+            };
+            if !is_gateway_command_line(&cmdline) {
+                super::guardian_log(&format!(
+                    "跳过清理端口 {port} 上的 PID {pid}：不是 openclaw gateway"
+                ));
+                continue;
             }
+            if responsive {
+                super::guardian_log(&format!(
+                    "检测到健康的 Gateway 进程 (PID {pid})：/health 正常响应，跳过清理"
+                ));
+                continue;
+            }
+
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .output();
+            super::guardian_log(&format!(
+                "检测到僵尸 Gateway 进程 (PID {pid})：端口 {port} 占用但 /health 连续无响应，已强制终止"
+            ));
         }
     }
 

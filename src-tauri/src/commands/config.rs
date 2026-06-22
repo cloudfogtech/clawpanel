@@ -1278,12 +1278,13 @@ fn select_calibration_source(current: Option<Value>, backup: Option<Value>) -> (
     match (current, backup) {
         (Some(current), Some(backup)) => {
             let current_score = calibration_richness_score(&current);
-            let backup_score = calibration_richness_score(&backup);
-            if backup_score > current_score {
-                ("backup".into(), backup)
-            } else {
-                ("current".into(), current)
+            if current_score == 0 {
+                let backup_score = calibration_richness_score(&backup);
+                if backup_score > 0 {
+                    return ("backup".into(), backup);
+                }
             }
+            ("current".into(), current)
         }
         (Some(current), None) => ("current".into(), current),
         (None, Some(backup)) => ("backup".into(), backup),
@@ -7601,11 +7602,13 @@ pub fn invalidate_path_cache() -> Result<(), String> {
 #[cfg(test)]
 mod write_openclaw_config_merge_tests {
     use super::apply_reset_inheritance;
+    use super::calibration_richness_score;
     use super::merge_configs_preserving_fields;
     use super::node_version_satisfies_requirement;
     use super::openclaw_version_requires_node_22_19;
     #[cfg(target_os = "windows")]
     use super::resolve_openclaw_cli_input_path;
+    use super::select_calibration_source;
     use super::standalone_bundled_node_bin;
     use serde_json::json;
     use std::path::PathBuf;
@@ -7707,6 +7710,54 @@ mod write_openclaw_config_merge_tests {
             .and_then(|v| v.as_array())
             .expect("allowedOrigins");
         assert!(origins.iter().any(|v| v == "tauri://localhost"));
+    }
+
+    #[test]
+    fn select_calibration_source_prefers_current_over_richer_backup() {
+        let current = json!({
+            "models": { "providers": {} },
+            "gateway": {
+                "auth": { "mode": "token", "token": "secret-current" },
+            }
+        });
+        let backup = json!({
+            "models": {
+                "providers": {
+                    "old": { "type": "openai", "apiKey": "old" }
+                }
+            },
+            "agents": {
+                "defaults": { "workspace": "/tmp/work" },
+                "list": [{ "id": "old-agent" }]
+            },
+            "channels": { "telegram": { "enabled": true } },
+            "gateway": {
+                "auth": { "mode": "token", "token": "secret-backup" },
+                "controlUi": { "allowedOrigins": ["http://localhost:3000"] }
+            }
+        });
+
+        assert!(calibration_richness_score(&backup) > calibration_richness_score(&current));
+        let (source, seed) = select_calibration_source(Some(current.clone()), Some(backup));
+
+        assert_eq!(source, "current");
+        assert_eq!(seed, current);
+    }
+
+    #[test]
+    fn select_calibration_source_uses_backup_when_current_empty() {
+        let backup = json!({
+            "models": {
+                "providers": {
+                    "old": { "type": "openai", "apiKey": "old" }
+                }
+            }
+        });
+
+        let (source, seed) = select_calibration_source(Some(json!({})), Some(backup.clone()));
+
+        assert_eq!(source, "backup");
+        assert_eq!(seed, backup);
     }
 
     #[cfg(target_os = "windows")]

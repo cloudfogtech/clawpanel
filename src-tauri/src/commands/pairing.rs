@@ -112,6 +112,14 @@ fn operator_token_is_usable(value: Option<&serde_json::Value>) -> bool {
         .all(|scope| scopes.iter().any(|existing| existing == scope))
 }
 
+fn operator_token_is_revoked(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get("revokedAtMs"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+}
+
 fn ensure_operator_token(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     now_ms: u64,
@@ -129,12 +137,16 @@ fn ensure_operator_token(
     }
 
     let existing = tokens_obj.get(CONTROL_UI_ROLE).and_then(|v| v.as_object());
-    let token = existing
-        .and_then(|entry| entry.get("token"))
-        .and_then(|v| v.as_str())
-        .filter(|token| !token.trim().is_empty())
-        .map(|token| token.to_string())
-        .unwrap_or_else(generate_pairing_token);
+    let token = if operator_token_is_revoked(tokens_obj.get(CONTROL_UI_ROLE)) {
+        generate_pairing_token()
+    } else {
+        existing
+            .and_then(|entry| entry.get("token"))
+            .and_then(|v| v.as_str())
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| token.to_string())
+            .unwrap_or_else(generate_pairing_token)
+    };
     let created_at_ms = existing
         .and_then(|entry| entry.get("createdAtMs"))
         .and_then(|v| v.as_u64())
@@ -510,5 +522,45 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(entry["approvedAtMs"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn normalize_existing_pairing_rotates_revoked_operator_token() {
+        let mut entry = serde_json::json!({
+            "deviceId": "device-1",
+            "publicKey": "key",
+            "platform": "windows",
+            "deviceFamily": "desktop",
+            "clientId": "openclaw-control-ui",
+            "clientMode": "ui",
+            "role": "operator",
+            "roles": ["operator"],
+            "scopes": scope_values(),
+            "approvedScopes": scope_values(),
+            "tokens": {
+                "operator": {
+                    "token": "revoked-token",
+                    "role": "operator",
+                    "scopes": scope_values(),
+                    "createdAtMs": 1,
+                    "revokedAtMs": 999
+                }
+            },
+            "createdAtMs": 1,
+            "approvedAtMs": 1
+        });
+
+        let changed = normalize_control_ui_pairing(&mut entry, "device-1", "key", "windows", 1234);
+
+        assert!(changed);
+        let token = entry["tokens"]["operator"]["token"]
+            .as_str()
+            .expect("token");
+        assert_ne!(token, "revoked-token");
+        assert!(entry["tokens"]["operator"].get("revokedAtMs").is_none());
+        assert_eq!(
+            entry["tokens"]["operator"]["rotatedAtMs"],
+            serde_json::json!(1234)
+        );
     }
 }
