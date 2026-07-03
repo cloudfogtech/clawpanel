@@ -24,7 +24,7 @@ Web 模式是纯 Node.js 服务，零 GUI 依赖，最适合 ARM 板。
 curl -fsSL https://raw.githubusercontent.com/qingchencloud/clawpanel/main/scripts/linux-deploy.sh | bash
 ```
 
-国内网络推荐使用 Gitee 镜像：
+如果 GitHub raw 脚本拉取失败，可暂用以下脚本备用入口：
 
 ```bash
 curl -fsSL https://gitee.com/QtCodeCreators/clawpanel/raw/main/scripts/linux-deploy.sh | bash
@@ -47,6 +47,12 @@ npm run build
 
 # 4. 启动服务
 npm run serve -- --port 1420
+```
+
+国内网络可将克隆地址换成 AtomGit 镜像：
+
+```bash
+git clone https://atomgit.com/qingchencloud/clawpanel.git /opt/clawpanel
 ```
 
 ### 设置开机自启（systemd）

@@ -128,6 +128,12 @@ cd clawpanel
 npm install
 ```
 
+国内网络可使用 AtomGit 镜像：
+
+```bash
+sudo git clone https://atomgit.com/qingchencloud/clawpanel.git
+```
+
 ### 4. 构建并启动 ClawPanel Web
 
 ```bash
@@ -322,9 +328,9 @@ npm install --registry https://registry.npmmirror.com
 sudo systemctl restart clawpanel  # 或 pm2 restart clawpanel
 ```
 
-> 国内拉不到 GitHub？用 Gitee 镜像：
+> 国内拉不到 GitHub？可切换到 AtomGit 镜像：
 > ```bash
-> git remote set-url origin https://gitee.com/QtCodeCreators/clawpanel.git
+> git remote set-url origin https://atomgit.com/qingchencloud/clawpanel.git
 > git pull origin main
 > ```
 

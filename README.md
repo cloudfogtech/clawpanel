@@ -39,7 +39,7 @@
 
 ClawPanel 是支持多 AI Agent 框架的可视化管理面板，目前支持 [OpenClaw](https://github.com/1186258278/OpenClawChineseTranslation) 和 [Hermes Agent](https://github.com/nousresearch/hermes-agent) 双引擎。**内置智能 AI 助手**，帮你一键安装、自动诊断配置、排查问题、修复错误。8 大工具 + 4 种模式 + 交互式问答，从新手到老手都能轻松管理。
 
-> 🌐 **官网**: [claw.qt.cool](https://claw.qt.cool/)  |  📦 **下载**: [官网下载中心](https://claw.qt.cool/download)  |  备用: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)
+> 🌐 **官网**: [claw.qt.cool](https://claw.qt.cool/)  |  📦 **下载**: [官网下载中心](https://claw.qt.cool/download)  |  备用: [GitHub Releases](https://github.com/qingchencloud/clawpanel/releases/latest)  |  国内镜像: [AtomGit](https://atomgit.com/qingchencloud/clawpanel)
 
 ## ✨ Hermes Agent 第二引擎：会话、记忆、人格与工具全景管理
 
@@ -627,6 +627,12 @@ clawpanel/
 git clone https://github.com/qingchencloud/clawpanel.git
 cd clawpanel
 npm install
+```
+
+国内网络可使用 AtomGit 镜像：
+
+```bash
+git clone https://atomgit.com/qingchencloud/clawpanel.git
 ```
 
 #### macOS / Linux
