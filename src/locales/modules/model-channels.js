@@ -42,6 +42,7 @@ export default {
   nameRequired: _('请填写渠道名称', 'Channel name is required', '請填寫渠道名稱'),
   baseUrlRequired: _('请填写以 http:// 或 https:// 开头的接口地址', 'Base URL must start with http:// or https://', '請填寫以 http:// 或 https:// 開頭的介面位址'),
   modelCount: _('{count} 个模型', '{count} models', '{count} 個模型'),
+  bindings: _('绑定状态', 'Bindings', '綁定狀態'),
   syncOpenclaw: _('同步到 OpenClaw', 'Sync to OpenClaw', '同步到 OpenClaw'),
   syncHermes: _('同步到 Hermes', 'Sync to Hermes', '同步到 Hermes'),
   syncAssistant: _('同步到助手', 'Sync to Assistant', '同步到助手'),

@@ -291,7 +291,11 @@ export function render() {
     return `<div class="card" style="margin-bottom:16px">
       <div class="card-body" style="padding:24px">
         <h3 style="margin:0 0 4px;font-size:16px">${t('engine.configTitle')}</h3>
-        <p style="color:var(--text-secondary);margin:0 0 20px;font-size:13px">${t('engine.configDesc')}</p>
+        <p style="color:var(--text-secondary);margin:0 0 12px;font-size:13px">${t('engine.configDesc')}</p>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:20px;padding:8px 12px;background:var(--bg-tertiary);border-radius:var(--radius-md,8px);font-size:12px;color:var(--text-secondary)">
+          <span>${t('engine.configChannelsGuide')}</span>
+          <button class="btn btn-sm btn-secondary hermes-goto-channels" type="button" style="white-space:nowrap;flex-shrink:0">${t('engine.configChannelsGuideBtn')}</button>
+        </div>
 
         <div class="hermes-form">
           <div class="hermes-field">
@@ -446,6 +450,10 @@ export function render() {
     document.addEventListener('click', (e) => {
       const dd = el.querySelector('#hm-model-dropdown')
       if (dd && !e.target.closest('.hermes-field')) dd.style.display = 'none'
+    })
+    // 前往模型渠道页（可在渠道页统一维护后同步回 Hermes）
+    el.querySelector('.hermes-goto-channels')?.addEventListener('click', () => {
+      window.location.hash = '#/model-channels'
     })
     // 配置保存
     el.querySelector('.hermes-config-save')?.addEventListener('click', doSaveConfig)

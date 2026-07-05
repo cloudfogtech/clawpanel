@@ -111,6 +111,8 @@ export default {
   installGitMirror: _('Git 镜像前缀（可选）', 'Git mirror prefix (optional)', 'Git 鏡像前綴（可選）'),
   installNetworkHint: _('依赖下载失败或速度慢时，选择国内镜像后重试。设置会保存，下次安装/升级自动生效。', 'If dependency downloads fail or crawl, pick a mirror and retry. The setting is saved and reused for future installs/upgrades.', '依賴下載失敗或速度慢時，選擇鏡像後重試。設定會儲存，下次安裝/升級自動生效。'),
   configKeyVerifyHint: _('提示：点「获取模型列表」可顺便验证 Key 是否有效', 'Tip: "Fetch models" also verifies that your key works', '提示：點「獲取模型清單」可順便驗證 Key 是否有效'),
+  configChannelsGuide: _('已在「模型渠道」维护过接入配置？可从渠道页一键同步到 Hermes，无需重复填写', 'Already set up on the Model Channels page? Sync it to Hermes from there instead of re-typing', '已在「模型渠道」維護過接入設定？可從渠道頁一鍵同步到 Hermes，無需重複填寫'),
+  configChannelsGuideBtn: _('前往模型渠道', 'Open Model Channels', '前往模型渠道'),
   configApiKeyRequired: _('请输入 API Key', 'Please enter an API key', '請輸入 API Key'),
   configSaveFailed: _('配置保存失败', 'Failed to save configuration', '設定儲存失敗'),
   installModeLocal: _('本地', 'Local', '本地'),

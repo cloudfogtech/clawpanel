@@ -286,6 +286,8 @@ export default {
   model: _('模型', 'Model', '', 'モデル', '모델', 'Mô hình', 'Modelo', 'Modelo', 'Модель', 'Modèle', 'Modell'),
   temperature: _('温度', 'Temperature', '溫度', '温度', '온도', 'Nhiệt độ', 'Temperatura', 'Temperatura', 'Температура', 'Température', 'Temperatur'),
   quickSelect: _('快捷选择', 'Quick Select', '快捷選擇', 'クイック選択', '빠른 선택'),
+  channelsGuide: _('已在「模型渠道」维护过接入配置？可直接同步到助手，无需重复填写', 'Already set up on the Model Channels page? Sync it to the assistant instead of re-typing', '已在「模型渠道」維護過接入設定？可直接同步到助手，無需重複填寫'),
+  channelsGuideBtn: _('前往模型渠道', 'Open Model Channels', '前往模型渠道'),
   visitSite: _('访问官网', 'Visit Website', '訪問官網', 'サイトを訪問', '사이트 방문'),
   notConfigured: _('未配置', 'Not configured', '未設定', '未設定', '미설정'),
   qtcoolName: _('晴辰云', 'QingChen Cloud', '晴辰雲'),

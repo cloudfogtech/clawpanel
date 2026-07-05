@@ -187,6 +187,7 @@ function renderChannelCard(state, channel) {
         ${channel.defaultModel ? `<span class="mch-chip">${icon('check', 11)} ${esc(channel.defaultModel)}</span>` : ''}
       </div>
       <div class="mch-sync-row">
+        <div style="font-size:11px;font-weight:600;color:var(--text-tertiary);letter-spacing:0.3px">${t('modelChannels.bindings')}</div>
         ${renderSyncLine(state, channel, 'openclaw', t('modelChannels.targetOpenclaw'), true, '', t('modelChannels.syncOpenclaw'))}
         ${renderSyncLine(state, channel, 'hermes', t('modelChannels.targetHermes'), hermesSyncSupported(channel), t('modelChannels.syncHermesUnsupported'), t('modelChannels.syncHermes'))}
         ${renderSyncLine(state, channel, 'assistant', t('modelChannels.targetAssistant'), assistantSyncSupported(channel), t('modelChannels.syncAssistantUnsupported'), t('modelChannels.syncAssistant'))}

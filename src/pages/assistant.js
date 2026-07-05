@@ -4089,6 +4089,10 @@ function showSettings() {
       <div class="modal-body">
       <div class="ast-settings-form">
         <div class="ast-tab-panel active" data-panel="api">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;padding:8px 12px;background:var(--bg-tertiary);border-radius:var(--radius-md);font-size:12px;color:var(--text-secondary)">
+            <span>${t('assistant.channelsGuide')}</span>
+            <button class="btn btn-sm btn-secondary ast-goto-channels" type="button" style="white-space:nowrap;flex-shrink:0">${t('assistant.channelsGuideBtn')}</button>
+          </div>
           <div class="form-group" style="margin-bottom:8px">
             <label class="form-label">${t('assistant.quickSelect')}</label>
             <div id="ast-provider-presets" style="display:flex;flex-wrap:wrap;gap:6px">
@@ -4553,6 +4557,12 @@ function showSettings() {
       tab.classList.add('active')
       overlay.querySelector(`.ast-tab-panel[data-panel="${tab.dataset.tab}"]`)?.classList.add('active')
     })
+  })
+
+  // 前往模型渠道页（统一维护接入配置的中枢入口）
+  overlay.querySelector('.ast-goto-channels')?.addEventListener('click', () => {
+    overlay.remove()
+    window.location.hash = '#/model-channels'
   })
 
   // 服务商快捷预设按钮
