@@ -311,6 +311,14 @@ export const api = {
   listRemoteModels: (baseUrl, apiKey, apiType = null) => invoke('list_remote_models', { baseUrl, apiKey, apiType }),
   scanModelClientConfigs: () => invoke('scan_model_client_configs'),
 
+  // 统一模型渠道
+  readModelChannels: () => cachedInvoke('read_model_channels', {}, 5000),
+  writeModelChannels: (config) => {
+    invalidate('read_model_channels')
+    return invoke('write_model_channels', { config })
+  },
+  revealModelChannelKey: (channelId) => invoke('reveal_model_channel_key', { channelId }),
+
   // Agent 管理
   listAgents: () => cachedInvoke('list_agents'),
   getAgentDetail: (id) => cachedInvoke('get_agent_detail', { id }, 5000),

@@ -8778,6 +8778,7 @@ const ALWAYS_LOCAL = new Set([
   'assistant_list_dir', 'assistant_system_info', 'assistant_list_processes',
   'assistant_check_port', 'assistant_web_search', 'assistant_fetch_url',
   'assistant_ensure_data_dir', 'assistant_save_image', 'assistant_load_image', 'assistant_delete_image',
+  'read_model_channels', 'write_model_channels', 'reveal_model_channel_key',
   'read_media_config', 'write_media_config', 'test_media_provider', 'fetch_media_models',
   'generate_image', 'create_video_task', 'poll_video_task',
   'cancel_media_job', 'list_media_jobs', 'delete_media_job',
@@ -9235,6 +9236,99 @@ function mediaApiKeyMask(key) {
   if (!value) return ''
   if ([...value].length <= 8) return '已保存'
   return `${value.slice(0, 3)}***${value.slice(-4)}`
+}
+
+// === 统一模型渠道（与 src-tauri/src/commands/model_channels.rs 行为保持一致） ===
+const MODEL_CHANNELS_FILE = 'model-channels.json'
+
+function modelChannelsPath() {
+  return path.join(OPENCLAW_DIR, 'clawpanel', MODEL_CHANNELS_FILE)
+}
+
+function isChannelKeepSentinel(key) {
+  return !key || key === '__KEEP__' || key === '••••••••' || key === '********'
+}
+
+function normalizeChannelModel(entry) {
+  if (typeof entry === 'string') {
+    const id = entry.trim()
+    return id ? { id } : null
+  }
+  const id = String(entry?.id || '').trim()
+  if (!id) return null
+  const out = { id }
+  const name = String(entry?.name || '').trim()
+  if (name) out.name = name
+  const ctx = Number(entry?.contextWindow)
+  if (Number.isFinite(ctx) && ctx > 0) out.contextWindow = ctx
+  return out
+}
+
+function normalizeModelChannel(entry, current) {
+  const id = String(entry?.id || '').trim()
+  const name = String(entry?.name || '').trim()
+  if (!id || !name) return null
+  const baseUrl = String(entry?.baseUrl || '').trim().replace(/\/+$/, '')
+  if (baseUrl && !/^https?:\/\//.test(baseUrl)) return null
+  const incomingKey = String(entry?.apiKey || '').trim()
+  const apiKey = isChannelKeepSentinel(incomingKey) ? String(current?.apiKey || '') : incomingKey
+  const models = []
+  const seen = new Set()
+  for (const item of Array.isArray(entry?.models) ? entry.models : []) {
+    const model = normalizeChannelModel(item)
+    if (model && !seen.has(model.id)) {
+      seen.add(model.id)
+      models.push(model)
+    }
+  }
+  let defaultModel = String(entry?.defaultModel || '').trim()
+  if (!models.some(m => m.id === defaultModel)) defaultModel = models[0]?.id || ''
+  return {
+    id,
+    name,
+    presetKey: String(entry?.presetKey || '').trim(),
+    baseUrl,
+    apiType: String(entry?.apiType || '').trim() || 'openai-completions',
+    apiKey,
+    models,
+    defaultModel,
+    enabled: entry?.enabled !== false,
+    updatedAt: String(entry?.updatedAt || '').trim(),
+  }
+}
+
+function normalizeModelChannelsDoc(config, current) {
+  const currentChannels = Array.isArray(current?.channels) ? current.channels : []
+  const channels = []
+  const seen = new Set()
+  for (const entry of (Array.isArray(config?.channels) ? config.channels : []).slice(0, 100)) {
+    const id = String(entry?.id || '').trim()
+    if (seen.has(id)) continue
+    seen.add(id)
+    const normalized = normalizeModelChannel(entry, currentChannels.find(c => c.id === id))
+    if (normalized) channels.push(normalized)
+  }
+  const syncState = config?.syncState && typeof config.syncState === 'object' ? config.syncState : {}
+  return { version: 1, channels, syncState }
+}
+
+function readModelChannelsPrivate() {
+  return normalizeModelChannelsDoc(
+    readJsonOrDefault(modelChannelsPath(), { version: 1, channels: [], syncState: {} }),
+    null,
+  )
+}
+
+function sanitizeModelChannelsForRead(doc) {
+  return {
+    ...doc,
+    channels: doc.channels.map(ch => ({
+      ...ch,
+      apiKey: '',
+      apiKeySaved: Boolean(String(ch.apiKey || '').trim()),
+      apiKeyMask: mediaApiKeyMask(ch.apiKey),
+    })),
+  }
 }
 
 function mediaProviderIds() {
@@ -12936,6 +13030,24 @@ const handlers = {
       if (fs.existsSync(filepath)) fs.unlinkSync(filepath)
     }
     return null
+  },
+
+  // 统一模型渠道
+  read_model_channels() {
+    return sanitizeModelChannelsForRead(readModelChannelsPrivate())
+  },
+
+  write_model_channels({ config }) {
+    const normalized = normalizeModelChannelsDoc(config, readModelChannelsPrivate())
+    writeJsonAtomic(modelChannelsPath(), normalized)
+    return sanitizeModelChannelsForRead(normalized)
+  },
+
+  reveal_model_channel_key({ channelId }) {
+    const doc = readModelChannelsPrivate()
+    const channel = doc.channels.find(ch => ch.id === String(channelId || '').trim())
+    if (!channel) throw new Error(`模型渠道不存在: ${channelId}`)
+    return channel.apiKey || ''
   },
 
   // 云端媒体生成

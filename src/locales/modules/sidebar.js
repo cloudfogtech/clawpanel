@@ -20,6 +20,7 @@ export default {
   models: _('模型配置', 'Models', '模型設定', 'モデル設定', '모델 설정', 'Mô hình', 'Modelos', 'Modelos', 'Модели', 'Modèles', 'Modelle'),
   agents: _('Agent 管理', 'Agents', '', 'Agent 管理', 'Agent 관리', 'Agent', 'Agentes', 'Agentes', 'Агенты', '', 'Agenten'),
   media: _('创作中心', 'Media Studio', '創作中心', 'メディアスタジオ', '미디어 스튜디오', 'Studio media', 'Estudio multimedia', 'Estúdio de mídia', 'Медиа-студия', 'Studio média', 'Medien-Studio'),
+  modelChannels: _('模型渠道', 'Model Channels', '模型渠道', 'モデルチャネル', '모델 채널', 'Kênh mô hình', 'Canales de modelos', 'Canais de modelos', 'Каналы моделей', 'Canaux de modèles', 'Modellkanäle'),
   gateway: _('Gateway', 'Gateway'),
   channels: _('消息渠道', 'Channels', '訊息頻道', 'チャンネル', '채널', 'Kênh', 'Canales', 'Canais', 'Каналы', 'Canaux', 'Kanäle'),
   communication: _('通信与自动化', 'Communication', '通信與自動化', '通信と自動化', '통신 및 자동화', 'Truyền thông', 'Comunicación', 'Comunicação', 'Коммуникации', '', 'Kommunikation'),

@@ -5,7 +5,8 @@ mod utils;
 
 use commands::{
     agent, assistant, cli_conflict, config, device, diagnose, extensions, hermes, hermes_providers,
-    logs, media, memory, messaging, pairing, portable, service, site_api, skills, update,
+    logs, media, memory, messaging, model_channels, pairing, portable, service, site_api, skills,
+    update,
 };
 
 pub fn run() {
@@ -200,6 +201,10 @@ pub fn run() {
             assistant::assistant_save_image,
             assistant::assistant_load_image,
             assistant::assistant_delete_image,
+            // 统一模型渠道
+            model_channels::read_model_channels,
+            model_channels::write_model_channels,
+            model_channels::reveal_model_channel_key,
             // 云端媒体生成
             media::read_media_config,
             media::write_media_config,

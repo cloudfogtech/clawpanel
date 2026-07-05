@@ -5,6 +5,16 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布 (Unreleased)]
+
+### 新功能 (Features)
+
+- **统一模型渠道** — 新增「模型渠道」页面（通用分组）：一处维护模型接入配置（服务商预设 / 接口地址 / API Key / 模型列表），一键同步到 OpenClaw、Hermes 与晴辰助手，不再需要在三处重复配置
+  - 同步为显式推送并逐项确认：写入 OpenClaw 只更新对应 provider 且保留未知字段（自动备份）；写入 Hermes 走环境变量与配置命令（自动备份）；同步助手为一次性拷贝
+  - 支持从 OpenClaw 现有模型配置一键导入渠道、从服务商在线拉取模型列表、渠道修改后的「有未同步变更」提醒
+  - 渠道文件存放在 OpenClaw 数据目录下（便携迁移自动带走）；密钥读取只返回掩码，写入支持保留旧 Key
+  - Hermes 同步覆盖 OpenAI / Anthropic / Gemini 兼容接口（API Key 型）；OAuth / 云 SDK 型服务商仍走 Hermes 安装向导
+
 ## [0.18.6] - 2026-07-04
 
 ### 新功能 (Features)
