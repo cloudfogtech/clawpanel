@@ -32,6 +32,11 @@ function newChannelId() {
   return `ch-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`
 }
 
+// apiType 值 → 用户可读标签（卡片与芯片展示用）
+function apiTypeLabel(value) {
+  return API_TYPES.find(item => item.value === value)?.label || value
+}
+
 export async function render() {
   const page = document.createElement('div')
   page.className = 'page channels-hub-page'
@@ -176,7 +181,7 @@ function renderChannelCard(state, channel) {
       </div>
       <div class="mch-url" title="${attr(channel.baseUrl)}">${esc(channel.baseUrl || '-')}</div>
       <div class="mch-meta">
-        <span class="mch-chip">${esc(channel.apiType)}</span>
+        <span class="mch-chip">${esc(apiTypeLabel(channel.apiType))}</span>
         <span class="mch-chip">${icon('box', 11)} ${t('modelChannels.modelCount', { count: (channel.models || []).length })}</span>
         <span class="mch-chip ${channel.apiKeySaved ? '' : 'mch-chip-warn'}">${icon('key', 11)} ${esc(keyInfo)}</span>
         ${channel.defaultModel ? `<span class="mch-chip">${icon('check', 11)} ${esc(channel.defaultModel)}</span>` : ''}
@@ -223,7 +228,7 @@ function renderEditor(state) {
           <div class="form-group">
             <label class="form-label" for="mch-api-type">${t('modelChannels.apiType')}</label>
             <select class="form-input" id="mch-api-type">
-              ${API_TYPES.map(v => `<option value="${attr(v)}" ${v === draft.apiType ? 'selected' : ''}>${esc(v)}</option>`).join('')}
+              ${API_TYPES.map(item => `<option value="${attr(item.value)}" ${item.value === draft.apiType ? 'selected' : ''}>${esc(item.label)}</option>`).join('')}
             </select>
           </div>
           <div class="form-group">

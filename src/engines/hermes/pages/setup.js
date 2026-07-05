@@ -46,8 +46,19 @@ export function render() {
   let customGatewayUrl = 'http://127.0.0.1:8642'
   let progress = 0
   let unlisten = null
+  // 检测完成后待跳转的目标阶段；有环境警告时不自动跳，等用户确认
+  let detectDone = false
+  let detectTarget = 'install'
+  // 网络与镜像偏好（panelConfig.pypiMirror / gitMirror），安装时持久化
+  let mirrorPrefs = null
+  let mirrorOpen = false
+
+  const PHASE_ORDER = ['detect', 'install', 'configure', 'gateway', 'complete']
+  const PHASE_STORE_KEY = 'hermes-setup-phase'
 
   function draw() {
+    // 记录进行到的阶段：中途关闭后重开可从这里继续（检测结果允许时）
+    try { sessionStorage.setItem(PHASE_STORE_KEY, phase) } catch (_) {}
     el.innerHTML = `
       <div class="page-header">
         <h1>Hermes Agent</h1>
@@ -124,10 +135,19 @@ export function render() {
         }
       }
     }
+    // 检测完成但存在环境警告 → 不自动跳转，显示结果并等用户确认继续
+    const continueBlock = detectDone ? `
+      <div style="margin-top:16px">
+        <div style="font-size:12px;color:var(--text-tertiary);margin-bottom:10px">${t('engine.detectHasWarnings')}</div>
+        <button class="btn btn-primary hermes-detect-continue">${t('engine.detectContinue')}</button>
+      </div>
+    ` : ''
+
     return `<div class="card" style="margin-bottom:16px">
       <div class="card-body" style="padding:24px">
         <p style="color:var(--text-secondary);line-height:1.7;margin:0 0 16px">${t('engine.hermesSetupIntro')}</p>
         <div class="hermes-detect-list">${rows.join('')}</div>
+        ${continueBlock}
       </div>
     </div>`
   }
@@ -221,11 +241,47 @@ export function render() {
         ${modeSwitch}
         ${errorBlock}
         ${progressBlock}
+        ${renderMirrorBox()}
         <div style="display:flex;gap:10px;align-items:center;margin-top:16px">
           <button class="btn btn-primary hermes-install-btn" ${btnDisabled}>${installError ? `${ICONS.rocket} ${t('engine.retryBtn')}` : btnText}</button>
         </div>
       </div>
     </div>`
+  }
+
+  // 网络与镜像折叠区：国内用户下载依赖失败/慢的第一解法，选择后随安装持久化
+  const PYPI_MIRRORS = [
+    { value: '', labelKey: 'engine.installPypiOfficial' },
+    { value: 'https://pypi.tuna.tsinghua.edu.cn/simple', labelKey: 'engine.installPypiTuna' },
+    { value: 'https://mirrors.aliyun.com/pypi/simple/', labelKey: 'engine.installPypiAliyun' },
+    { value: 'custom', labelKey: 'engine.installPypiCustomOpt' },
+  ]
+
+  function renderMirrorBox() {
+    const saved = mirrorPrefs?.pypiMirror || ''
+    const isPreset = PYPI_MIRRORS.some(m => m.value === saved && m.value !== 'custom')
+    const selectValue = saved === '' ? '' : (isPreset ? saved : 'custom')
+    return `
+      <details id="hm-mirror-box" ${mirrorOpen ? 'open' : ''} style="margin-top:14px;border:1px solid var(--border-primary);border-radius:var(--radius-md,8px);padding:10px 14px;background:var(--bg-tertiary)">
+        <summary style="cursor:pointer;font-size:13px;color:var(--text-secondary);user-select:none">${t('engine.installNetworkTitle')}</summary>
+        <div style="display:grid;gap:10px;margin-top:12px">
+          <label class="hermes-field">
+            <span>${t('engine.installPypiMirror')}</span>
+            <select id="hm-pypi-mirror" class="input">
+              ${PYPI_MIRRORS.map(m => `<option value="${m.value}" ${m.value === selectValue ? 'selected' : ''}>${t(m.labelKey)}</option>`).join('')}
+            </select>
+          </label>
+          <label class="hermes-field" id="hm-pypi-custom-row" style="display:${selectValue === 'custom' ? '' : 'none'}">
+            <span>${t('engine.installPypiCustomLabel')}</span>
+            <input type="text" id="hm-pypi-custom" class="input" placeholder="https://mirror.example.com/simple" value="${selectValue === 'custom' ? esc(saved) : ''}">
+          </label>
+          <label class="hermes-field">
+            <span>${t('engine.installGitMirror')}</span>
+            <input type="text" id="hm-git-mirror" class="input" placeholder="https://ghproxy.com/" value="${esc(mirrorPrefs?.gitMirror || '')}">
+          </label>
+          <div style="font-size:11px;color:var(--text-tertiary);line-height:1.6">${t('engine.installNetworkHint')}</div>
+        </div>
+      </details>`
   }
 
   // --- 配置阶段 ---
@@ -253,6 +309,7 @@ export function render() {
               <input type="password" id="hm-apikey" class="input" placeholder="sk-..." autocomplete="off" style="flex:1">
               <button class="btn btn-sm btn-secondary hermes-fetch-models" style="white-space:nowrap;flex-shrink:0">${t('engine.configFetchModels')}</button>
             </div>
+            <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">${t('engine.configKeyVerifyHint')}</div>
           </div>
           <div id="hm-fetch-result" style="font-size:12px;min-height:16px;margin:-6px 0 2px"></div>
           <div class="hermes-field">
@@ -264,6 +321,7 @@ export function render() {
           </div>
         </div>
 
+        <div id="hm-config-error" style="display:none;margin-top:14px;padding:10px 14px;background:var(--error-bg, #fef2f2);border:1px solid var(--error, #ef4444);border-radius:var(--radius-sm,6px);color:var(--error, #ef4444);font-size:13px;line-height:1.5;word-break:break-all"></div>
         <div style="display:flex;gap:10px;margin-top:20px">
           <button class="btn btn-primary hermes-config-save">${t('engine.configSaveBtn')}</button>
           <button class="btn-text hermes-config-skip">${t('engine.configSkipBtn')}</button>
@@ -328,6 +386,20 @@ export function render() {
         }
       })
     })
+    // 检测页「继续」按钮（有环境警告时不自动跳转）
+    el.querySelector('.hermes-detect-continue')?.addEventListener('click', () => {
+      phase = detectTarget
+      draw()
+    })
+    // 网络与镜像折叠区
+    const mirrorBox = el.querySelector('#hm-mirror-box')
+    if (mirrorBox) {
+      mirrorBox.addEventListener('toggle', () => { mirrorOpen = mirrorBox.open })
+      el.querySelector('#hm-pypi-mirror')?.addEventListener('change', (e) => {
+        const customRow = el.querySelector('#hm-pypi-custom-row')
+        if (customRow) customRow.style.display = e.target.value === 'custom' ? '' : 'none'
+      })
+    }
     // 安装按钮（本地模式）
     el.querySelector('.hermes-install-btn')?.addEventListener('click', doInstall)
     // 自定义连接按钮
@@ -398,6 +470,7 @@ export function render() {
   // --- 检测流程 ---
   async function detect() {
     phase = 'detect'
+    detectDone = false
     draw()
     try {
       invalidate('check_hermes', 'check_python')
@@ -405,19 +478,38 @@ export function render() {
       pyInfo = py
       hermesInfo = hm
 
-      draw()
+      // 计算目标阶段
+      let target
+      if (hm.installed && hm.gatewayRunning) target = 'complete'
+      else if (hm.installed && hm.configExists) target = 'gateway'
+      else if (hm.installed) target = 'configure'
+      else target = 'install'
 
-      // 自动跳转到最合适的阶段（不自动离开向导，让用户可以查看和回退每一步）
-      await new Promise(r => setTimeout(r, 800))
-      if (hm.installed && hm.gatewayRunning) {
-        phase = 'complete'
-      } else if (hm.installed && hm.configExists) {
-        phase = 'gateway'
-      } else if (hm.installed) {
-        phase = 'configure'
-      } else {
-        phase = 'install'
+      // 恢复上次进行到的阶段：中途关闭后重开不必从头再走
+      // （仅在前提一致时生效：configure/gateway 需要已安装）
+      try {
+        const stored = sessionStorage.getItem(PHASE_STORE_KEY)
+        if (stored && stored !== 'complete'
+          && PHASE_ORDER.indexOf(stored) > PHASE_ORDER.indexOf(target)
+          && (stored === 'install' || hm.installed)) {
+          target = stored
+        }
+      } catch (_) {}
+
+      // 环境有警告（Python 版本、Git 缺失等）且尚未安装 → 停在检测页
+      // 展示结果，等用户确认后再继续，避免 800ms 后自动跳走看不清问题
+      const envWarnings = !hm.installed && py
+        && (!py.installed || py.versionOk === false || !py.hasGit || !py.hasUv)
+      detectTarget = target
+      if (envWarnings) {
+        detectDone = true
+        draw()
+        return
       }
+
+      draw()
+      await new Promise(r => setTimeout(r, 500))
+      phase = target
       draw()
     } catch (e) {
       logs.push(`[detect error] ${e?.message || e}`)
@@ -443,9 +535,9 @@ export function render() {
       // 保存 Gateway URL
       await api.hermesSetGatewayUrl(url)
 
-      // 测试连接
+      // 测试连接（health 可能返回对象，ok === false 也视为失败）
       const health = await api.hermesHealthCheck()
-      if (!health) throw new Error(t('engine.installCustomNoResponse'))
+      if (!health || health.ok === false) throw new Error(t('engine.installCustomNoResponse'))
 
       installing = false
       customGatewayUrl = url
@@ -461,6 +553,26 @@ export function render() {
 
   // --- 安装流程 ---
   async function doInstall() {
+    // 持久化镜像偏好（后端安装命令读取 panelConfig.pypiMirror / gitMirror）
+    try {
+      const pypiSel = el.querySelector('#hm-pypi-mirror')
+      if (pypiSel) {
+        const pypiMirror = pypiSel.value === 'custom'
+          ? (el.querySelector('#hm-pypi-custom')?.value?.trim() || '')
+          : pypiSel.value
+        const gitMirror = el.querySelector('#hm-git-mirror')?.value?.trim() || ''
+        if (pypiMirror !== (mirrorPrefs?.pypiMirror || '') || gitMirror !== (mirrorPrefs?.gitMirror || '')) {
+          const cfg = (await api.readPanelConfig()) || {}
+          cfg.pypiMirror = pypiMirror
+          cfg.gitMirror = gitMirror
+          await api.writePanelConfig(cfg)
+          mirrorPrefs = { pypiMirror, gitMirror }
+        }
+      }
+    } catch (e) {
+      console.warn('[hermes/setup] 保存镜像偏好失败（不阻塞安装）:', e)
+    }
+
     installing = true
     installError = null
     progress = 0
@@ -611,8 +723,18 @@ export function render() {
     const matched = inferProviderByBaseUrl(hermesProviders, baseUrl)
     const provider = matched?.id || 'custom'
 
+    // 错误统一用内联面板展示（与安装步一致），toast 一闪而过容易错过
+    const showConfigError = (msg) => {
+      const errEl = el.querySelector('#hm-config-error')
+      if (errEl) {
+        errEl.textContent = msg
+        errEl.style.display = 'block'
+      } else {
+        toast(msg, 'error')
+      }
+    }
     if (!apiKey) {
-      toast(t('engine.installCustomEmpty') || '请输入 API Key', 'warning')
+      showConfigError(t('engine.configApiKeyRequired'))
       return
     }
     try {
@@ -621,7 +743,7 @@ export function render() {
       await refreshHermes()
     } catch (e) {
       const msg = String(e?.message || e).replace(/^Error:\s*/, '')
-      toast(`${t('engine.configSaveFailed') || '配置保存失败'}: ${msg}`, 'error')
+      showConfigError(`${t('engine.configSaveFailed')}: ${msg}`)
     }
   }
 
@@ -665,7 +787,7 @@ export function render() {
     draw()
   }
 
-  // 启动检测前先加载 provider registry，然后启动检测
+  // 启动检测前先加载 provider registry 与镜像偏好，然后启动检测
   ;(async () => {
     try {
       hermesProviders = await loadHermesProviders()
@@ -673,6 +795,15 @@ export function render() {
     } catch (err) {
       console.warn('[hermes/setup] failed to load providers:', err)
     }
+    try {
+      const cfg = await api.readPanelConfig()
+      mirrorPrefs = {
+        pypiMirror: String(cfg?.pypiMirror || '').trim(),
+        gitMirror: String(cfg?.gitMirror || '').trim(),
+      }
+      // 已配置过镜像 → 默认展开折叠区，让用户看到当前生效的镜像
+      if (mirrorPrefs.pypiMirror || mirrorPrefs.gitMirror) mirrorOpen = true
+    } catch (_) {}
     detect()
   })()
 

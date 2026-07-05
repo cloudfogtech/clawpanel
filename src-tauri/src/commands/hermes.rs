@@ -2471,7 +2471,23 @@ fn apply_git_mirror_env(cmd: &mut tokio::process::Command) {
 /// 命中返回建议文案（含「可在设置页启用 Git 镜像」提示）。
 fn diagnose_install_network_error(text: &str) -> Option<String> {
     let lower = text.to_lowercase();
-    let hits = [
+    // PyPI / 通用网络类失败：下载依赖超时、SSL、解析失败等（国内环境高频）
+    let pypi_hits = [
+        "pypi.org",
+        "files.pythonhosted.org",
+        "read timed out",
+        "operation timed out",
+        "request timeout",
+        "tls handshake",
+        "ssl",
+        "certificate",
+        "proxy",
+        "error sending request",
+        "failed to fetch",
+        "failed to download",
+        "name resolution",
+    ];
+    let git_hits = [
         "failed to connect to github.com",
         "could not connect to server",
         "failed to clone",
@@ -2482,15 +2498,93 @@ fn diagnose_install_network_error(text: &str) -> Option<String> {
         "network is unreachable",
         "could not resolve host",
     ];
-    if !hits.iter().any(|h| lower.contains(h)) {
-        return None;
-    }
-    Some(
-        "⚠ 检测到安装过程中无法访问外部 Git 服务。请任选一项重试：\
+    if git_hits.iter().any(|h| lower.contains(h)) {
+        return Some(
+            "⚠ 检测到安装过程中无法访问外部 Git 服务。请任选一项重试：\
 \n  1) 在「设置 → 网络代理」配置可用代理后重试；\
 \n  2) 在「设置 → Hermes 安装镜像」填入可用的 Git 镜像前缀。"
-            .to_string(),
-    )
+                .to_string(),
+        );
+    }
+    if pypi_hits.iter().any(|h| lower.contains(h)) {
+        return Some(
+            "⚠ 检测到下载 Python 依赖失败（PyPI 网络问题）。请任选一项重试：\
+\n  1) 在安装页「网络与镜像」选择国内 PyPI 镜像（清华 / 阿里云）后重试；\
+\n  2) 在「设置 → 网络代理」配置可用代理后重试。"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// 以流式方式运行安装类子进程：stdout / stderr 逐行实时 emit 到前端日志，
+/// 返回退出状态与 stderr 尾部内容（用于失败诊断）。
+/// 修复旧实现 wait_with_output 等进程结束才发日志、用户长时间只见转圈的问题
+async fn run_install_command_streaming(
+    app: &tauri::AppHandle,
+    mut cmd: tokio::process::Command,
+) -> Result<(std::process::ExitStatus, String), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    const STDERR_KEEP_BYTES: usize = 8 * 1024;
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("启动安装进程失败: {e}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let app_out = app.clone();
+    let out_task = tokio::spawn(async move {
+        let Some(stdout) = stdout else { return };
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let _ = app_out.emit(
+                    "hermes-install-log",
+                    sanitize_hermes_install_output(trimmed),
+                );
+            }
+        }
+    });
+
+    let app_err = app.clone();
+    let err_task = tokio::spawn(async move {
+        let mut collected = String::new();
+        let Some(stderr) = stderr else {
+            return collected;
+        };
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let _ = app_err.emit(
+                "hermes-install-log",
+                sanitize_hermes_install_output(trimmed),
+            );
+            collected.push_str(trimmed);
+            collected.push('\n');
+            // 只保留尾部：uv 输出可能很长，错误信息几乎都在最后
+            if collected.len() > STDERR_KEEP_BYTES * 2 {
+                let mut cut = collected.len() - STDERR_KEEP_BYTES;
+                while !collected.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                collected.drain(..cut);
+            }
+        }
+        collected
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待安装进程失败: {e}"))?;
+    let _ = out_task.await;
+    let stderr_text = err_task.await.unwrap_or_default();
+    Ok((status, stderr_text))
 }
 
 /// 通过 uv tool install 安装 Hermes Agent
@@ -2537,10 +2631,6 @@ async fn install_via_uv_tool(
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    // 捕获输出
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
     let _ = app.emit(
         "hermes-install-log",
         format!(
@@ -2549,26 +2639,10 @@ async fn install_via_uv_tool(
         ),
     );
 
-    let child = cmd.spawn().map_err(|e| format!("启动安装进程失败: {e}"))?;
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("等待安装进程失败: {e}"))?;
+    // 流式执行：安装输出逐行实时显示，不再等进程结束
+    let (status, stderr_text) = run_install_command_streaming(app, cmd).await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // 逐行输出日志
-    for line in stdout.lines().chain(stderr.lines()) {
-        if !line.trim().is_empty() {
-            let _ = app.emit(
-                "hermes-install-log",
-                sanitize_hermes_install_output(line.trim()),
-            );
-        }
-    }
-
-    if output.status.success() {
+    if status.success() {
         let _ = app.emit("hermes-install-log", "✓ uv tool install 完成");
         if crate::commands::portable::portable_context().is_some() {
             let _ = app.emit(
@@ -2587,20 +2661,20 @@ async fn install_via_uv_tool(
         }
         Ok(())
     } else {
-        let cleaned = sanitize_hermes_install_output(stderr.trim());
+        let cleaned = sanitize_hermes_install_output(stderr_text.trim());
         // 命中 git/network 失败 → 在日志流尾部追加诊断 + 给最终错误消息加上提示
         if let Some(hint) = diagnose_install_network_error(&cleaned) {
             let _ = app.emit("hermes-install-log", &hint);
             return Err(format!(
                 "安装失败 (exit {}): {}\n\n{}",
-                output.status.code().unwrap_or(-1),
+                status.code().unwrap_or(-1),
                 cleaned,
                 hint
             ));
         }
         Err(format!(
             "安装失败 (exit {}): {}",
-            output.status.code().unwrap_or(-1),
+            status.code().unwrap_or(-1),
             cleaned
         ))
     }
@@ -2667,27 +2741,16 @@ async fn install_via_uv_pip(
     #[cfg(target_os = "windows")]
     pip_cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let pip_out = pip_cmd
-        .output()
-        .await
-        .map_err(|e| format!("pip install 失败: {e}"))?;
+    // 流式执行：pip 下载/构建输出逐行实时显示
+    let (pip_status, pip_stderr) = run_install_command_streaming(app, pip_cmd).await?;
 
-    let stdout = String::from_utf8_lossy(&pip_out.stdout);
-    let stderr = String::from_utf8_lossy(&pip_out.stderr);
-    for line in stdout.lines().chain(stderr.lines()) {
-        if !line.trim().is_empty() {
-            let _ = app.emit(
-                "hermes-install-log",
-                sanitize_hermes_install_output(line.trim()),
-            );
+    if !pip_status.success() {
+        let cleaned = sanitize_hermes_install_output(pip_stderr.trim());
+        if let Some(hint) = diagnose_install_network_error(&cleaned) {
+            let _ = app.emit("hermes-install-log", &hint);
+            return Err(format!("pip install 失败: {cleaned}\n\n{hint}"));
         }
-    }
-
-    if !pip_out.status.success() {
-        return Err(format!(
-            "pip install 失败: {}",
-            sanitize_hermes_install_output(stderr.trim())
-        ));
+        return Err(format!("pip install 失败: {cleaned}"));
     }
 
     let _ = app.emit("hermes-install-log", "✓ pip install 完成");
