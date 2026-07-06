@@ -1,5 +1,10 @@
 param(
+  # 模拟模式：用 subst 虚拟盘符 + 桩 CLI（默认，无副作用，用于 CI/本机快速验证布局约定）
   [string]$DriveLetter = "",
+  # 真实模式：指定真实 U 盘路径（如 F:\），只做无损校验——
+  # 补建缺失目录、portable.json 缺失时补种，绝不覆盖任何已有文件、绝不写桩 CLI；
+  # 对盘上真实存在的组件（openclaw/hermes/uv/git/node）逐一实测版本
+  [string]$UsbPath = "",
   [string]$RootName = "ClawPanelPortable",
   [switch]$Keep
 )
@@ -15,22 +20,42 @@ function Find-FreeDriveLetter {
   throw "No free test drive letter found"
 }
 
-if ([string]::IsNullOrWhiteSpace($DriveLetter)) {
-  $DriveLetter = Find-FreeDriveLetter
-}
-$DriveLetter = $DriveLetter.Replace(':', '').ToUpperInvariant()
-if (Get-PSDrive -Name $DriveLetter -ErrorAction SilentlyContinue) {
-  throw "Drive $DriveLetter already exists. Choose another DriveLetter."
+# 仅在文件不存在时写入（真实盘保护：绝不覆盖用户数据）
+function Set-ContentIfAbsent {
+  param([string]$Path, [object]$Value, [string]$Encoding = "UTF8")
+  if (Test-Path -LiteralPath $Path) { return $false }
+  $Value | Set-Content -LiteralPath $Path -Encoding $Encoding
+  return $true
 }
 
-$hostRoot = Join-Path $env:TEMP ("clawpanel-usb-smoke-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force -Path $hostRoot | Out-Null
+$realMode = -not [string]::IsNullOrWhiteSpace($UsbPath)
+$hostRoot = $null
+$driveName = $null
+
+if ($realMode) {
+  if (-not (Test-Path -LiteralPath $UsbPath)) {
+    throw "UsbPath not found: $UsbPath"
+  }
+  $usbRoot = Join-Path $UsbPath $RootName
+} else {
+  if ([string]::IsNullOrWhiteSpace($DriveLetter)) {
+    $DriveLetter = Find-FreeDriveLetter
+  }
+  $DriveLetter = $DriveLetter.Replace(':', '').ToUpperInvariant()
+  if (Get-PSDrive -Name $DriveLetter -ErrorAction SilentlyContinue) {
+    throw "Drive $DriveLetter already exists. Choose another DriveLetter."
+  }
+  $hostRoot = Join-Path $env:TEMP ("clawpanel-usb-smoke-" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Force -Path $hostRoot | Out-Null
+  $driveName = $DriveLetter + ":"
+}
 
 try {
-  $driveName = $DriveLetter + ":"
-  $driveRoot = $DriveLetter + ":\"
-  subst $driveName $hostRoot
-  $usbRoot = Join-Path $driveRoot $RootName
+  if (-not $realMode) {
+    $driveRoot = $DriveLetter + ":\"
+    subst $driveName $hostRoot
+    $usbRoot = Join-Path $driveRoot $RootName
+  }
   $dataDir = Join-Path $usbRoot "data"
   $panelDir = Join-Path $dataDir "clawpanel"
   $openclawDir = Join-Path $dataDir "openclaw"
@@ -44,22 +69,61 @@ try {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
   }
 
-  @{
+  $null = Set-ContentIfAbsent -Path (Join-Path $usbRoot "portable.json") -Value (@{
     mode = "portable"
     dataDir = "./data"
     enginesDir = "./engines"
     runtimesDir = "./runtimes"
-  } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $usbRoot "portable.json") -Encoding UTF8
+  } | ConvertTo-Json -Depth 4)
 
-  @{
+  $null = Set-ContentIfAbsent -Path (Join-Path $panelDir "clawpanel.json") -Value (@{
     accessPassword = "portable-smoke"
     engine = "openclaw"
-  } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $panelDir "clawpanel.json") -Encoding UTF8
+  } | ConvertTo-Json -Depth 8)
 
-  '{ "gateway": { "port": 18789 }, "agents": { "main": { "name": "main" } } }' |
-    Set-Content -LiteralPath (Join-Path $openclawDir "openclaw.json") -Encoding UTF8
-  "model: smoke" | Set-Content -LiteralPath (Join-Path $hermesHome "config.yaml") -Encoding UTF8
+  $null = Set-ContentIfAbsent -Path (Join-Path $openclawDir "openclaw.json") -Value '{ "gateway": { "port": 18789 }, "agents": { "main": { "name": "main" } } }'
+  $null = Set-ContentIfAbsent -Path (Join-Path $hermesHome "config.yaml") -Value "model: smoke"
 
+  if ($realMode) {
+    # ===== 真实模式：无损校验，逐组件实测（存在才测，不存在报 missing）=====
+    function Test-Component {
+      param([string]$Path, [string[]]$CmdArgs)
+      if (-not (Test-Path -LiteralPath $Path)) { return "(missing)" }
+      try {
+        $out = & $Path @CmdArgs 2>&1 | Select-Object -First 1
+        return ($out -join " ")
+      } catch {
+        return "(error) $($_.Exception.Message)"
+      }
+    }
+
+    $manifest = $null
+    $manifestOk = $false
+    try {
+      $raw = Get-Content -LiteralPath (Join-Path $usbRoot "portable.json") -Raw
+      $manifest = $raw -replace "^﻿", "" | ConvertFrom-Json
+      $manifestOk = ($manifest.mode -eq "portable")
+    } catch {}
+
+    $fsName = "unknown"
+    try { $fsName = (Get-Volume -FilePath $usbRoot -ErrorAction Stop).FileSystem } catch {}
+
+    [pscustomobject]@{
+      ok = $manifestOk
+      mode = "real-usb"
+      fileSystem = $fsName
+      usbRoot = $usbRoot
+      manifestMode = $manifest.mode
+      openclaw = Test-Component -Path (Join-Path $openclawEngine "openclaw.cmd") -CmdArgs @("--version")
+      hermes = Test-Component -Path (Join-Path $hermesBin "hermes.cmd") -CmdArgs @("version")
+      node = Test-Component -Path (Join-Path $openclawEngine "node.exe") -CmdArgs @("--version")
+      uv = Test-Component -Path (Join-Path $uvBin "uv.exe") -CmdArgs @("--version")
+      git = Test-Component -Path (Join-Path $gitCmd "git.exe") -CmdArgs @("--version")
+    } | ConvertTo-Json -Depth 4
+    return
+  }
+
+  # ===== 模拟模式：写桩 CLI，验证布局与 PATH 约定 =====
   @(
     "@echo off",
     "echo openclaw portable smoke"
@@ -128,7 +192,8 @@ try {
 
   [pscustomobject]@{
     ok = $true
-    drive = $driveName
+    mode = "simulated"
+    fileSystem = "subst(NTFS)"
     usbRoot = $usbRoot
     hostRoot = $hostRoot
     hermes = ($hermesVersion -join "`n")
@@ -137,10 +202,12 @@ try {
     uv = ($uvVersion -join "`n")
   } | ConvertTo-Json -Depth 4
 } finally {
-  if (-not $Keep) {
-    subst $driveName /D 2>$null
-    Remove-Item -LiteralPath $hostRoot -Recurse -Force -ErrorAction SilentlyContinue
-  } else {
-    Write-Host "Keeping test drive $driveName -> $hostRoot"
+  if (-not $realMode) {
+    if (-not $Keep) {
+      subst $driveName /D 2>$null
+      Remove-Item -LiteralPath $hostRoot -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+      Write-Host "Keeping test drive $driveName -> $hostRoot"
+    }
   }
 }
