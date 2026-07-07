@@ -331,8 +331,11 @@ async function checkAuth() {
       const cfg = await api.readPanelConfig()
       if (!cfg.accessPassword) return { ok: true }
       if (sessionStorage.getItem('clawpanel_authed') === '1') return { ok: true }
-      // 默认密码：直接传给登录页，避免二次读取
-      const defaultPw = (cfg.mustChangePassword && cfg.accessPassword) ? cfg.accessPassword : null
+      // 默认密码：直接传给登录页明文预填提示。判定与 security.js 一致——
+      // 密码为出厂值 123456 即视为默认（U 盘便携包等预置配置可能没有
+      // mustChangePassword 标记，不能只依赖标记）
+      const isDefaultPw = cfg.accessPassword === '123456' || !!cfg.mustChangePassword
+      const defaultPw = isDefaultPw ? cfg.accessPassword : null
       return { ok: false, defaultPw }
     } catch { return { ok: true } }
   }
@@ -630,6 +633,8 @@ async function boot() {
   registerEngine(hermesEngine)
   registerEngine(xintianEngine)
   registerRoute('/engine-select', () => import('./pages/engine-select.js'))
+  registerRoute('/media', () => import('./pages/media.js'))
+  registerRoute('/model-channels', () => import('./pages/model-channels.js'))
 
   // 初始化引擎管理器：读取 clawpanel.json 的 engineMode，注册对应路由
   await initEngineManager()
@@ -713,11 +718,16 @@ async function boot() {
       <a class="password-change-action" href="#/security" data-pw-banner-action>${t('common.goSecurity')}</a>
       <button class="password-change-close" type="button" aria-label="${t('common.close')}" title="${t('common.close')}" data-pw-banner-close>✕</button>
     `
-    banner.querySelector('[data-pw-banner-action]')?.addEventListener('click', () => {
+    document.body.classList.add('has-password-change-banner')
+    const removePasswordBanner = () => {
       banner.remove()
+      document.body.classList.remove('has-password-change-banner')
+    }
+    banner.querySelector('[data-pw-banner-action]')?.addEventListener('click', () => {
       sessionStorage.removeItem('clawpanel_must_change_pw')
+      removePasswordBanner()
     })
-    banner.querySelector('[data-pw-banner-close]')?.addEventListener('click', () => banner.remove())
+    banner.querySelector('[data-pw-banner-close]')?.addEventListener('click', removePasswordBanner)
     document.body.prepend(banner)
   }
 
@@ -867,10 +877,16 @@ async function boot() {
           if (isOpenclawReady() && window.location.hash === '#/setup') {
             navigate('/dashboard')
           }
-          // 如果卸载后变为未就绪，跳转到 setup
+          // 如果卸载后变为未就绪，把默认路由指向 setup；
+          // 但只有停留在依赖 CLI 的页面（仪表盘）才主动跳转，
+          // 避免安装失败事件把用户从诊断/设置等页面反复拽回安装页、
+          // 或在 setup 页上重复 navigate 导致页面反复重建重新检测
           if (!isOpenclawReady() && !isUpgrading()) {
             setDefaultRoute('/setup')
-            navigate('/setup')
+            const current = window.location.hash.replace(/^#/, '')
+            if (current === '/dashboard' || current === '' || current === '/') {
+              navigate('/setup')
+            }
           }
           window.dispatchEvent(new CustomEvent('openclaw:runtime-changed'))
         }

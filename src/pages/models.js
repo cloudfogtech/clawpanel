@@ -35,6 +35,10 @@ export async function render() {
     <div class="form-hint" style="margin-bottom:var(--space-md)">
       ${t('models.providerHint')}
     </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:var(--space-md);padding:10px 14px;background:var(--bg-secondary);border:1px solid var(--border-primary);border-left:3px solid var(--primary);border-radius:var(--radius-md);font-size:var(--font-size-sm);color:var(--text-secondary)">
+      <span>${t('models.channelsGuide')}</span>
+      <button class="btn btn-sm btn-secondary" id="btn-goto-channels" type="button" style="white-space:nowrap;flex-shrink:0">${t('models.channelsGuideBtn')}</button>
+    </div>
     <div id="qtcool-promo" style="margin-bottom:var(--space-md);border-radius:var(--radius-lg);border:1px solid var(--border-primary);border-left:3px solid var(--primary);background:var(--bg-secondary);padding:16px 20px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:12px">
         <div style="flex:1;min-width:200px">
@@ -1168,6 +1172,8 @@ function applyDefaultModel(state) {
 function bindTopActions(page, state) {
   page.querySelector('#btn-add-provider').onclick = () => addProvider(page, state)
   page.querySelector('#btn-import-client').onclick = () => importClientConfigs(page, state)
+  const gotoChannels = page.querySelector('#btn-goto-channels')
+  if (gotoChannels) gotoChannels.onclick = () => { window.location.hash = '#/model-channels' }
   page.querySelector('#btn-undo').onclick = () => undo(page, state)
 
   // 晴辰云:获取模型列表 → 弹窗让用户选择要添加的模型
